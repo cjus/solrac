@@ -1,0 +1,44 @@
+[Unit]
+Description=Solrac Telegram agent (Bun + Claude Agent SDK)
+After=network-online.target
+Wants=network-online.target
+
+# Burst limit lives in [Unit] (post-systemd-229). See [Service] Restart= for
+# context: a 409 Conflict makes us exit 1 deliberately; cap restarts so the
+# unit fails out instead of looping forever. docs/RUNBOOK.md#409-conflict.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=solrac
+Group=solrac
+WorkingDirectory=/opt/solrac
+EnvironmentFile=/etc/solrac/solrac.env
+ExecStart=/usr/local/bin/bun run src/main.ts
+
+# Restart on crash; clean exit (e.g. SIGTERM drain → exit 0) is intentional and
+# should be left alone (use `systemctl restart solrac` to bounce explicitly).
+# Burst cap (StartLimitBurst/StartLimitIntervalSec) lives in [Unit] above.
+Restart=on-failure
+RestartSec=10
+
+# Graceful shutdown: lifecycle.ts caps drain at 60s; give systemd 90s before
+# escalating to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/solrac/data
+
+# Logs to journald; process already emits structured JSON to stdout/stderr.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solrac
+
+[Install]
+WantedBy=multi-user.target

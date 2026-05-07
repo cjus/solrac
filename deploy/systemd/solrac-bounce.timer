@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly bounce of solrac.service
+Requires=solrac-bounce.service
+
+[Timer]
+OnCalendar=Sun 04:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=solrac-bounce.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Bounce solrac.service (mitigates Bun long-uptime memory drift)
+Requisite=solrac.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart solrac.service
