@@ -190,6 +190,10 @@ npm run smoke:ollama   # live Ollama smoke (requires Ollama on $OLLAMA_URL)
 
 For live smokes against a dev bot, see [docs/RUNBOOK.md](./docs/RUNBOOK.md).
 
+## Origin
+
+Solrac was built as part of the [PNXStudios.com](https://pnxstudios.com) project to manage work on a complex monorepo from anywhere — Telegram in, code edits and shell out, with full audit and per-chat budget control. It's released as open source on the chance it's useful to others running similar single-operator setups.
+
 ## Contact
 
 Open issues against this repository. Project owner: [@cjus](https://github.com/cjus).

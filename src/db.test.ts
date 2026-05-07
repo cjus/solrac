@@ -8,9 +8,9 @@
  * pre-Step-11 (no `model` column), pre-Step-12 (no per-tier session
  * columns), and finally the current shape. Each `openDb` call must walk it
  * forward without losing data and without re-running migrations on
- * subsequent boots. This was previously verified manually against Carlos's
- * sqlite; these tests pin the contract so a refactor of the migration block
- * doesn't quietly regress.
+ * subsequent boots. This was previously verified manually against an
+ * operator's sqlite; these tests pin the contract so a refactor of the
+ * migration block doesn't quietly regress.
  *
  * Scenarios covered:
  *

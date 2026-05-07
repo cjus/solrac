@@ -1,7 +1,6 @@
 # Slash Commands Design — PNX-167
 
 Status: design (no code yet)
-Owner: carlos@pnxstudios.com
 Scope: four user-facing Telegram slash commands — `/clear`, `/compact`, `/status`, `/help`.
 
 ---
@@ -809,7 +808,7 @@ Ship as a script under `test/smokes/`, not part of `bun test` (live, costs real 
 
 ## Open questions (extremely concise)
 
-- `/compact` default tier — primary (cheap) confirmed, but if Carlos's usage skews secondary, revisit.
+- `/compact` default tier — primary (cheap) confirmed, but if operator usage skews secondary, revisit.
 - `/compact` chat output — header only is the v1 default; alternative (echo full summary) is one if-branch away.
 - Cache-token telemetry — defer to v1.1.
 

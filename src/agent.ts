@@ -102,8 +102,8 @@ const LOOP_THRESHOLD = 3;
 
 const TELEGRAM_TEXT_MAX = 3800;
 const EDIT_THROTTLE_MS = 1500;
-// PLAN Step 12 — per-tier thinking-stub emoji so Carlos can eyeball which
-// tier handled a turn without checking logs. Ollama uses 🦙 in `ollama.ts`;
+// PLAN Step 12 — per-tier thinking-stub emoji so the operator can eyeball
+// which tier handled a turn without checking logs. Ollama uses 🦙 in `ollama.ts`;
 // Claude tiers split here so primary (cheap default) is visually distinct
 // from secondary (heavyweight). Same "thinking…" suffix everywhere.
 const THINKING_STUB_BY_ENGINE: Record<SessionTier, string> = {
