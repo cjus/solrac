@@ -192,7 +192,7 @@ For live smokes against a dev bot, see [docs/RUNBOOK.md](./docs/RUNBOOK.md).
 
 ## Origin
 
-Solrac was built as part of the [PNXStudios.com](https://pnxstudios.com) project to manage work on a complex monorepo from anywhere — Telegram in, code edits and shell out, with full audit and per-chat budget control. It's released as open source on the chance it's useful to others running similar single-operator setups.
+Solrac was built as part of the [PNXStudios.com](https://pnxstudios.com) project to manage work on a complex monorepo from anywhere — Telegram in, code edits and shell out, with full audit and per-chat budget control. It's open-sourced as a complete, hackable foundation: the same ~2K lines of TypeScript that drive a real production workflow, with the building blocks — auditable agent loop, dual-Claude tier routing, local-Ollama escape hatch, per-chat cost caps, three-tier permission policy, operator-defined skills — laid bare for anyone to read, run, fork, or extend to a different transport (email, Slack, scheduled jobs, in-house dashboards).
 
 ## Contact
 
