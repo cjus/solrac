@@ -262,10 +262,10 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   await mkdir(dataDir, { recursive: true });
   const dbPath = join(dataDir, "solrac.sqlite");
   const db = new Database(dbPath, { create: true });
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA busy_timeout = 5000");
-  db.exec("PRAGMA foreign_keys = ON");
-  db.exec(SCHEMA);
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA busy_timeout = 5000");
+  db.run("PRAGMA foreign_keys = ON");
+  db.run(SCHEMA);
   // PLAN Step 11.3 — additive migration for pre-Step-11 databases. The
   // `model` column lives in the CREATE TABLE for fresh installs; for an
   // existing solrac.sqlite the ALTER backfills every row to 'claude' and
@@ -277,7 +277,7 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   // upgraded databases (column came from ALTER above).
   const auditCols = db.query("PRAGMA table_info(audit)").all() as { name: string }[];
   if (!auditCols.some((c) => c.name === "model")) {
-    db.exec("ALTER TABLE audit ADD COLUMN model TEXT NOT NULL DEFAULT 'claude'");
+    db.run("ALTER TABLE audit ADD COLUMN model TEXT NOT NULL DEFAULT 'claude'");
     log.info("db.migrated", { migration: "audit.model_column_added" });
   }
   // PNX-167 — capture prompt-cache telemetry so /context (and follow-up
@@ -286,11 +286,11 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   // of their input via the cache; without these columns the audit log
   // dramatically under-reports real context size.
   if (!auditCols.some((c) => c.name === "cache_creation_input_tokens")) {
-    db.exec("ALTER TABLE audit ADD COLUMN cache_creation_input_tokens INTEGER");
+    db.run("ALTER TABLE audit ADD COLUMN cache_creation_input_tokens INTEGER");
     log.info("db.migrated", { migration: "audit.cache_creation_input_tokens_added" });
   }
   if (!auditCols.some((c) => c.name === "cache_read_input_tokens")) {
-    db.exec("ALTER TABLE audit ADD COLUMN cache_read_input_tokens INTEGER");
+    db.run("ALTER TABLE audit ADD COLUMN cache_read_input_tokens INTEGER");
     log.info("db.migrated", { migration: "audit.cache_read_input_tokens_added" });
   }
   // PLAN Step 12 — additive migration. Pre-Step-12 sessions had a single
@@ -300,11 +300,11 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   // only the per-tier columns. ALTER is idempotent across boots.
   const sessionCols = db.query("PRAGMA table_info(sessions)").all() as { name: string }[];
   if (!sessionCols.some((c) => c.name === "primary_session_id")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN primary_session_id TEXT");
+    db.run("ALTER TABLE sessions ADD COLUMN primary_session_id TEXT");
     log.info("db.migrated", { migration: "sessions.primary_session_id_added" });
   }
   if (!sessionCols.some((c) => c.name === "secondary_session_id")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN secondary_session_id TEXT");
+    db.run("ALTER TABLE sessions ADD COLUMN secondary_session_id TEXT");
     log.info("db.migrated", { migration: "sessions.secondary_session_id_added" });
   }
   // PNX-167 — additive columns for /compact: per-tier summary text + the
@@ -314,19 +314,19 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   // `recentChatTurnsForEngine` so a back-to-back `/compact` doesn't
   // re-summarize already-condensed turns.
   if (!sessionCols.some((c) => c.name === "primary_summary")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN primary_summary TEXT");
+    db.run("ALTER TABLE sessions ADD COLUMN primary_summary TEXT");
     log.info("db.migrated", { migration: "sessions.primary_summary_added" });
   }
   if (!sessionCols.some((c) => c.name === "primary_summary_at")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN primary_summary_at INTEGER");
+    db.run("ALTER TABLE sessions ADD COLUMN primary_summary_at INTEGER");
     log.info("db.migrated", { migration: "sessions.primary_summary_at_added" });
   }
   if (!sessionCols.some((c) => c.name === "secondary_summary")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN secondary_summary TEXT");
+    db.run("ALTER TABLE sessions ADD COLUMN secondary_summary TEXT");
     log.info("db.migrated", { migration: "sessions.secondary_summary_added" });
   }
   if (!sessionCols.some((c) => c.name === "secondary_summary_at")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN secondary_summary_at INTEGER");
+    db.run("ALTER TABLE sessions ADD COLUMN secondary_summary_at INTEGER");
     log.info("db.migrated", { migration: "sessions.secondary_summary_at_added" });
   }
   // PLAN Step 12 — retag legacy `audit.model='claude'` rows. They ran on the
@@ -355,7 +355,7 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
       rowsChanged: legacyTagged.changes,
     });
   }
-  db.exec("CREATE INDEX IF NOT EXISTS idx_audit_chat_model_started ON audit(chat_id, model, started_at)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_audit_chat_model_started ON audit(chat_id, model, started_at)");
   log.info("db.opened", { dbPath });
 
   const stGetMeta = db.prepare("SELECT value FROM meta WHERE key = ?");

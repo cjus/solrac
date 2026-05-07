@@ -137,7 +137,7 @@ export function installShutdown(deps: ShutdownDeps): ShutdownHandle {
     }
 
     try {
-      deps.db.raw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      deps.db.raw.run("PRAGMA wal_checkpoint(TRUNCATE)");
       log.info("shutdown.wal_checkpointed");
     } catch (err) {
       log.warn("shutdown.wal_checkpoint_failed", { error: (err as Error).message });

@@ -93,8 +93,8 @@ function writePreStep11Schema(dir: string): void {
   // openDb's migrations have something to walk forward.
   const dbPath = join(dir, "solrac.sqlite");
   const old = new Database(dbPath, { create: true });
-  old.exec("PRAGMA journal_mode = WAL");
-  old.exec(`
+  old.run("PRAGMA journal_mode = WAL");
+  old.run(`
     CREATE TABLE meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
@@ -136,7 +136,7 @@ function writePreStep11Schema(dir: string): void {
     );
   `);
   // Seed two rows so we can verify backfill + retag.
-  old.exec(`
+  old.run(`
     INSERT INTO audit (tree_id, chat_id, from_id, update_id, prompt, response,
                        cost_usd, status, started_at, ended_at)
       VALUES (1, 100, 200, 1, 'q1', 'a1', 0.10, 'ok', 1000, 1100);
@@ -227,7 +227,7 @@ describe("openDb migrations", () => {
       // Sneak in a row with the legacy tag (only possible by bypassing
       // insertAudit, which always tags engine-prefix). Direct SQL to demonstrate
       // the retag rule.
-      db1.raw.exec(`
+      db1.raw.run(`
         INSERT INTO audit (tree_id, chat_id, from_id, update_id, prompt,
                            cost_usd, status, started_at, model)
           VALUES (1, 999, 999, 999, 'manual', 0.0, 'ok', 9999, 'claude');
@@ -267,8 +267,8 @@ describe("openDb migrations", () => {
     {
       const db1 = await openDb(dir);
       // Drop the new columns to simulate the upgrade path.
-      db1.raw.exec("ALTER TABLE audit DROP COLUMN cache_creation_input_tokens");
-      db1.raw.exec("ALTER TABLE audit DROP COLUMN cache_read_input_tokens");
+      db1.raw.run("ALTER TABLE audit DROP COLUMN cache_creation_input_tokens");
+      db1.raw.run("ALTER TABLE audit DROP COLUMN cache_read_input_tokens");
       db1.close();
     }
     const db2 = await openDb(dir);
@@ -294,12 +294,12 @@ describe("openDb migrations", () => {
       // recreate the table without them. (3.35+ supports DROP COLUMN; if
       // bun:sqlite's bundled SQLite is older, this test still proves
       // idempotency on the second boot — see the `idempotent` assertion.)
-      db1.raw.exec("ALTER TABLE sessions DROP COLUMN primary_summary");
-      db1.raw.exec("ALTER TABLE sessions DROP COLUMN primary_summary_at");
-      db1.raw.exec("ALTER TABLE sessions DROP COLUMN secondary_summary");
-      db1.raw.exec("ALTER TABLE sessions DROP COLUMN secondary_summary_at");
+      db1.raw.run("ALTER TABLE sessions DROP COLUMN primary_summary");
+      db1.raw.run("ALTER TABLE sessions DROP COLUMN primary_summary_at");
+      db1.raw.run("ALTER TABLE sessions DROP COLUMN secondary_summary");
+      db1.raw.run("ALTER TABLE sessions DROP COLUMN secondary_summary_at");
       // Seed an existing row so we verify the additive ALTER doesn't disturb it.
-      db1.raw.exec(`
+      db1.raw.run(`
         INSERT INTO sessions (chat_id, primary_session_id, created_at, updated_at)
           VALUES (777, 'p-uuid', 100, 100);
       `);

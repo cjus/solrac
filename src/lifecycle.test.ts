@@ -11,7 +11,7 @@
  *
  * Scenarios covered:
  *   - Idle shutdown: aborts poll, stops server, removes pidfile, exits 0;
- *     `db.raw.exec("SELECT 1")` throws after shutdown (proves close ran).
+ *     `db.raw.run("SELECT 1")` throws after shutdown (proves close ran).
  *   - Drain awaits in-flight turns: a `tracker.begin()` blocks shutdown until
  *     the matching `end` is called.
  *   - Drain timeout: a stuck turn that never ends causes exit code 1 after
@@ -121,7 +121,7 @@ describe("installShutdown", () => {
     expect(h.exitCodes).toEqual([0]);
     expect(handle.triggered()).toBe(true);
     // db.close() happened — raw query should throw.
-    expect(() => h.db.raw.exec("SELECT 1")).toThrow();
+    expect(() => h.db.raw.run("SELECT 1")).toThrow();
   });
 
   test("waits for in-flight turns to drain", async () => {
