@@ -685,7 +685,15 @@ async function main(): Promise<void> {
           return "queued";
         },
         onConfirm: (callbackId, decision) => webBroker.resolve(callbackId, decision),
-        loadHistory: () => db.recentChatTurns(config.webChatId, 50),
+        // Slash-command audit rows store marker strings (`help_shown`,
+        // `status_shown`, `cleared:primary,secondary`, …) — useful in the DB
+        // for ops queries, but not human-readable in a browser conversation
+        // view. Filter them out of history hydration; the user can re-run a
+        // slash command live to see the real output.
+        loadHistory: () =>
+          db
+            .recentChatTurns(config.webChatId, 50)
+            .filter((r) => !r.model.startsWith("system")),
       });
     }
     installShutdown({ tracker, db, pidPath, pollAbort, server, webServer });
