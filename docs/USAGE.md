@@ -381,6 +381,249 @@ EOF
 - The model's output is HTML-escaped before sending — your skill body cannot produce raw `<b>` tags. If a skill author wants formatted output, that's a v1.1 conversation.
 - Hot-reload is intentionally absent: edit a `SKILL.md`, restart Solrac. This matches the boot-once config story (see `docs/CONFIG.md`).
 
+## Integrations
+
+> Status: opt-in via `SOLRAC_INTEGRATIONS_ENABLED=true`. Disabled by default.
+
+An **integration** is a TypeScript module under `$SOLRAC_INTEGRATIONS_DIR/<name>/index.ts` (or, for shipped reference integrations, `src/integrations-builtin/<name>/index.ts`) that adds new tools to the agent without touching solrac's source. Each module default-exports `setup(ctx)` and returns `{ apiVersion, tools, meta }`. Tools surface to the model as `mcp__solrac__<name>`.
+
+> ⚠️ **Ollama limitation.** Integrations are reachable from the Claude tiers (`@`, `!`) only. The Ollama path (`>`) does NOT consume integrations — the local model is text-completion only in v1, and `OLLAMA_CAPABILITY_NOTE` (`ollama.ts:112`) explicitly tells it "you do not have tools." If a user prefixes a tool-shaped request with `>`, the local model will refuse or hallucinate; that's expected. Route tool work via `@` or `!` instead. Adding tool support to Ollama is tracked as [`ROADMAP.md` OQ#16](./ROADMAP.md#oq16--integrations-on-ollama) — deferred because Ollama tool-call reliability varies sharply by model.
+
+### Shipping model
+
+Solrac ships the **mechanism** (loader, context, policy gate). The integration **content** is operator-owned. There are two sources, both discovered when `SOLRAC_INTEGRATIONS_ENABLED=true`:
+
+- **Blessed integrations** at `src/integrations-builtin/<name>/` — shipped with solrac, version-controlled in the repo. Each blessed integration self-gates inside its `setup(ctx)` (e.g. `gmail` no-ops without OAuth credentials). v1 ships a small set; see the directory.
+- **Operator integrations** at `$SOLRAC_INTEGRATIONS_DIR/<name>/` — operator-authored, NOT in the repo. Default `./integrations` (cwd-relative); set to `~/.solrac/integrations` or wherever else makes sense for your deployment.
+
+`examples/integrations/*` in the source tree are **templates, not loaded**. The loader does not scan `examples/`; that directory exists only so you have something to `cp -r` into your operator dir.
+
+### Quick start (10 minutes)
+
+```bash
+# 1. From the solrac repo root, copy the minimal example.
+mkdir -p ~/.solrac/integrations
+cp -r examples/integrations/echo ~/.solrac/integrations/echo
+
+# 2. Edit your .env to enable integrations and point at your operator dir.
+echo "SOLRAC_INTEGRATIONS_ENABLED=true" >> .env
+echo "SOLRAC_INTEGRATIONS_DIR=$HOME/.solrac/integrations" >> .env
+
+# 3. Restart solrac.
+bun src/main.ts
+
+# 4. Watch boot logs for the integrations.loaded event.
+#    Expected: "names":["echo"], "tools":1, "errors":0.
+
+# 5. From an allowed Telegram user (or the web UI):
+#    @ use the echo_say tool with msg="hello"
+#    Response: echo: hello
+```
+
+If you instead see `"integrations":0,"tools":0`, check that `$SOLRAC_INTEGRATIONS_DIR/echo/index.ts` exists. If you see a non-zero `errors` count, the boot log will name the file and the parse error.
+
+### The `setup(ctx)` contract
+
+```ts
+// $SOLRAC_INTEGRATIONS_DIR/myservice/index.ts
+import type { IntegrationContext, IntegrationModule } from "../../../src/integrations.ts"; // type-only; erased at runtime
+
+export default function setup(ctx: IntegrationContext): IntegrationModule {
+  return {
+    apiVersion: 1,
+    tools: [
+      ctx.tool(
+        "myservice_get_thing",
+        "Fetch a thing from myservice. <description matters — the model reads it>",
+        { id: ctx.z.string() },
+        async (args) => {
+          const res = await ctx.fetch(`https://api.myservice.com/things/${args.id}`, {
+            headers: { Authorization: `Bearer ${ctx.env.MYSERVICE_API_KEY}` },
+          });
+          const data = await res.json();
+          return { content: [{ type: "text", text: JSON.stringify(data) }] };
+        },
+        { alwaysLoad: true },
+      ),
+    ],
+    meta: {
+      tier: "auto",
+      // Per-tool override beats `meta.tier`. Use for mutating ops:
+      // toolTiers: { myservice_delete_thing: "confirm" },
+    },
+  };
+}
+```
+
+`ctx` carries `{ z, tool, fetch, log, env }`. Integrations don't import zod or the SDK directly — those come through `ctx`, so you don't need to `npm install zod` next to your `index.ts`. Only third-party SDKs (e.g. `@linear/sdk`) need a local install (see "Per-integration deps" below).
+
+**`alwaysLoad: true` (recommended for small integrations)** — the SDK normally hides MCP server tools behind `ToolSearch` discovery. With `alwaysLoad: true` the tool is visible in the model's upfront tool list every turn, costing ~50–100 tokens of schema overhead but skipping the ToolSearch round-trip. For ≤ ~10 integration tools, the math favors `alwaysLoad: true`. For very large integrations (50+ tools), keep the default to avoid bloating every turn.
+
+### Tool tiers (`auto` vs `confirm`)
+
+Every integration tool gets a tier:
+
+- `"auto"` — runs without prompting the user. Use for read-only / pure-function tools that have no side effects (a time lookup, a Knowledge-Base search, an `echo`).
+- `"confirm"` — Telegram inline-keyboard prompt before running. Use for anything that mutates state or calls a paid API. Default if `meta` is omitted.
+
+Resolution order for a tool:
+
+1. `meta.toolTiers[<short_tool_name>]` if set.
+2. `meta.tier` if set.
+3. `"confirm"` (default).
+
+`policy.ts::classifyToolWithIntegrations` consults the toolTiers map captured at boot. Cost cap and loop detector run independently in `PreToolUse` regardless of tier — `tier:"auto"` does NOT skip cost-cap enforcement.
+
+### Per-integration deps
+
+Each integration directory is its own dependency root. If your integration needs `@linear/sdk`, drop a `package.json` next to your `index.ts` and `npm install` from inside that directory:
+
+```bash
+cd $SOLRAC_INTEGRATIONS_DIR/linear
+cat > package.json <<'EOF'
+{ "name": "solrac-integration-linear", "private": true, "dependencies": { "@linear/sdk": "^64.0.0" } }
+EOF
+npm install
+```
+
+Bun's dynamic `import()` resolves `@linear/sdk` from the integration's local `node_modules` (verified — see `examples/integrations/linear/`). Integrations cannot reach solrac's `node_modules`; that's the design — each integration is fully self-contained.
+
+### Sharing integrations
+
+Pattern: a community-published integration is a **git repo** (or gist) containing one integration directory. Consumers clone it into their `$SOLRAC_INTEGRATIONS_DIR/<name>/`, run `npm install` inside if a `package.json` is present, and restart solrac.
+
+```bash
+# Operator A publishes:
+git init solrac-integration-shopify && cd solrac-integration-shopify
+# ... index.ts + package.json + README ...
+git remote add origin git@github.com:operatorA/solrac-integration-shopify.git
+git push -u origin main
+
+# Operator B consumes:
+cd $SOLRAC_INTEGRATIONS_DIR
+git clone git@github.com:operatorA/solrac-integration-shopify.git shopify
+cd shopify && npm install
+# ... configure required env vars ...
+# Restart solrac. Tools surface as mcp__solrac__shopify_*.
+```
+
+No registry. No auto-update. **Pin to a commit hash for reproducibility** — `git checkout <sha>` after clone. v1 deliberately keeps the sharing story low-tech; revisit if integrations proliferate.
+
+### API stability
+
+Integration modules MUST declare `apiVersion: 1`. The loader rejects any other value with a clear log line — your tools simply don't register, the rest of solrac runs normally. When the contract changes (e.g. a new field in `IntegrationContext`, a different `tool()` signature), solrac will bump to `apiVersion: 2`. Modules pinned to `1` will be skipped with a warn until they migrate. This is the explicit upgrade path; we will NOT silently coerce.
+
+Today, only `apiVersion: 1` is recognized.
+
+### Security note
+
+Integrations run **as solrac**, in the same process, with the same filesystem and network access solrac itself has. They are NOT sandboxed. Read this carefully:
+
+- **You wrote the code (or vetted code you copied)**. The threat model is "untrusted *Telegram users*", NOT "untrusted *integration authors*". An integration is part of your deployment.
+- Integrations have full read access to `process.env` via `ctx.env`. Don't log secrets — solrac's logger does NOT redact.
+- The Telegram-user gate still applies. Even a maliciously-permissive integration (e.g. one that exposes `Bash`) can't bypass `policy.ts::classifyTool`'s catch-all confirm-tier — Telegram users will still see the inline-keyboard prompt before the tool runs.
+- An integration's handler runs in solrac's parent process, NOT in the SDK's spawned `claude` subprocess. The subprocess env scrub (`agent.ts::sanitizedSubprocessEnv`) does NOT apply to integration handlers; they have full env access.
+
+If you're sharing an integration with someone else, treat it like you would any other shared dependency: review the code, pin to a commit, and document required env vars in the integration's README.
+
+### Built-in integrations
+
+solrac ships a small set of blessed integrations under `src/integrations-builtin/`. They're always tried first when integrations are enabled (they win tool-name collisions over operator-authored integrations) and each self-gates: missing creds or missing optional deps → register zero tools, log a single line, boot continues normally.
+
+#### `time` — current time + timestamp formatting (no setup)
+
+Two tools, zero deps, no credentials. Always loads when integrations are enabled.
+
+| Tool | Tier | Description |
+|---|---|---|
+| `mcp__solrac__time_now` | auto | Current ISO 8601 UTC timestamp + human rendering in a given IANA timezone. |
+| `mcp__solrac__time_format` | auto | Format an existing ISO timestamp in a target timezone + locale. |
+
+Use cases the agent answers without flinching:
+
+- "What time is it for the team in Tokyo right now?"
+- "Convert 2026-04-12T18:30:00Z to JST."
+- "When does our 5pm New York standup happen in Berlin?"
+
+This is also the file to read first when learning to write your own integration — `src/integrations-builtin/time/index.ts` is heavily commented and demonstrates `IntegrationContext`, `meta.tier`, `alwaysLoad`, and multi-tool registration in ~200 lines.
+
+#### `gmail` — multi-account Gmail (OAuth2; opt-in deps)
+
+11 tools spanning read, organization, and send/delete. Self-gates if `googleapis` is not installed OR no accounts are configured. Setup is a one-time bootstrap per account.
+
+| Tool | Tier | Description |
+|---|---|---|
+| `gmail_list_accounts` | auto | Discover configured aliases. |
+| `gmail_list_labels` | auto | All labels (system + user) for an account. |
+| `gmail_search_messages` | auto | Gmail query syntax (from:, subject:, is:unread, etc.). |
+| `gmail_get_message` | auto | Full message: headers, plain-text + HTML body, attachments. |
+| `gmail_list_threads` | auto | Conversation groups. |
+| `gmail_apply_label` | confirm | Add labels to messages. |
+| `gmail_remove_label` | confirm | Remove labels (e.g. mark UNREAD off → mark read). |
+| `gmail_archive_message` | confirm | Remove INBOX label. |
+| `gmail_trash_message` | confirm | Move to Trash (recoverable 30 days). |
+| `gmail_delete_message` | confirm | **PERMANENT** delete. Requires `confirm: true` body field too. |
+| `gmail_send_message` | confirm | Send email with optional attachments + reply threading. Requires `confirm: true` body field too. |
+
+The destructive ops (`delete`, `send`) carry **two** safeguards: solrac's Telegram-confirm prompt (you, the user, must tap ✅) AND a `confirm: true` field the model must explicitly include in its tool call (the model must intentionally assert "I want to send/delete"). Both must be satisfied; an agent can't trip-and-send.
+
+##### Setup (~5 min one-time + ~1 min per account)
+
+```bash
+# 1. From the solrac repo root, install Gmail's optional runtime deps.
+#    They are NOT in solrac's `dependencies` (only `devDependencies`),
+#    so production deploys via `npm ci --production` skip them. To
+#    enable Gmail in production, install with --save (no --save-dev):
+npm install --save googleapis google-auth-library
+
+# 2. Get an OAuth client credentials.json from Google Cloud Console:
+#    APIs & Services → Credentials → Create credentials → OAuth client ID.
+#    Application type: "Desktop app".
+#    Save the downloaded JSON to:
+mkdir -p ~/.solrac/gmail
+mv ~/Downloads/client_secret_*.json ~/.solrac/gmail/credentials.json
+
+# 3. Authenticate one or more accounts (opens browser per call).
+bun scripts/gmail-auth.ts personal
+bun scripts/gmail-auth.ts work
+# Each writes ~/.solrac/gmail/<alias>.json + appends to accounts.json.
+
+# 4. Restart solrac. Boot log should show:
+#    integrations.gmail.loaded accountCount:2 toolCount:11
+```
+
+If Gmail is unconfigured, the boot log distinguishes which precondition failed:
+
+| Log event | Meaning |
+|---|---|
+| `integrations.gmail.deps_missing` | `googleapis` / `google-auth-library` not installed. Run the `npm install` above. |
+| `integrations.gmail.disabled` | `~/.solrac/gmail/credentials.json` not found. Get it from Google Cloud Console. |
+| `integrations.gmail.no_accounts` | Credentials present, but no accounts authed. Run `bun scripts/gmail-auth.ts <alias>`. |
+| `integrations.gmail.loaded` | All set. Tool count + account count reported. |
+
+##### Use cases
+
+```
+@ search my personal Gmail for unread newsletters older than a week
+@ archive everything in personal Gmail labeled "promotions"
+@ draft a reply to message <id> in work Gmail saying I'll respond Monday
+```
+
+The third one will require approving the send via inline-keyboard. The agent must produce the right `confirm: true` argument first; it can't accidentally trip-send.
+
+##### Limits to know
+
+- **`gmail_delete_message` is permanent.** Use `gmail_trash_message` (Trash, recoverable 30 days) for normal deletes. The permanent-delete tool exists for cases where you really mean it.
+- **OAuth refresh** is automatic. The integration writes refreshed tokens back to `~/.solrac/gmail/<alias>.json` whenever Google rotates them.
+- **Scope is fixed** at read + modify + send + userinfo (for email-address discovery). To narrow scope, edit `scripts/gmail-auth.ts` SCOPES and re-auth per account.
+- **The `googleapis` package is ~30MB.** That's why it's an optional dep, not a runtime requirement. If you don't want Gmail, skip step 1 and Gmail self-gates on `deps_missing`.
+
+### Limits to know
+
+- **Hot-reload is intentionally absent.** Edit your `index.ts`, restart solrac. Same boot-once story as skills and config.
+- **One MCP server.** All integrations share the namespace `mcp__solrac__*` — there is no per-integration MCP server. Tool name collisions across integrations are resolved first-dir-wins (blessed first, operator second), with a warn log. Pick distinctive prefixes: `linear_*`, `gmail_*`, `shopify_*`.
+- **Audit + cost cap apply.** Every integration tool call writes to `audit.tool_calls` (the same column Claude tools use), and every call passes through `PreToolUse` (cost cap + loop detector). Verified live; see `solrac-dev/PLAN.md` Phase 3 verification.
+
 ## Permission UX
 
 Solrac classifies every tool call into one of three tiers (`policy.ts::classifyTool`). You only see prompts for the third tier.

@@ -81,7 +81,12 @@
  *   - session.ts — session id persistence
  */
 
-import { query, type CanUseTool, type Options } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type CanUseTool,
+  type McpSdkServerConfigWithInstance,
+  type Options,
+} from "@anthropic-ai/claude-agent-sdk";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { SolracDb } from "./db.ts";
@@ -171,6 +176,13 @@ export interface AgentRunDeps {
   // and auditId; the SDK only invokes this for tools its internal classifier
   // considers non-trivial. If omitted, every tool that reaches it is allowed.
   createCanUseTool?: (args: { chatId: number; auditId: number }) => CanUseTool;
+  // Optional in-process MCP server hosting operator + blessed integrations
+  // (Phase 2). When non-null, registered as `mcpServers: { solrac }` so the
+  // model sees integration tools as `mcp__solrac__<name>`. `null` when
+  // integrations are disabled or when the loader produced zero tools — in
+  // that case we omit `mcpServers` entirely rather than registering an empty
+  // server.
+  mcpServer?: McpSdkServerConfigWithInstance | null;
 }
 
 export interface AgentRunInput {
@@ -257,6 +269,13 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
     disallowedTools: ["Agent", "Task"],
     canUseTool,
     env: sanitizedSubprocessEnv(),
+    // In-process MCP server hosting operator + blessed integrations (Phase 2).
+    // Only attached when at least one tool was loaded — registering an empty
+    // server would put `mcp__solrac__*` in the model's tool list with no
+    // callable handlers, which is wasted prompt budget.
+    ...(deps.mcpServer && {
+      mcpServers: { solrac: deps.mcpServer },
+    }),
     // PreToolUse fires for every tool call, including SDK-auto-approved ones
     // (Bash(date), Read, etc.) that bypass `canUseTool` under
     // permissionMode:'default'. Cost cap + loop detector live here so the gate

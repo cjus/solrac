@@ -26,6 +26,8 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `OLLAMA_HISTORY_LIMIT` | no | `6` | positive int | Last N successful Ollama turns reconstructed as conversation context per chat. At 256-char prompts × 6 turns ≈ ~3k tokens worst case. |
 | `SOLRAC_SKILLS_ENABLED` | no | `false` | boolean | Master switch for operator-defined skills. When `true`, Solrac discovers `SKILL.md` files under `SOLRAC_SKILLS_DIR` at boot and exposes each as a `/<name>` slash command. |
 | `SOLRAC_SKILLS_DIR` | no | `./skills` | path | Directory scanned for `<name>/SKILL.md` files. Resolved relative to launch cwd. Loaded ONCE at boot — edit files and restart. See [USAGE.md#skills-operator-defined-commands](./USAGE.md#skills-operator-defined-commands). |
+| `SOLRAC_INTEGRATIONS_ENABLED` | no | `false` | boolean | Master switch for operator + blessed integrations. When `true`, Solrac discovers `<name>/index.ts` modules under `src/integrations-builtin/` (always) and `SOLRAC_INTEGRATIONS_DIR` (operator-owned) at boot, and registers each one's tools as `mcp__solrac__<tool>`. **Effective for Claude tiers (`@`, `!`) only — Ollama (`>`) does not consume integrations.** See [USAGE.md#integrations](./USAGE.md#integrations). |
+| `SOLRAC_INTEGRATIONS_DIR` | no | `./integrations` | path | Directory scanned for operator-authored `<name>/index.ts` integration modules. Resolved relative to launch cwd; can also be absolute (e.g. `~/.solrac/integrations`). Loaded ONCE at boot — edit files and restart. **Claude-tier-only** (same caveat as above). |
 | `SOLRAC_WEB_ENABLED` | no | `false` | boolean | Master switch for the browser web UI. When `true`, Solrac binds a second `Bun.serve` instance to `SOLRAC_WEB_HOST:SOLRAC_WEB_PORT`. `SOLRAC_WEB_TOKEN` becomes required. |
 | `SOLRAC_WEB_HOST` | no | `127.0.0.1` | string | Bind address for the web UI. `127.0.0.1`/`localhost` = loopback only. `0.0.0.0` = all interfaces (LAN/Tailscale/public — pair with a strong token). |
 | `SOLRAC_WEB_PORT` | no | `8080` | positive int | Port for the web UI. Must differ from `PORT` (which serves `/health` & `/stats`). |
@@ -57,6 +59,17 @@ These are exported from `config.ts` but not env-tunable in v1 — they're securi
 | `MAX_CHAT_QUEUE_DEPTH` | 10 | Max in-chain `KeyedMutex` depth before `enqueue()` returns `dropped_queue_full`. |
 
 If you need to bump these, edit the constant — and update the threat-model section in [ARCHITECTURE.md](./ARCHITECTURE.md#db-pollution-defenses) so the rationale stays current.
+
+## Anthropic rate-limit considerations
+
+Solrac's per-turn input is dominated by the SDK's `claude_code` system-prompt preset, plus the `SOUL.md`/`SOLRAC.md` overlays, the cross-engine bridge block, and — when `SOLRAC_INTEGRATIONS_ENABLED=true` — every loaded integration's tool schema. With the two blessed integrations enabled, observed primary-Claude turns send **~24K input tokens** each (mostly served from prompt cache after the first turn warms it).
+
+This collides with Anthropic's per-model **input tokens per minute (ITPM)** rate limit, which scales with your plan tier (see [Anthropic rate-limits](https://docs.claude.com/en/api/rate-limits)). Two practical implications:
+
+- If your Sonnet ITPM is below ~25K, every cold turn 429s — single-turn input already exceeds the cap. `MAX_CONCURRENT_TURNS` does not help; the problem is per-turn size, not concurrency.
+- Disabling integrations only saves per-tool schema overhead, not the bulk — most of the ~24K is the SDK preset itself.
+
+If you see `429 · This request would exceed your organization's rate limit of N input tokens per minute`, raise your Anthropic plan tier rather than tuning Solrac. Routing heavy turns through the secondary tier (`!` prefix → Opus) uses a separate ITPM bucket and may unblock you in the short term.
 
 ## Example `.env`
 
@@ -90,6 +103,11 @@ OLLAMA_HISTORY_LIMIT=6
 # Operator-defined skills. Off by default.
 SOLRAC_SKILLS_ENABLED=false       # set to true to load $SOLRAC_SKILLS_DIR/<name>/SKILL.md at boot
 SOLRAC_SKILLS_DIR=./skills        # cwd-relative; edit + restart to pick up changes
+
+# Integrations (operator-authored TS modules + blessed built-ins). Off by default.
+# Effective for Claude tiers only (`@`, `!`). Ollama (`>`) ignores integrations.
+SOLRAC_INTEGRATIONS_ENABLED=false # set to true to load src/integrations-builtin + $SOLRAC_INTEGRATIONS_DIR
+SOLRAC_INTEGRATIONS_DIR=./integrations # cwd-relative; edit + restart to pick up changes
 
 # Web UI. Off by default. When SOLRAC_WEB_ENABLED=true, SOLRAC_WEB_TOKEN is required.
 SOLRAC_WEB_ENABLED=false

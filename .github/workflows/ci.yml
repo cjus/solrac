@@ -29,3 +29,6 @@ jobs:
 
       - name: Test
         run: bun test
+
+      - name: Smoke — integrations loader
+        run: npm run smoke:integrations

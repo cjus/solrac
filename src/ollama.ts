@@ -109,8 +109,14 @@ const THINKING_STUB = "🦙 thinking…";
 // design) because it's a fact about THIS engine — Ollama is tools-disabled —
 // not a personality trait. SOUL.md ships engine-agnostic so the same file
 // serves both the Claude and Ollama paths.
+//
+// The routing nudge is here because the OPERATOR may have integrations
+// enabled on the Claude tiers; if a user prefixes a tool-shaped request with
+// `>` they'll get a hallucination or refusal. Naming the right prefix in the
+// system prompt lets the local model itself redirect without the user having
+// to learn the convention from docs.
 export const OLLAMA_CAPABILITY_NOTE =
-  "You do not have tools; answer from what you know.";
+  "You do not have tools; answer from what you know. If the user asks for something that needs tools (file edits, API calls, web fetches), tell them to re-send the message with `@` (default tier) or `!` (heavyweight tier) instead of `>`.";
 
 export interface OllamaRunDeps {
   tg: TelegramClient;

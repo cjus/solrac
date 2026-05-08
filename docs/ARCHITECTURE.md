@@ -339,6 +339,22 @@ The SDK's `query()` spawns a `claude` subprocess that **inherits parent env**. T
 
 Pass-through for everything else (the agent legitimately needs `ANTHROPIC_API_KEY`, `PATH`, etc.). If you add a new operator-only secret, add a scrub line. If you add a third-party API key meant for the agent's tools, leave it pass-through and consider adding an [auto-deny rule](#bash-rule-tables) for the corresponding CLI to keep budget under the cap.
 
+### Integrations: in-process MCP server
+
+Operators can extend the Claude tiers' tool surface by dropping TypeScript modules under `src/integrations-builtin/<name>/index.ts` (blessed, shipped with solrac) or `$SOLRAC_INTEGRATIONS_DIR/<name>/index.ts` (operator-authored). Each module default-exports `setup(ctx) → { apiVersion: 1, tools, meta? }`. At boot, `main.ts` invokes `loadIntegrations([builtinDir, operatorDir], ctx)`, collects every tool, and passes them through a single `createSdkMcpServer({ name: "solrac", tools })` to the SDK as `options.mcpServers = { solrac }`.
+
+Tools surface to the model as `mcp__solrac__<name>`. The full picture:
+
+- **Loader.** `src/integrations.ts` — fail-soft per-integration error handling, first-dir-wins on tool-name collisions (so a stale operator copy can't shadow a blessed integration), boot-only (no hot-reload, matches skills loader semantics).
+- **Context.** `IntegrationContext` carries `{ z, tool, fetch, log, env }`. Integrations don't import zod or the SDK directly; they receive solrac's instances. Each integration directory IS its own dependency root — Bun's dynamic `import()` resolves bare specifiers from the integration's location upward, so `npm install @linear/sdk` next to `index.ts` works without polluting solrac's `node_modules`.
+- **Policy gating.** Integration tools default to `"confirm"` (Telegram inline-keyboard) via `policy.ts::classifyTool`'s catch-all. An integration may declare `meta.tier: "auto"` or `meta.toolTiers: { tool_name: "auto" }` to bypass the prompt for safe operations. `classifyToolWithIntegrations(toolName, input, toolTiers)` is the integration-aware shim — `classifyTool` itself stays pure.
+- **Cost cap + loop detector** apply identically to integration tools — verified via live `policy.cost_cap_exceeded` event firing for `mcp__solrac__echo_say` when the cap was tripped (`carlos/solrac-integrations` Phase 3 verification).
+- **Heavy deps optional.** Blessed integrations (e.g. `gmail`) may dynamic-import packages like `googleapis` and gracefully no-op when absent. Solrac's direct dependencies remain SDK + `marked` + `zod`. Operators who want Gmail run `npm install googleapis google-auth-library` from the solrac root once.
+
+### Ollama scope (no integrations)
+
+`runOllamaTurn` in `ollama.ts` does NOT consume `deps.mcpServer`. The local-model path is intentionally tool-less — `OLLAMA_CAPABILITY_NOTE` (`ollama.ts:112`) tells the local model "you do not have tools" and `audit.tool_calls` is hardcoded to `null` (`ollama.ts:348`). The capability note nudges users toward `@`/`!` prefixes when they ask for tool work. Tool-call support on Ollama is tracked as [`ROADMAP.md` OQ#16](./ROADMAP.md#oq16--integrations-on-ollama) — deferred because Ollama tool-call reliability varies sharply by model.
+
 ---
 
 ## Concurrency model
@@ -606,11 +622,11 @@ Global is checked first because if the host is over its absolute budget, every c
 
 The first non-whitespace character of `msg.text` picks the engine:
 
-| Prefix | Engine label | Model | Audit `model` value |
-|--------|--------------|-------|---------------------|
-| (none) or `@` | `primary` (Claude) | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | `claude:primary:<modelId>` |
-| `!` | `secondary` (Claude) | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | `claude:secondary:<modelId>` |
-| `>` | `ollama` | `OLLAMA_MODEL` (required when `OLLAMA_ENABLED=true`) | `ollama:<modelId>` |
+| Prefix | Engine label | Model | Tools | Audit `model` value |
+|--------|--------------|-------|-------|---------------------|
+| (none) or `@` | `primary` (Claude) | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | `claude_code` preset + integrations | `claude:primary:<modelId>` |
+| `!` | `secondary` (Claude) | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | `claude_code` preset + integrations | `claude:secondary:<modelId>` |
+| `>` | `ollama` | `OLLAMA_MODEL` (required when `OLLAMA_ENABLED=true`) | none — local model is text-completion only | `ollama:<modelId>` |
 
 `policy.ts::parseEnginePrefix(text)` returns `{ engine, explicit, prompt }`. `explicit` is true only when an actual prefix character was consumed; the `main.ts` dispatcher uses it to decide whether an empty payload should render a usage hint (only for explicit prefixes — no-prefix-empty messages can't reach us; Telegram rejects empty text).
 

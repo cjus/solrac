@@ -1,0 +1,10 @@
+{
+  "name": "solrac-integration-linear",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Example solrac integration: Linear (issues + projects). Real-pattern reference.",
+  "type": "module",
+  "dependencies": {
+    "@linear/sdk": "^64.0.0"
+  }
+}

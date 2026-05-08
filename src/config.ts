@@ -90,6 +90,15 @@ export interface Config {
   // for `./data` (dataDir).
   readonly skillsEnabled: boolean;
   readonly skillsDir: string;
+  // Operator-authored integrations (Phase 1). `integrationsEnabled` is the
+  // master switch; when off, neither blessed (`src/integrations-builtin/`)
+  // nor operator integrations (`integrationsDir`) load — solrac runs with
+  // the same SDK preset tool surface as before. When on, both sources are
+  // discovered. Default `./integrations` matches the `./skills` convention
+  // for cwd-relative operator dirs. Effective for Claude tiers (`@`, `!`)
+  // only — Ollama path ignores integrations.
+  readonly integrationsEnabled: boolean;
+  readonly integrationsDir: string;
   // Web UI transport — second Bun.serve instance on a separate port. When
   // off (default), Solrac is Telegram-only. When on, `webToken` is required
   // even on loopback (a co-tenant on a shared host could otherwise reach the
@@ -283,6 +292,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       env.SOLRAC_SKILLS_DIR && env.SOLRAC_SKILLS_DIR.trim() !== ""
         ? env.SOLRAC_SKILLS_DIR.trim()
         : "./skills",
+    integrationsEnabled: parseBoolean(
+      "SOLRAC_INTEGRATIONS_ENABLED",
+      env.SOLRAC_INTEGRATIONS_ENABLED,
+      false,
+    ),
+    integrationsDir:
+      env.SOLRAC_INTEGRATIONS_DIR && env.SOLRAC_INTEGRATIONS_DIR.trim() !== ""
+        ? env.SOLRAC_INTEGRATIONS_DIR.trim()
+        : "./integrations",
     webEnabled,
     webHost,
     webPort,
