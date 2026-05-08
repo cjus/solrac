@@ -205,3 +205,26 @@ describe("loadConfig — skills", () => {
     expect(cfg.skillsDir).toBe("./skills");
   });
 });
+
+describe("loadConfig — integrations", () => {
+  test("default: integrationsEnabled=false, integrationsDir=./integrations", () => {
+    const cfg = loadConfig({ ...baseEnv });
+    expect(cfg.integrationsEnabled).toBe(false);
+    expect(cfg.integrationsDir).toBe("./integrations");
+  });
+
+  test("SOLRAC_INTEGRATIONS_ENABLED=true is parsed", () => {
+    const cfg = loadConfig({ ...baseEnv, SOLRAC_INTEGRATIONS_ENABLED: "true" });
+    expect(cfg.integrationsEnabled).toBe(true);
+  });
+
+  test("SOLRAC_INTEGRATIONS_DIR overrides default", () => {
+    const cfg = loadConfig({ ...baseEnv, SOLRAC_INTEGRATIONS_DIR: "/var/solrac/integrations" });
+    expect(cfg.integrationsDir).toBe("/var/solrac/integrations");
+  });
+
+  test("SOLRAC_INTEGRATIONS_DIR blank falls back to ./integrations", () => {
+    const cfg = loadConfig({ ...baseEnv, SOLRAC_INTEGRATIONS_DIR: "  " });
+    expect(cfg.integrationsDir).toBe("./integrations");
+  });
+});
