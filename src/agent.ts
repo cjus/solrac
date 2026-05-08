@@ -449,7 +449,12 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
       .catch((err) => log.warn("agent.final_send_failed", { error: (err as Error).message }));
   }
 
-  if (resultSessionId) {
+  // PNX-170 — only persist the SDK session id on a clean turn. Errored
+  // sessions retain partial state (interrupted tool_use, stuck loops) that
+  // confuses the model on resume; dropping the id forces the next turn to
+  // open a fresh session. Mirrors the `!isError` gate on summary clearing
+  // below. See ARCHITECTURE.md#tricky-seams.
+  if (resultSessionId && !isError) {
     deps.sessions.setSessionId(input.chatId, input.engine, resultSessionId);
   }
   // PNX-167 — consume the /compact summary on a successful turn. The summary

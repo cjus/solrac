@@ -925,6 +925,16 @@ If we reordered (offset before claim), a crash between steps 2 and 3 would re-pr
 
 **Implication.** `enqueue()` returning sync (not awaiting turn completion) is load-bearing. The drain happens via the tracker, not the offset.
 
+### 8. Session-resume contract: only resume clean turns
+
+**Problem.** A mid-turn API error (429, network blip, model timeout) leaves the SDK session in a partially-failed state — interrupted `tool_use` without a matching `tool_result`, partial assistant text, or a stuck `error_max_turns` loop. All four `SDKResultError.subtype` values (`error_during_execution`, `error_max_turns`, `error_max_budget_usd`, `error_max_structured_output_retries`) carry a non-null `session_id` (see `sdk.d.ts:3050-3066`), so the SDK happily hands back a resumable id even on failure. If we resume that id, the model's next-turn narration conflates the prior failed attempt with the present one — observed live as the model claiming a present-and-successful tool call was "blocked by a permission error" because the resumed session history showed a prior denial-shaped failure.
+
+**Solution.** `agent.ts` gates the `setSessionId` write on `!isError`. Errored turns drop the session id silently; the next inbound message starts a fresh SDK session. Mirrors the existing `!isError` gate on summary clearing two lines below. Both Claude tiers (`primary_session_id`, `secondary_session_id`) inherit the gate via the shared call site — no per-tier duplication.
+
+**Implication.** `/clear` remains the explicit operator escape hatch (semantics unchanged), but operators no longer need to remember to run it after every visible `❌ error` — recovery is automatic on the next message. There is no operator-facing surface change beyond the absence of contaminated narration.
+
+**See also.** PNX-170 ticket for the original repro with a 429-driven `error_during_execution`.
+
 ---
 
 ## Logging
