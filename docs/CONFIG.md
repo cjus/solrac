@@ -60,6 +60,17 @@ These are exported from `config.ts` but not env-tunable in v1 — they're securi
 
 If you need to bump these, edit the constant — and update the threat-model section in [ARCHITECTURE.md](./ARCHITECTURE.md#db-pollution-defenses) so the rationale stays current.
 
+## Anthropic rate-limit considerations
+
+Solrac's per-turn input is dominated by the SDK's `claude_code` system-prompt preset, plus the `SOUL.md`/`SOLRAC.md` overlays, the cross-engine bridge block, and — when `SOLRAC_INTEGRATIONS_ENABLED=true` — every loaded integration's tool schema. With the two blessed integrations enabled, observed primary-Claude turns send **~24K input tokens** each (mostly served from prompt cache after the first turn warms it).
+
+This collides with Anthropic's per-model **input tokens per minute (ITPM)** rate limit, which scales with your plan tier (see [Anthropic rate-limits](https://docs.claude.com/en/api/rate-limits)). Two practical implications:
+
+- If your Sonnet ITPM is below ~25K, every cold turn 429s — single-turn input already exceeds the cap. `MAX_CONCURRENT_TURNS` does not help; the problem is per-turn size, not concurrency.
+- Disabling integrations only saves per-tool schema overhead, not the bulk — most of the ~24K is the SDK preset itself.
+
+If you see `429 · This request would exceed your organization's rate limit of N input tokens per minute`, raise your Anthropic plan tier rather than tuning Solrac. Routing heavy turns through the secondary tier (`!` prefix → Opus) uses a separate ITPM bucket and may unblock you in the short term.
+
 ## Example `.env`
 
 ```sh
