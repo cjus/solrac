@@ -79,6 +79,7 @@ import type { Update } from "@grammyjs/types";
 import { MAX_AUDIT_PROMPT_LEN } from "./config.ts";
 import {
   classifyTool,
+  classifyToolWithIntegrations,
   createConfirmationBroker,
   createCostCapGuard,
   createDenialThrottle,
@@ -494,6 +495,59 @@ describe("classifyTool", () => {
   test("Bash without a string command goes to confirm (caller didn't supply one)", () => {
     expect(classifyTool("Bash", {})).toEqual({ kind: "confirm" });
     expect(classifyTool("Bash", null)).toEqual({ kind: "confirm" });
+  });
+});
+
+describe("classifyToolWithIntegrations", () => {
+  test("non-mcp-solrac tool unaffected by toolTiers map", () => {
+    const tiers = new Map<string, "auto" | "confirm">([["echo_say", "auto"]]);
+    expect(classifyToolWithIntegrations("Read", { file_path: "/tmp/x" }, tiers)).toEqual({
+      kind: "allow",
+    });
+    expect(classifyToolWithIntegrations("Bash", { command: "rm -rf /" }, tiers)).toMatchObject({
+      kind: "deny",
+    });
+    expect(classifyToolWithIntegrations("Write", { file_path: "/x" }, tiers)).toEqual({
+      kind: "confirm",
+    });
+  });
+
+  test("mcp__solrac__* tool with auto tier → allow", () => {
+    const tiers = new Map<string, "auto" | "confirm">([["echo_say", "auto"]]);
+    expect(classifyToolWithIntegrations("mcp__solrac__echo_say", { msg: "hi" }, tiers)).toEqual({
+      kind: "allow",
+    });
+  });
+
+  test("mcp__solrac__* tool with confirm tier → confirm (catch-all)", () => {
+    const tiers = new Map<string, "auto" | "confirm">([["risky_op", "confirm"]]);
+    expect(classifyToolWithIntegrations("mcp__solrac__risky_op", {}, tiers)).toEqual({
+      kind: "confirm",
+    });
+  });
+
+  test("mcp__solrac__* tool not in map → confirm (safe default)", () => {
+    const tiers = new Map<string, "auto" | "confirm">();
+    expect(classifyToolWithIntegrations("mcp__solrac__unknown", {}, tiers)).toEqual({
+      kind: "confirm",
+    });
+  });
+
+  test("empty toolTiers map: every mcp__solrac__* falls through to confirm", () => {
+    const tiers = new Map<string, "auto" | "confirm">();
+    expect(classifyToolWithIntegrations("mcp__solrac__a", {}, tiers)).toEqual({ kind: "confirm" });
+    expect(classifyToolWithIntegrations("mcp__solrac__b", {}, tiers)).toEqual({ kind: "confirm" });
+  });
+
+  test("similar prefix that isn't ours doesn't trigger the branch", () => {
+    // mcp__notion__... is a different MCP server's tool; no tier override
+    // applies, and `classifyTool`'s catch-all returns confirm. The point
+    // here is that `mcp__notion__search` is NOT shortened to `search` and
+    // looked up in our map.
+    const tiers = new Map<string, "auto" | "confirm">([["search", "auto"]]);
+    expect(classifyToolWithIntegrations("mcp__notion__search", {}, tiers)).toEqual({
+      kind: "confirm",
+    });
   });
 });
 

@@ -510,9 +510,41 @@ async function main(): Promise<void> {
     const costGuard = createCostCapGuard(db, config.hourlyCostCapUsd);
     const globalCostGuard = createGlobalCostCapGuard(db, config.globalHourlyCostCapUsd);
     const denialThrottle = createDenialThrottle();
+    // Phase 2 — load integrations BEFORE `createCanUseTool` so the per-turn
+    // policy hook closes over the per-tool tier map captured here. Off by
+    // default; when enabled, both `src/integrations-builtin/` (always tried,
+    // shipped with solrac) and `$SOLRAC_INTEGRATIONS_DIR` (operator-owned)
+    // are scanned. First-dir-wins on tool-name collisions so a stale
+    // operator copy can't shadow a blessed integration. Tools registered
+    // here surface to Claude tiers as `mcp__solrac__<name>`. Ollama
+    // (`>` prefix) does NOT see integrations — see ollama.ts.
+    let integrationsMcpServer: McpSdkServerConfigWithInstance | null = null;
+    let integrationToolTiers: ReadonlyMap<string, "auto" | "confirm"> = new Map();
+    if (config.integrationsEnabled) {
+      const builtinDir = join(import.meta.dir, "integrations-builtin");
+      const result = await loadIntegrations(
+        [builtinDir, config.integrationsDir],
+        createIntegrationContext(),
+      );
+      logIntegrationLoadResult([builtinDir, config.integrationsDir], result);
+      integrationToolTiers = result.toolTiers;
+      if (result.tools.length > 0) {
+        integrationsMcpServer = createSdkMcpServer({
+          name: "solrac",
+          version: "1.0.0",
+          tools: [...result.tools],
+        });
+      }
+    }
     const createCanUseTool = ({ chatId, auditId }: { chatId: number; auditId: number }) => {
       const b = webBroker && chatId === config.webChatId ? webBroker : broker;
-      return createPolicyHook({ chatId, auditId, costGuard, broker: b });
+      return createPolicyHook({
+        chatId,
+        auditId,
+        costGuard,
+        broker: b,
+        integrationToolTiers,
+      });
     };
     // PLAN Step 11: Ollama deps are constructed once iff the feature is on.
     // When off, dispatch in makeRunTurn falls through to a "disabled" reply.
@@ -554,30 +586,6 @@ async function main(): Promise<void> {
           return result.registry;
         })()
       : EMPTY_SKILL_REGISTRY;
-
-    // Phase 2 — load integrations (blessed + operator-authored). Off by
-    // default. When enabled, both `src/integrations-builtin/` (always tried,
-    // shipped with solrac) and `$SOLRAC_INTEGRATIONS_DIR` (operator-owned)
-    // are scanned. First-dir-wins on tool-name collisions so a stale
-    // operator copy can't shadow a blessed integration. Tools registered
-    // here surface to Claude tiers as `mcp__solrac__<name>`. Ollama
-    // (`>` prefix) does NOT see integrations — see ollama.ts.
-    let integrationsMcpServer: McpSdkServerConfigWithInstance | null = null;
-    if (config.integrationsEnabled) {
-      const builtinDir = join(import.meta.dir, "integrations-builtin");
-      const result = await loadIntegrations(
-        [builtinDir, config.integrationsDir],
-        createIntegrationContext(),
-      );
-      logIntegrationLoadResult([builtinDir, config.integrationsDir], result);
-      if (result.tools.length > 0) {
-        integrationsMcpServer = createSdkMcpServer({
-          name: "solrac",
-          version: "1.0.0",
-          tools: [...result.tools],
-        });
-      }
-    }
 
     // PNX-167 — register slash commands so Telegram clients show them in the
     // bot's autocomplete menu. Non-fatal — autocomplete is a UX nicety.

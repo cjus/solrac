@@ -353,6 +353,43 @@ function readBashCommand(input: unknown): string | null {
   return null;
 }
 
+// Integration-aware classifier. Stays a thin shim ON TOP of `classifyTool`
+// so the pure-function contract of `classifyTool` is preserved (tests rely
+// on it). `toolTiers` is the per-tool tier map produced by the integrations
+// loader (`integrations.ts::loadIntegrations`); keys are the SHORT tool
+// name as the integration declared it (e.g. `"echo_say"`), and the SDK
+// surfaces them to the model as `mcp__solrac__echo_say`.
+//
+// Resolution order for an `mcp__solrac__*` tool name:
+//   1. tier "auto" in toolTiers → allow without confirm.
+//   2. tier "confirm" in toolTiers → fall through to default (confirm).
+//   3. not in toolTiers → fall through to default (confirm).
+// For any other tool name the call is a straight passthrough to
+// `classifyTool` — the prefix branch can't shadow Bash, Write, etc.
+//
+// The SDK's MCP tool-name format `mcp__<server>__<name>` is documented at
+// https://docs.anthropic.com/.../mcp — we register our server as `solrac`
+// (see main.ts) so the prefix is fixed at `mcp__solrac__`.
+const SOLRAC_MCP_PREFIX = "mcp__solrac__";
+
+export function classifyToolWithIntegrations(
+  toolName: string,
+  input: unknown,
+  toolTiers: ReadonlyMap<string, "auto" | "confirm">,
+): ToolDecision {
+  if (toolName.startsWith(SOLRAC_MCP_PREFIX)) {
+    const shortName = toolName.slice(SOLRAC_MCP_PREFIX.length);
+    if (toolTiers.get(shortName) === "auto") {
+      return { kind: "allow" };
+    }
+    // Anything else — including unknown short names — falls through to
+    // confirm via the catch-all in `classifyTool`. Don't `return` here:
+    // letting `classifyTool` run gives operators a single source of truth
+    // for what "no tier override" means.
+  }
+  return classifyTool(toolName, input);
+}
+
 // ---------------------------------------------------------------------------
 // Cost cap (per-chat / sliding hour)
 // ---------------------------------------------------------------------------
@@ -614,6 +651,11 @@ export interface PolicyHookDeps {
   // Whether to consult the broker. Tests inject a stub broker; production
   // wiring always passes one through.
   classify?: (toolName: string, input: unknown) => ToolDecision;
+  // Per-tool tier overrides for `mcp__solrac__*` integration tools. Empty
+  // map (or absent) means every integration tool falls through to the
+  // confirm tier — the safe default. Captured at boot from the integrations
+  // loader and reused across all turns. Tests pass an explicit map.
+  integrationToolTiers?: ReadonlyMap<string, "auto" | "confirm">;
 }
 
 // Build the per-turn `canUseTool` hook. The SDK may call this concurrently
@@ -621,7 +663,16 @@ export interface PolicyHookDeps {
 // is either pure (classify), atomic (cost-cap query is a single SQL read), or
 // uses the broker's own Map (single-key writes).
 export function createPolicyHook(deps: PolicyHookDeps): CanUseTool {
-  const classify = deps.classify ?? classifyTool;
+  // Resolve the classifier ONCE at factory time, not per-call. If the caller
+  // supplied a custom `classify` that takes precedence (test injection); else
+  // we wrap `classifyTool` with the integration-aware shim that consults
+  // `integrationToolTiers` for `mcp__solrac__*` lookups. Empty map is fine —
+  // shim falls through to confirm on cache miss.
+  const integrationToolTiers = deps.integrationToolTiers ?? new Map();
+  const classify =
+    deps.classify ??
+    ((toolName: string, input: unknown) =>
+      classifyToolWithIntegrations(toolName, input, integrationToolTiers));
   return async (toolName, input): Promise<PermissionResult> => {
     const cap = deps.costGuard.check(deps.chatId);
     if (cap.exceeded) {
