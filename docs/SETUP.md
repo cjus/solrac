@@ -181,7 +181,41 @@ If you don't have Ollama or don't enable the flag, `>`-prefixed messages get a o
 
 For the full env reference and constraints, see [CONFIG.md](./CONFIG.md). For the live-smoke harness against your local Ollama, run `npm run smoke:ollama`.
 
-## 11. (Optional) Production deploy
+## 11. (Optional) Enable the browser web UI
+
+Solrac can run a second `Bun.serve` instance that hosts a minimal vanilla-JS chat interface alongside the Telegram bot. Same agent loop, same slash commands, same engine routing, same audit log — different transport. Useful when Telegram is unavailable, on a desk monitor, or for richer markdown rendering than Telegram's HTML mode supports.
+
+1. Pick a port (must differ from `PORT`). Default `8080`.
+2. Generate a strong token: `openssl rand -hex 32`.
+3. Add to `.env`:
+
+   ```sh
+   SOLRAC_WEB_ENABLED=true
+   SOLRAC_WEB_HOST=127.0.0.1               # 0.0.0.0 to expose on LAN/Tailnet
+   SOLRAC_WEB_PORT=8080                    # must differ from PORT
+   SOLRAC_WEB_TOKEN=<paste-the-hex-here>   # required even on 127.0.0.1
+   # SOLRAC_WEB_CHAT_ID=-1000              # synthetic shared chat id (negative)
+   ```
+
+4. Restart Solrac. The boot log gains a `web.listening` line:
+
+   ```json
+   {"level":"info","msg":"web.listening","host":"127.0.0.1","port":8080,"bound_zero":false}
+   ```
+
+5. Browse to `http://127.0.0.1:8080`. The login page accepts your token; on success a `solrac_web` cookie is set (`HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`) and the chat UI loads.
+
+6. Try it: send `**hello in bold**` — the browser renders proper bold; Telegram (if you also DM the bot) shows the same with `<b>` HTML. Try ` ```py\nprint(1)\n``` ` — the browser shows a syntax-class code block; Telegram shows a `<pre><code class="language-py">` block. Both transports get the right formatting on their respective clients.
+
+**Security notes:**
+- The token is **required** even on `127.0.0.1` — a co-tenant on a shared host could otherwise reach the unauthenticated UI.
+- When `SOLRAC_WEB_HOST=0.0.0.0`, the UI is reachable on every interface. Pair with a strong token (32+ hex chars) and consider Tailscale or a reverse proxy if you need TLS.
+- Sessions are stored in process memory; restarting Solrac signs out all browsers (operator must log in again).
+- File uploads are not supported (Telegram's photo flow is). Out of scope for v1.
+
+For the full env reference, see [CONFIG.md](./CONFIG.md#variables); for the architecture and security posture see [ARCHITECTURE.md#web-ui-transport-optional](./ARCHITECTURE.md#web-ui-transport-optional); for daily-use feature parity with Telegram see [USAGE.md#web-ui-browser-interface](./USAGE.md#web-ui-browser-interface).
+
+## 12. (Optional) Production deploy
 
 For systemd-managed deploys see [OPERATIONS.md](./OPERATIONS.md#systemd-deploy). The rough shape:
 

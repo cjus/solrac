@@ -106,6 +106,14 @@ Terms that recur across Solrac's codebase and docs. Alphabetical.
 
 **WAL** — SQLite Write-Ahead Log mode (`PRAGMA journal_mode = WAL`). Concurrent readers + a single writer; checkpointed to truncate on graceful shutdown (`PRAGMA wal_checkpoint(TRUNCATE)` in `lifecycle.ts`).
 
+**web transport** — Optional second transport: a `Bun.serve` instance on `SOLRAC_WEB_HOST:SOLRAC_WEB_PORT` that hosts a browser chat UI. All web traffic shares one synthetic `chat.id` (default `-1000`, settable via `SOLRAC_WEB_CHAT_ID`). Token-gated login (`SOLRAC_WEB_TOKEN`) → HttpOnly + SameSite=Strict cookie. The `WebClient` (`src/web-client.ts`) implements the same `TelegramClient` interface as the bot path, publishing to an in-process bus consumed by SSE. Off by default; see [SETUP.md#11-optional-enable-the-browser-web-ui](./SETUP.md#11-optional-enable-the-browser-web-ui).
+
+**WebClient** — `src/web-client.ts::createWebClient`. A `TelegramClient`-shaped sink whose `sendMessage` / `editMessageText` / `setMessageReaction` publish events to an in-process bus instead of calling Telegram's API. Lets `agent.ts`, `ollama.ts`, `commands.ts`, and the confirmation broker run unmodified against the web transport.
+
+**markdownSource** — Optional sidecar field on `SendMessageOpts` carrying the raw markdown text alongside the Telegram-HTML body. The real Telegram client strips it before the wire (it's not a Telegram API field); the WebClient reads it preferentially so the browser renders full markdown via `marked` + the allowlist sanitizer.
+
+**mdToTelegramHtml** — `src/markdown.ts::mdToTelegramHtml(md)`. Converts markdown to the small HTML subset Telegram's `parse_mode: HTML` accepts (no `<h1>`, no `<ul>`, no `<table>`). Headers collapse to `<b>`, lists flatten to `• item` lines, tables render as ASCII inside `<pre>`. Wrapped in try/catch with fallback to `htmlEscapeText` so a parser glitch can't break the existing Telegram path.
+
 **workspace** — Per-chat directory at `<dataDir>/workspaces/<chatId>/` used as the agent's `cwd`. Idempotently created by `agent.ts::runAgent`. Accumulates files from agent shell calls; janitor is deferred (see [OQ#4](./ROADMAP.md#oq4-workspace-janitor)).
 
 **zombie poller** — Anti-pattern from previous architecture: a process kept polling Telegram after the user thought it was dead, racing a fresh instance. Solrac defends with the PID file (`poll.ts::acquirePidFile`) and 409-on-conflict fast exit.

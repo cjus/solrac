@@ -26,6 +26,7 @@ If you'd rather use Claude Code's official Telegram plugin, that's a perfectly g
 - **Persistent audit trail** — every turn (allowed, denied, queue-full) writes a SQLite row with prompt, response, tool calls, cost, tokens, session id, status, **and engine** (`claude:primary:<modelId>` / `claude:secondary:<modelId>` / `ollama:<name>`).
 - **Dual-Claude tier routing** — message prefix picks the model: no prefix or `@` → primary tier (`SOLRAC_PRIMARY_MODEL`, default `claude-sonnet-4-6` — cheap default), `!` → secondary tier (`SOLRAC_SECONDARY_MODEL`, default `claude-opus-4-7` — heavyweight, "escalate"). Each tier keeps its own SDK session id so prompt caching survives same-tier turns; cross-tier context bridge means the other tier's recent turns get prepended as out-of-band context. Per-tier thinking-stub emoji (🙂 primary / 🤔 secondary) makes the routing visible in chat.
 - **Local-Ollama escape hatch** — messages prefixed with `>` route to a local Ollama instance instead of Claude. Free, offline-capable, pure inference (no tools). Cross-engine context bridge means the conversation thread flows in every direction: each Claude tier sees prior `>` exchanges and the other tier's turns; Ollama sees both Claude tiers' responses.
+- **Optional browser web UI** — a second `Bun.serve` instance on a configurable port serves a minimal vanilla-JS chat interface with the same agent loop, slash commands, engine routing, and tool-confirm UX as Telegram. Full markdown rendering (headers, lists, tables, fenced code) on both transports — Claude/Ollama responses get a server-side markdown→HTML pass for Telegram and the raw markdown to the browser. Off by default; enable with `SOLRAC_WEB_ENABLED=true` plus a token. See [docs/USAGE.md#web-ui-browser-interface](./docs/USAGE.md#web-ui-browser-interface).
 - **Session resume across restarts** — SDK session ids persisted per chat **and per tier**; conversations survive process death.
 - **Inline-keyboard confirm UX** — 60-second timeout, fail-closed on send failure, verdict stamped into chat history after tap.
 - **Bearer-gated `/stats` endpoint** — RSS, in-flight turns, 24h spend; `node:crypto.timingSafeEqual` constant-time auth.
@@ -63,6 +64,8 @@ If you don't have Bun, a Telegram bot, or an Anthropic API key — see [docs/SET
 
 **Optional — local-Ollama routing.** Set `OLLAMA_ENABLED=true` and `OLLAMA_MODEL=<pulled-model>` in `.env` (e.g. `gemma4:e4b`, `llama3.2`, `qwen2.5`); Solrac then routes any message starting with `>` to your local Ollama at `OLLAMA_URL` (default `http://localhost:11434`) instead of Claude. See [docs/USAGE.md#routing-to-local-ollama--prefix](./docs/USAGE.md#routing-to-local-ollama--prefix) and [docs/ARCHITECTURE.md#engine-routing](./docs/ARCHITECTURE.md#engine-routing).
 
+**Optional — browser web UI.** Set `SOLRAC_WEB_ENABLED=true` and `SOLRAC_WEB_TOKEN=$(openssl rand -hex 32)` in `.env`; browse to `http://127.0.0.1:8080` for a chat interface with full markdown rendering. Bind `SOLRAC_WEB_HOST=0.0.0.0` to expose it on a LAN/Tailnet (token gates access). See [docs/USAGE.md#web-ui-browser-interface](./docs/USAGE.md#web-ui-browser-interface) and [docs/ARCHITECTURE.md#web-ui-transport-optional](./docs/ARCHITECTURE.md#web-ui-transport-optional).
+
 ## Documentation
 
 | Doc | Audience | What it covers |
@@ -81,6 +84,15 @@ Auxiliary references in the source tree:
 - `docs/SDK_NOTES.md` — verified Claude Agent SDK surface, pinned to `0.2.119`
 - `docs/SLASH_COMMANDS_DESIGN.md` — design notes for the `/help`, `/status`, `/context`, `/clear`, `/compact` surface
 - `deploy/systemd/README.md` — install commands for the three systemd units
+
+Web UI deep-dives are split across the existing docs:
+
+- [SETUP.md §11](./docs/SETUP.md#11-optional-enable-the-browser-web-ui) — turning it on, security notes
+- [USAGE.md "Web UI"](./docs/USAGE.md#web-ui-browser-interface) — feature parity with Telegram, markdown rendering
+- [CONFIG.md](./docs/CONFIG.md#variables) — the five `SOLRAC_WEB_*` env vars
+- [OPERATIONS.md "Web UI (optional)"](./docs/OPERATIONS.md#web-ui-optional) — boot verification, route reference, audit queries
+- [ARCHITECTURE.md "Web UI transport"](./docs/ARCHITECTURE.md#web-ui-transport-optional) — module map, markdown sidecar, anti-goal posture
+- [RUNBOOK.md "Web UI not reachable"](./docs/RUNBOOK.md#web-ui-issues) and ["streaming silent"](./docs/RUNBOOK.md#web-ui-stream-silent) — troubleshooting
 
 ## Repository layout
 

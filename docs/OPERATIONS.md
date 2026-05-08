@@ -172,6 +172,91 @@ Response shape:
 
 ---
 
+## Web UI (optional)
+
+A second `Bun.serve` instance hosts the browser chat interface when `SOLRAC_WEB_ENABLED=true`. Same process, separate port, separate bind address — so ops endpoints (`/health`, `/stats`) can stay on loopback while the UI is exposed on a Tailnet IP, or vice versa.
+
+### Enable
+
+```sh
+# .env
+SOLRAC_WEB_ENABLED=true
+SOLRAC_WEB_HOST=127.0.0.1               # 0.0.0.0 to expose on LAN/Tailnet
+SOLRAC_WEB_PORT=8080                    # must differ from PORT (8443)
+SOLRAC_WEB_TOKEN=$(openssl rand -hex 32)   # required even on loopback
+```
+
+Restart Solrac. The boot log gains:
+
+```json
+{"level":"info","msg":"web.listening","host":"127.0.0.1","port":8080,"bound_zero":false}
+```
+
+### Verify
+
+```sh
+# Anonymous request hits the login page (HTML) on the configured port.
+curl -s http://127.0.0.1:8080/ | head -3
+# <!doctype html>...
+
+# /api/history is gated; bad cookie → 401.
+curl -s http://127.0.0.1:8080/api/history -w '\n(status %{http_code})\n'
+# {"ok":false} (status 401)
+
+# Login mints a session cookie.
+curl -s -c /tmp/solrac.cookie -X POST http://127.0.0.1:8080/api/login \
+  -H 'content-type: application/json' \
+  -d "{\"token\":\"$SOLRAC_WEB_TOKEN\"}"
+# {"ok":true}
+
+curl -s -b /tmp/solrac.cookie http://127.0.0.1:8080/api/history
+# {"ok":true,"turns":[...]}
+```
+
+### Routes (reference)
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET` | `/` | open | Login or chat UI (cookie-aware) |
+| `GET` | `/static/{app.js,style.css,marked.min.js,sanitize.js}` | open | Vendored UI assets |
+| `POST` | `/api/login` | open | Body `{token}` → sets `solrac_web` cookie |
+| `POST` | `/api/logout` | cookie | Drops session from in-memory set |
+| `POST` | `/api/message` | cookie | Body `{text}` → enqueues a synthetic `Update` |
+| `GET` | `/api/stream` | cookie | SSE; emits `message`, `edit`, `reaction` events |
+| `POST` | `/api/confirm` | cookie | Body `{callback_id, decision}` → `webBroker.resolve(...)` |
+| `GET` | `/api/history` | cookie | Last 50 turns from `audit` (filters `model='system'`) |
+
+### Security posture
+
+- Bearer compare uses `node:crypto.timingSafeEqual` with length pre-check (same pattern as `/stats`).
+- Cookie: `HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`.
+- Sessions held in process memory — restarting Solrac signs out all browsers.
+- `idleTimeout: 0` on the web `Bun.serve` so SSE streams aren't killed by Bun's default 10 s idle window. Heartbeats every 15 s keep intermediate proxies happy.
+- Boot fails loud if `SOLRAC_WEB_ENABLED=true` and `SOLRAC_WEB_TOKEN` is unset (regardless of host).
+
+### Audit queries for web traffic
+
+Web turns share a single synthetic chat id (`SOLRAC_WEB_CHAT_ID`, default −1000):
+
+```sh
+sqlite3 data/solrac.sqlite "
+  SELECT
+    started_at,
+    substr(model, 1, 30) AS model,
+    status,
+    cost_usd,
+    substr(prompt, 1, 60) AS prompt
+  FROM audit
+  WHERE chat_id = -1000
+  ORDER BY id DESC
+  LIMIT 20;
+"
+```
+
+The cost cap (`HOURLY_COST_CAP_USD`, default $1) applies to the web chat the same way it applies to a Telegram chat. The global cap (`GLOBAL_HOURLY_COST_CAP_USD`) still bounds the host-wide burn across all transports.
+
+---
+
 ## Daily cost report
 
 Cron in `daily-report.ts`. On boot and every 24h thereafter, sends an HTML message to the first allowlist entry:
