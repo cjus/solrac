@@ -68,6 +68,7 @@ import { sanitizedSubprocessEnv } from "./agent.ts";
 import type { Allowlist } from "./allowlist.ts";
 import type { ChatHistoryRow, SolracDb } from "./db.ts";
 import { log } from "./log.ts";
+import { mdToTelegramHtml } from "./markdown.ts";
 import {
   truncateAuditPrompt,
   type CostCapGuard,
@@ -920,43 +921,52 @@ async function runHelp(
   msg: Message,
   updateId: number,
 ): Promise<void> {
-  await sendOrLog(deps.tg, msg.chat.id, renderHelp(deps.skillRegistry), "cmd.help_reply_failed");
+  const md = renderHelpMarkdown(deps.skillRegistry);
+  // Authored once in markdown, derived to Telegram-safe HTML for the bot
+  // path. The web transport uses `markdownSource` directly so the browser
+  // gets full headers/lists/links rendering.
+  await sendOrLog(deps.tg, msg.chat.id, mdToTelegramHtml(md), "cmd.help_reply_failed", md);
   writeSystemAudit(deps, msg, updateId, "help_shown", "ok");
 }
 
-const HELP_BASE = [
-  "🤖 <b>Solrac help</b>",
+const HELP_BASE_MD = [
+  "## 🤖 Solrac help",
   "",
-  "<b>Engines</b> (first character of your message):",
-  "• plain text or <code>@</code> → primary Claude (Sonnet)",
-  "• <code>!</code> → secondary Claude (Opus, costs more)",
-  "• <code>&gt;</code> → local Ollama (free, no tools)",
+  "**Engines** (first character of your message):",
   "",
-  "<b>Commands</b> (type <code>/cmd</code> for autocomplete, or <code>:cmd</code>)",
-  "• <b>clear</b> [primary|secondary|all] — drop session state. Default: all.",
-  "• <b>compact</b> [primary|secondary] — summarize and restart session. Costs one Claude turn. Default: primary.",
-  "• <b>context</b> [primary|secondary] — show context-window size in bytes + tokens. Default: primary.",
-  "• <b>help</b> — this card.",
-  "• <b>status</b> — show session and spend snapshot for this chat.",
+  "- plain text or `@` → primary Claude (Sonnet)",
+  "- `!` → secondary Claude (Opus, costs more)",
+  "- `>` → local Ollama (free, no tools)",
   "",
-  "<b>Customize</b>",
-  "• <code>SOUL.md</code> in the launch dir — voice, stance, safety. Restart to apply.",
-  "• <code>SOLRAC.md</code> in the launch dir — operator overlay (who runs it, project context). Re-read every turn.",
+  "**Commands** (type `/cmd` for autocomplete, or `:cmd`)",
   "",
-  "Send <code>!!literal</code> to start a message with a literal <code>!</code>.",
+  "- **clear** `[primary|secondary|all]` — drop session state. Default: all.",
+  "- **compact** `[primary|secondary]` — summarize and restart session. Costs one Claude turn. Default: primary.",
+  "- **context** `[primary|secondary]` — show context-window size in bytes + tokens. Default: primary.",
+  "- **help** — this card.",
+  "- **status** — show session and spend snapshot for this chat.",
+  "",
+  "**Customize**",
+  "",
+  "- `SOUL.md` in the launch dir — voice, stance, safety. Restart to apply.",
+  "- `SOLRAC.md` in the launch dir — operator overlay (who runs it, project context). Re-read every turn.",
+  "",
+  "Send `!!literal` to start a message with a literal `!`.",
 ].join("\n");
 
-// Render `/help` including operator-defined skills if any are loaded. Static
-// commands stay verbatim so the help card is grep-stable across deployments
-// without skills; the skills section only appears when present.
-export function renderHelp(skills: SkillRegistry): string {
-  if (skills.size() === 0) return HELP_BASE;
-  const lines = [HELP_BASE, "", "<b>Skills</b>"];
+// Render `/help` in markdown including operator-defined skills if any are
+// loaded. Static commands stay verbatim so the help card is grep-stable
+// across deployments without skills; the skills section only appears when
+// present. The Telegram path runs this through `mdToTelegramHtml`; the web
+// transport renders it with `marked` in the browser.
+export function renderHelpMarkdown(skills: SkillRegistry): string {
+  if (skills.size() === 0) return HELP_BASE_MD;
+  const lines = [HELP_BASE_MD, "", "**Skills**", ""];
   // Sort by name for stable output across runs (registry insertion order is
   // filesystem-dependent).
   const sorted = [...skills.all].sort((a, b) => a.name.localeCompare(b.name));
   for (const s of sorted) {
-    lines.push(`• <b>${htmlEscapeText(s.name)}</b> — ${htmlEscapeText(s.description)}`);
+    lines.push(`- **${s.name}** — ${s.description}`);
   }
   return lines.join("\n");
 }
@@ -1230,8 +1240,9 @@ async function sendOrLog(
   chatId: number,
   text: string,
   errEvent: string,
+  markdownSource?: string,
 ): Promise<void> {
   await tg
-    .sendMessage(chatId, text, { parse_mode: "HTML" })
+    .sendMessage(chatId, text, { parse_mode: "HTML", markdownSource })
     .catch((err) => log.warn(errEvent, { chatId, error: (err as Error).message }));
 }
