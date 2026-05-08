@@ -70,7 +70,11 @@ export interface WebServerHandle {
 
 const COOKIE_NAME = "solrac_web";
 const COOKIE_MAX_AGE_S = 86400; // 24h
-const KEEPALIVE_MS = 25_000;
+// Keepalive cadence for SSE. Picked under the typical reverse-proxy/CDN idle
+// thresholds so a stream stays open through nginx (60s default) and Cloudflare
+// (100s) without an explicit tweak. Bun.serve's own per-request idle timeout
+// is disabled (set to 0 below) since SSE is long-poll by design.
+const KEEPALIVE_MS = 15_000;
 
 export function startWebServer(deps: WebServerDeps): WebServerHandle {
   const sessions = new Set<string>();
@@ -230,6 +234,10 @@ export function startWebServer(deps: WebServerDeps): WebServerHandle {
   const server = Bun.serve({
     hostname: deps.host,
     port: deps.port,
+    // SSE streams stay open indefinitely; Bun's default 10s per-request idle
+    // timeout would kill them mid-conversation. Disable here and rely on the
+    // KEEPALIVE_MS comments + browser EventSource auto-reconnect.
+    idleTimeout: 0,
     async fetch(req) {
       const url = new URL(req.url);
       const path = url.pathname;
