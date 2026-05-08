@@ -92,11 +92,17 @@ interface TelegramResponse<T> {
   parameters?: { retry_after?: number; migrate_to_chat_id?: number };
 }
 
-interface SendMessageOpts {
+export interface SendMessageOpts {
   parse_mode?: "HTML";
   disable_web_page_preview?: boolean;
   reply_to_message_id?: number;
   reply_markup?: unknown;
+  // Sidecar: original markdown text (pre-htmlification) used by the WebClient
+  // transport so the browser can render with full markdown features (headers,
+  // tables, etc. that Telegram's HTML parse_mode doesn't support). The real
+  // Telegram client below strips this before sending to Telegram's API — it's
+  // not a documented Telegram field and would 400 if forwarded.
+  markdownSource?: string;
 }
 
 type ChatAction =
@@ -203,14 +209,18 @@ export function createTelegramClient(token: string): TelegramClient {
       return call<Update[]>("getUpdates", params as unknown as Record<string, unknown>, signal);
     },
     sendMessage(chatId, text, opts) {
-      return call<Message>("sendMessage", { chat_id: chatId, text, ...opts });
+      // Strip `markdownSource` — it's a sidecar for the WebClient transport,
+      // not a Telegram API field. Forwarding it would yield a 400.
+      const { markdownSource: _md, ...wire } = opts ?? {};
+      return call<Message>("sendMessage", { chat_id: chatId, text, ...wire });
     },
     editMessageText(chatId, messageId, text, opts) {
+      const { markdownSource: _md, ...wire } = opts ?? {};
       return call<Message | true>("editMessageText", {
         chat_id: chatId,
         message_id: messageId,
         text,
-        ...opts,
+        ...wire,
       });
     },
     setMessageReaction(chatId, messageId, emoji) {

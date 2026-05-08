@@ -120,6 +120,69 @@ describe("loadConfig — OLLAMA_ENABLED contract", () => {
   });
 });
 
+describe("loadConfig — web UI", () => {
+  test("default: webEnabled=false, defaults filled in", () => {
+    const cfg = loadConfig({ ...baseEnv });
+    expect(cfg.webEnabled).toBe(false);
+    expect(cfg.webHost).toBe("127.0.0.1");
+    expect(cfg.webPort).toBe(8080);
+    expect(cfg.webToken).toBeNull();
+    expect(cfg.webChatId).toBe(-1000);
+  });
+
+  test("SOLRAC_WEB_ENABLED=true without token throws", () => {
+    expect(() => loadConfig({ ...baseEnv, SOLRAC_WEB_ENABLED: "true" })).toThrow(
+      /SOLRAC_WEB_TOKEN is required when SOLRAC_WEB_ENABLED=true/,
+    );
+  });
+
+  test("SOLRAC_WEB_ENABLED=true with token passes (loopback default)", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      SOLRAC_WEB_ENABLED: "true",
+      SOLRAC_WEB_TOKEN: "deadbeef".repeat(8),
+    });
+    expect(cfg.webEnabled).toBe(true);
+    expect(cfg.webToken).toBe("deadbeef".repeat(8));
+  });
+
+  test("0.0.0.0 still requires the token (no loopback shortcut)", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        SOLRAC_WEB_ENABLED: "true",
+        SOLRAC_WEB_HOST: "0.0.0.0",
+      }),
+    ).toThrow(/SOLRAC_WEB_TOKEN is required/);
+  });
+
+  test("SOLRAC_WEB_PORT colliding with PORT throws", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        SOLRAC_WEB_ENABLED: "true",
+        SOLRAC_WEB_TOKEN: "x".repeat(32),
+        PORT: "9000",
+        SOLRAC_WEB_PORT: "9000",
+      }),
+    ).toThrow(/must differ from PORT/);
+  });
+
+  test("SOLRAC_WEB_CHAT_ID positive integer throws", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        SOLRAC_WEB_CHAT_ID: "1000",
+      }),
+    ).toThrow(/SOLRAC_WEB_CHAT_ID must be a negative integer/);
+  });
+
+  test("SOLRAC_WEB_CHAT_ID custom negative value accepted", () => {
+    const cfg = loadConfig({ ...baseEnv, SOLRAC_WEB_CHAT_ID: "-42" });
+    expect(cfg.webChatId).toBe(-42);
+  });
+});
+
 describe("loadConfig — skills", () => {
   test("default: skillsEnabled=false, skillsDir=./skills", () => {
     const cfg = loadConfig({ ...baseEnv });

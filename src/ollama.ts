@@ -97,6 +97,7 @@ import type { SolracDb } from "./db.ts";
 import { readInstanceMd, wrapInstanceMd } from "./instance.ts";
 import { log } from "./log.ts";
 import { truncateAuditPrompt } from "./policy.ts";
+import { mdToTelegramHtml } from "./markdown.ts";
 import { htmlEscapeText, type TelegramClient } from "./telegram.ts";
 
 const TELEGRAM_TEXT_MAX = 3800;
@@ -277,10 +278,10 @@ export async function runOllamaTurn(
             const now = Date.now();
             if (now - lastEditAt >= EDIT_THROTTLE_MS) {
               const next = renderStreamingStub(assistantText);
-              if (next !== lastEditedContent) {
+              if (next.html !== lastEditedContent) {
                 lastEditAt = now;
-                lastEditedContent = next;
-                await tryEdit(deps.tg, input.chatId, stubId, next);
+                lastEditedContent = next.html;
+                await tryEdit(deps.tg, input.chatId, stubId, next.html, next.markdown);
               }
             }
           }
@@ -317,17 +318,27 @@ export async function runOllamaTurn(
   }
 
   const elapsedSec = (Date.now() - startedAt) / 1000;
-  const finalRender = isError
+  const finalRender: Rendered = isError
     ? renderError(errorMessage ?? "unknown")
     : renderFinal(assistantText, deps.model, elapsedSec);
 
   if (stubId !== null) {
-    if (finalRender !== lastEditedContent) {
-      await tryEdit(deps.tg, input.chatId, stubId, finalRender, "ollama.edit_final_failed");
+    if (finalRender.html !== lastEditedContent) {
+      await tryEdit(
+        deps.tg,
+        input.chatId,
+        stubId,
+        finalRender.html,
+        finalRender.markdown,
+        "ollama.edit_final_failed",
+      );
     }
   } else if (!isError && assistantText.trim()) {
     await deps.tg
-      .sendMessage(input.chatId, finalRender, { parse_mode: "HTML" })
+      .sendMessage(input.chatId, finalRender.html, {
+        parse_mode: "HTML",
+        markdownSource: finalRender.markdown,
+      })
       .catch((err) => log.warn("ollama.final_send_failed", { error: (err as Error).message }));
   }
 
@@ -358,19 +369,36 @@ export async function runOllamaTurn(
   });
 }
 
-function renderStreamingStub(text: string): string {
-  if (!text.trim()) return THINKING_STUB;
-  return truncate(htmlEscapeText(text), TELEGRAM_TEXT_MAX);
+interface Rendered {
+  html: string;
+  markdown: string;
 }
 
-function renderFinal(text: string, model: string, elapsedSec: number): string {
-  const body = text.trim() ? htmlEscapeText(text) : "(empty response)";
-  const footer = `<i>✅ ollama:${htmlEscapeText(model)} · ${elapsedSec.toFixed(1)}s</i>`;
-  return truncate(`${body}\n\n${footer}`, TELEGRAM_TEXT_MAX);
+function renderStreamingStub(text: string): Rendered {
+  if (!text.trim()) return { html: THINKING_STUB, markdown: THINKING_STUB };
+  return {
+    html: truncate(mdToTelegramHtml(text), TELEGRAM_TEXT_MAX),
+    markdown: text,
+  };
 }
 
-function renderError(msg: string): string {
-  return `❌ <b>error</b>: ${htmlEscapeText(msg)}`;
+function renderFinal(text: string, model: string, elapsedSec: number): Rendered {
+  const hasText = text.trim().length > 0;
+  const htmlBody = hasText ? mdToTelegramHtml(text) : "(empty response)";
+  const mdBody = hasText ? text : "(empty response)";
+  const htmlFooter = `<i>✅ ollama:${htmlEscapeText(model)} · ${elapsedSec.toFixed(1)}s</i>`;
+  const mdFooter = `*✅ ollama:${model} · ${elapsedSec.toFixed(1)}s*`;
+  return {
+    html: truncate(`${htmlBody}\n\n${htmlFooter}`, TELEGRAM_TEXT_MAX),
+    markdown: `${mdBody}\n\n${mdFooter}`,
+  };
+}
+
+function renderError(msg: string): Rendered {
+  return {
+    html: `❌ <b>error</b>: ${htmlEscapeText(msg)}`,
+    markdown: `❌ **error**: ${msg}`,
+  };
 }
 
 async function tryEdit(
@@ -378,10 +406,11 @@ async function tryEdit(
   chatId: number,
   messageId: number,
   text: string,
+  markdownSource: string | undefined,
   errEvent: string = "ollama.edit_throttled",
 ): Promise<void> {
   await tg
-    .editMessageText(chatId, messageId, text, { parse_mode: "HTML" })
+    .editMessageText(chatId, messageId, text, { parse_mode: "HTML", markdownSource })
     .catch((err) => log.debug(errEvent, { error: (err as Error).message }));
 }
 

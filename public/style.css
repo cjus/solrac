@@ -1,0 +1,316 @@
+/* Solrac web UI — minimal, system-font, light/dark via prefers-color-scheme */
+
+:root {
+  --bg: #fafaf9;
+  --fg: #1c1917;
+  --muted: #78716c;
+  --bg-elev: #fff;
+  --border: #e7e5e4;
+  --accent: #0369a1;
+  --user-bg: #eaf2f8;
+  --bot-bg: #fff;
+  --code-bg: #f5f4f1;
+  --error: #b91c1c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0c0a09;
+    --fg: #f5f5f4;
+    --muted: #a8a29e;
+    --bg-elev: #1c1917;
+    --border: #292524;
+    --accent: #38bdf8;
+    --user-bg: #1e293b;
+    --bot-bg: #1c1917;
+    --code-bg: #292524;
+    --error: #f87171;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; margin: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.hidden { display: none !important; }
+
+/* ── Login ─────────────────────────────────────────────── */
+
+.login {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  padding: 16px;
+}
+
+.login h1 {
+  font-weight: 200;
+  font-size: 32px;
+  letter-spacing: -0.02em;
+  margin: 0 0 24px 0;
+}
+
+.login form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 280px;
+}
+
+.login label {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.login input {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-size: 15px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.login input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.login button {
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.login .error {
+  color: var(--error);
+  margin: 0;
+  min-height: 1em;
+  font-size: 13px;
+}
+
+/* ── Chat ──────────────────────────────────────────────── */
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+
+.chat-header .title { font-weight: 500; }
+.chat-header .spacer { flex: 1; }
+
+.conn-state {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.conn-state[data-state="connected"] { color: #16a34a; }
+.conn-state[data-state="disconnected"] { color: var(--error); }
+
+.header-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  cursor: pointer;
+  padding: 4px 10px;
+  font-size: 14px;
+}
+
+.messages {
+  flex: 1;
+  list-style: none;
+  margin: 0;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.msg {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.msg .role {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: lowercase;
+  padding-top: 2px;
+}
+
+.msg .body { word-wrap: break-word; overflow-wrap: anywhere; }
+.msg .body > :first-child { margin-top: 0; }
+.msg .body > :last-child { margin-bottom: 0; }
+
+.msg.user .body { color: var(--fg); }
+.msg.assistant .body { color: var(--fg); }
+
+.msg .body p { margin: 0.5em 0; }
+.msg .body h1, .msg .body h2, .msg .body h3,
+.msg .body h4, .msg .body h5, .msg .body h6 {
+  font-weight: 600;
+  margin: 0.8em 0 0.4em 0;
+}
+.msg .body h1 { font-size: 1.4em; }
+.msg .body h2 { font-size: 1.25em; }
+.msg .body h3 { font-size: 1.1em; }
+.msg .body code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+.msg .body pre {
+  background: var(--code-bg);
+  padding: 10px 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+}
+.msg .body pre code { background: transparent; padding: 0; }
+.msg .body blockquote {
+  margin: 0.5em 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+.msg .body table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+}
+.msg .body th, .msg .body td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+.msg .body th { background: var(--code-bg); font-weight: 600; }
+.msg .body ul, .msg .body ol { margin: 0.5em 0; padding-left: 1.5em; }
+.msg .body a { color: var(--accent); }
+
+.msg.confirm .body {
+  background: var(--code-bg);
+  padding: 10px;
+  border-radius: 6px;
+}
+
+.msg .actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+}
+
+.msg .actions button {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.msg .actions button.allow:hover { border-color: #16a34a; color: #16a34a; }
+.msg .actions button.deny:hover { border-color: var(--error); color: var(--error); }
+
+/* ── Composer ──────────────────────────────────────────── */
+
+.composer {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elev);
+  align-items: flex-end;
+}
+
+.engine-pill {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.engine-opt {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 8px 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+}
+
+.engine-opt.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.composer textarea {
+  flex: 1;
+  resize: none;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1.4;
+  max-height: 200px;
+}
+
+.composer textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+#send-btn {
+  padding: 10px 14px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+#send-btn:disabled { opacity: 0.5; cursor: not-allowed; }

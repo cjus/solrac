@@ -59,9 +59,14 @@ src/
 │                       loop detector, PreToolUse hook,
 │                       db-pollution defenses
 │
+├── markdown.ts       — markdown → Telegram-safe HTML (marked + custom renderer)
 ├── agent.ts          — wires Claude Agent SDK; runs one turn
 │
 ├── server.ts         — Bun.serve: /health + /stats
+├── web-client.ts     — TelegramClient sink that publishes to an in-process
+│                       bus (used by the optional web UI transport)
+├── web-sanitize.ts   — allowlist HTML sanitizer (server tests + browser)
+├── web.ts            — second Bun.serve (login, SSE, message, confirm)
 ├── lifecycle.ts      — graceful shutdown
 ├── daily-report.ts   — cron: yesterday's per-chat spend
 │
@@ -80,10 +85,14 @@ mutex, semaphore,
 turn-tracker       →  zero internal deps
 queue              →  mutex + semaphore + turn-tracker + config + log
 telegram           →  config + log
+markdown           →  telegram (htmlEscape only)
 policy             →  db + telegram + log + config
-agent              →  session + policy + telegram + log
+agent              →  session + policy + telegram + log + markdown
 poll               →  telegram + db + log
 server             →  log
+web-sanitize       →  zero internal deps
+web-client         →  telegram (types only)
+web                →  log + web-client + web-sanitize
 lifecycle          →  db + log + turn-tracker
 daily-report       →  db + telegram + log
 main               →  everything
@@ -967,6 +976,72 @@ See `deploy/systemd/solrac.service`.
 
 ---
 
+## Web UI transport (optional)
+
+Off by default. Enabled via `SOLRAC_WEB_ENABLED=true` plus a token. Brings a browser-based chat UI alongside the Telegram bot, sharing the same agent loop, audit log, queue, cost caps, and policy hooks.
+
+### What ships
+
+| Module | Role |
+|---|---|
+| `src/web-client.ts::createWebClient` | `TelegramClient`-shaped sink. Methods publish events to an in-process bus instead of calling Telegram's API. |
+| `src/web.ts::startWebServer` | Second `Bun.serve` instance bound to `SOLRAC_WEB_HOST:SOLRAC_WEB_PORT`. Routes: `/`, `/static/:file`, `/api/login`, `/api/logout`, `/api/message`, `/api/stream` (SSE), `/api/confirm`, `/api/history`. |
+| `src/web-sanitize.ts::sanitizeHtml` | Allowlist HTML sanitizer used both server-side (boundary scrub of the html-fallback in SSE events) and browser-side (after `marked.parse`). Single source of truth — transpiled to JS at server boot via `Bun.Transpiler` and served as `/static/sanitize.js`. |
+| `src/markdown.ts::mdToTelegramHtml` | Converts Claude/Ollama markdown to Telegram-safe HTML for the bot. Same `marked` library; different renderer overrides. |
+| `public/index.html` + `public/app.js` + `public/style.css` | Vanilla-JS UI. No framework, no build step. Loads `marked` from `/static/marked.min.js` (served from `node_modules/marked/lib/marked.umd.js`) and `sanitizeHtml` from `/static/sanitize.js`. |
+
+### How it preserves the existing path
+
+`agent.ts` and `ollama.ts` already accept any `TelegramClient`. main.ts builds a parallel `WebClient`, a parallel `commandDeps` (with `tg = webClient`), a parallel `OllamaRunDeps`, and a parallel `ConfirmationBroker` (also pointed at `webClient`). The single turn queue's `runTurn` dispatches to the web variants when the synthetic `webChatId` is on the update; otherwise the Telegram path runs unchanged.
+
+```
+Browser ──HTTP──▶ web.ts (Bun.serve, separate port)
+   │                  │
+   │ SSE              │ POST /api/message
+   │ /api/stream      │   ↓
+   │                  │ synthetic Update {chat.id = webChatId, from.id = webChatId}
+   │                  │   ↓
+   │                  │ queue.enqueue(update)  (same queue Telegram uses)
+   │                  │   ↓
+   │                  │ runTurn dispatches by chatId → webRunTurn / tgRunTurn
+   ◀──events────  WebClient (TelegramClient impl)
+                       │
+                       └─▶ runAgent / runOllamaTurn (tg = webClient)
+                              audit row written, cost cap, policy hooks — all unchanged
+```
+
+### Markdown sidecar (`markdownSource`)
+
+Telegram's HTML parse_mode supports a small subset (`<b> <i> <s> <a> <code> <pre> <blockquote>`). `agent.ts:495` previously emitted `htmlEscapeText(text)` on Claude's body, which preserved markdown syntax as literal characters in Telegram. The fix:
+
+- `agent.ts` and `ollama.ts` now run the response body through `mdToTelegramHtml(text)` for Telegram (proper bold, italic, code blocks; lists flattened to `• item`; headers to `<b>`; tables to ASCII inside `<pre>`).
+- `SendMessageOpts` and `EditMessageTextOpts` carry an optional `markdownSource: string` sidecar. The real Telegram client (`telegram.ts:205-215`) destructures-and-drops it before `tgCall` — never hits the wire.
+- `WebClient` reads `markdownSource` preferentially; consumer (browser) renders it with `marked` + `sanitizeHtml`. If absent, the html-fallback (already sanitized at the SSE boundary) is used.
+
+The conversion is wrapped in try/catch with fallback to `htmlEscapeText` so a parser glitch can't break the existing Telegram path.
+
+### Auth
+
+Bearer token (`SOLRAC_WEB_TOKEN`) → login page → cookie. Constant-time compare via `node:crypto.timingSafeEqual`, mirroring `server.ts::authorizeBearer`. Cookie set with `HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`. Sessions held in process memory — restarting Solrac signs out all browsers.
+
+The token is required even when binding to `127.0.0.1`. A loopback-only shortcut would be unsafe on shared hosts (other UIDs can connect to localhost).
+
+### SSE
+
+`GET /api/stream` returns `text/event-stream` with a `ReadableStream` body. The handler subscribes to the `WebClient` bus; each `sendMessage` / `editMessageText` / `setMessageReaction` call publishes one event. Keepalive comments (`: keepalive\n\n`) every 25 s prevent intermediate proxies from idling out the connection. On client disconnect (request signal abort) the subscriber unregisters and the stream closes.
+
+### Tool confirmation
+
+The existing `policy.ts::createConfirmationBroker` is transport-agnostic — `request()` calls `tg.sendMessage(..., { reply_markup: { inline_keyboard: ... } })` and registers a Promise resolver keyed by callback id. main.ts builds a second broker with `tg = webClient` for web turns. The browser receives the inline keyboard inside the SSE event, renders Allow / Deny buttons, and posts the chosen `callback_data` to `POST /api/confirm`. The handler calls `webBroker.resolve(callbackId, decision)` — same flow as Telegram's callback_query, just with HTTP instead of polling.
+
+### Lifecycle
+
+`installShutdown` accepts an optional `webServer` handle and calls `webServer.stop()` right after the ops `server.stop()` and before tracker drain. SSE writers are closed first so their `req.signal.abort()` listeners fire and unsubscribe cleanly.
+
+### Anti-goal preservation
+
+The transport adds two new files (`web.ts`, `web-client.ts`) and a sanitizer + markdown converter, totaling ~700 lines of TypeScript. No HTTP framework, no WebSocket framework, no extra runtime dependencies beyond `marked` (used on both transports). The "no HTTP framework" anti-goal is honored — `Bun.serve` `routes` and `fetch` only, same shape as `server.ts`.
+
 ## Anti-goals
 
 Decisions deliberately not made. Don't relitigate without strong justification.
@@ -980,6 +1055,7 @@ Decisions deliberately not made. Don't relitigate without strong justification.
 - **No tests for HTTP/Telegram surfaces.** `bun:test` for pure logic only — `mutex`, `semaphore`, HTML escape, policy rules, cost-cap query, lifecycle composition. Telegram surface verified manually + via the synthetic flood smoke.
 - **No sub-agents.** `Agent`/`Task` disabled. See [OQ#8](./ROADMAP.md#oq8-sub-agent-enablement).
 - **No webhook transport.** Long-poll only. Deferred until a public host is provisioned. See [ROADMAP.md](./ROADMAP.md#webhook-transport).
+- **No web framework.** When `SOLRAC_WEB_ENABLED=true`, the second `Bun.serve` instance for the browser UI uses raw routes and SSE (`ReadableStream` body) — no Hono, no Express, no WebSocket framework. See [Web UI transport](#web-ui-transport-optional) above.
 
 If you find yourself wanting to add one of these, write the case in the PR description and tag it as an explicit re-evaluation. Anti-goals can be reversed; they just can't be drifted past silently.
 

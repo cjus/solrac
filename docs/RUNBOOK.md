@@ -22,6 +22,8 @@ For day-to-day operations, see [OPERATIONS.md](./OPERATIONS.md).
 - [Cost report never arrives](#cost-report-missing)
 - [Bot replies stale / out of date](#stale-replies)
 - [Ollama errors (`>` prefix path)](#ollama-errors)
+- [Web UI not reachable / login won't take](#web-ui-issues)
+- [Web UI streaming silent / messages don't appear](#web-ui-stream-silent)
 
 ---
 
@@ -750,6 +752,110 @@ OLLAMA_MODEL=<model> npm run smoke:ollama
 - After pulling a new model, run the smoke harness once.
 - For the `model not found` class: avoid renaming or removing models on a host without rotating `OLLAMA_MODEL` first.
 - Cross-engine context bridge means Claude follow-ups need **a successful Claude turn** before the bridge stops re-injecting older Ollama context. If a Claude turn errors out (cost cap, allowlist, etc.), the next Claude turn will re-inject — that's by design (the failed turn didn't consume the context).
+
+---
+
+<a id="web-ui-issues"></a>
+
+## Web UI not reachable / login won't take
+
+### Symptoms
+
+- Browser shows "connection refused" / "site can't be reached" against `http://<host>:<port>/`.
+- Login submits but always returns "invalid token" even with the right value.
+- Boot fails with `SOLRAC_WEB_TOKEN is required when SOLRAC_WEB_ENABLED=true`.
+
+### Diagnosis
+
+Check the boot log for the `web.listening` line:
+
+```sh
+journalctl -u solrac.service -o cat | jq 'select(.msg == "web.listening")'
+# {"msg":"web.listening","host":"127.0.0.1","port":8080,"bound_zero":false}
+```
+
+If the line is absent, `SOLRAC_WEB_ENABLED` isn't `true`, or boot validation rejected the config (look earlier in the log for a `config.invalid` event).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Boot exits 1 with `SOLRAC_WEB_TOKEN is required` | Web enabled but token unset | Add `SOLRAC_WEB_TOKEN=$(openssl rand -hex 32)` to `.env`. Required even on `127.0.0.1`. |
+| Boot exits 1 with `SOLRAC_WEB_PORT must differ from PORT` | Both vars set to the same port | Pick a distinct port for the web UI (default `8080`; `PORT` is `8443`). |
+| `connection refused` from a remote host | `SOLRAC_WEB_HOST=127.0.0.1` (loopback only) | Set `SOLRAC_WEB_HOST=0.0.0.0` to expose; pair with a strong token. |
+| Login always says "invalid token" | Mismatch between the value in the form and `.env` | `grep SOLRAC_WEB_TOKEN .env` and confirm. Compare uses constant-time `timingSafeEqual` — no whitespace forgiveness. |
+| `web.login_denied` repeatedly in logs | Brute-force or bad bookmark | Rotate the token; restart Solrac (sessions are in-memory, so a restart clears any older cookies). |
+
+### Recovery
+
+Most fixes are an `.env` edit + restart:
+
+```sh
+systemctl restart solrac.service
+journalctl -u solrac.service -o cat -f | jq 'select(.msg | startswith("web."))'
+```
+
+For a forgotten token, regenerate and restart — there's no token-recovery path by design. Operators are sole-user.
+
+### Prevention
+
+- Use `openssl rand -hex 32` (or longer) for the token; nothing shorter.
+- Keep `.env` mode 600, owner `solrac:solrac` on prod hosts.
+- If exposing on `0.0.0.0`, front with Tailscale or a reverse proxy that adds TLS — Solrac itself is HTTP-only. The cookie has no `Secure` flag because v1 doesn't assume TLS termination.
+
+---
+
+<a id="web-ui-stream-silent"></a>
+
+## Web UI streaming silent / messages don't appear
+
+### Symptoms
+
+- User sends a message in the browser, sees the prompt echoed, but no streaming reply appears.
+- Audit row exists for the turn (`status='ok'`, response populated), so the agent ran.
+- The conversation reappears correctly after a page reload.
+
+### Diagnosis
+
+Three failure modes:
+
+1. **EventSource disconnected.** Open browser devtools → Network → confirm `/api/stream` is `pending` (live). If it's `closed` or has reconnected loops, an upstream proxy is killing the long-poll. Check the `conn-state` chip in the header: `live` (green) means SSE is healthy; `off` (red) means EventSource gave up.
+
+2. **Bun.serve idle timeout.** Pre-`ec7669a`, Bun's default 10 s `idleTimeout` killed SSE connections silently and turns published while disconnected were lost. Confirm you're running on the post-fix branch:
+
+   ```sh
+   git -C /opt/solrac log --oneline | grep -i "idleTimeout"
+   ```
+
+   If the fix is missing, pull and restart.
+
+3. **Reverse proxy buffering.** A proxy with response buffering (some default nginx setups) holds the SSE response until it's complete, defeating live streaming. Confirm with:
+
+   ```sh
+   curl -N -b /tmp/solrac.cookie http://localhost:8080/api/stream
+   ```
+
+   If `: connected` appears immediately but no data flows during a turn, the proxy is buffering. Direct access bypasses the proxy → fixes it.
+
+### Recovery
+
+For (1) reload the browser; EventSource reconnects automatically and re-subscribes to the bus. The conversation history is hydrated from the audit log via `/api/history` — your previous response is recovered.
+
+For (2) restart Solrac on the latest branch.
+
+For (3) on nginx, add to the SSE location block:
+
+```
+proxy_buffering off;
+proxy_cache off;
+proxy_read_timeout 24h;
+```
+
+Or front with Caddy / Traefik, both of which handle SSE without explicit config.
+
+### Prevention
+
+- Keep Solrac on the post-`ec7669a` branch (any release after 2026-05-08).
+- Document the proxy SSE config alongside the systemd unit when deploying.
+- The audit log is the durable record — if a streaming reply was lost, it's still in `audit.response`. Reload restores it.
 
 ---
 

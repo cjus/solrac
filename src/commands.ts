@@ -68,6 +68,7 @@ import { sanitizedSubprocessEnv } from "./agent.ts";
 import type { Allowlist } from "./allowlist.ts";
 import type { ChatHistoryRow, SolracDb } from "./db.ts";
 import { log } from "./log.ts";
+import { mdToTelegramHtml } from "./markdown.ts";
 import {
   truncateAuditPrompt,
   type CostCapGuard,
@@ -428,8 +429,14 @@ async function runCompact(
       errorMessage: result.errorMessage ?? "unknown",
       endedAt: Date.now(),
     });
-    const reply = renderCompactError(tier, result.errorMessage ?? "unknown");
-    await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.compact_reply_failed");
+    const md = renderCompactErrorMarkdown(tier, result.errorMessage ?? "unknown");
+    await sendOrLog(
+      deps.tg,
+      msg.chat.id,
+      mdToTelegramHtml(md),
+      "cmd.compact_reply_failed",
+      md,
+    );
     return;
   }
 
@@ -455,20 +462,26 @@ async function runCompact(
 
   const cost = result.costUsd ?? 0;
   const tokens = result.outputTokens ?? 0;
-  const reply =
-    `✅ <b>Compacted</b> ${result.numSourceTurns} turn${result.numSourceTurns === 1 ? "" : "s"} ` +
-    `for <b>${tier}</b> · ~${tokens} tokens · $${cost.toFixed(4)}`;
-  await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.compact_reply_failed");
+  const md =
+    `✅ **Compacted** ${result.numSourceTurns} turn${result.numSourceTurns === 1 ? "" : "s"} ` +
+    `for **${tier}** · ~${tokens} tokens · $${cost.toFixed(4)}`;
+  await sendOrLog(
+    deps.tg,
+    msg.chat.id,
+    mdToTelegramHtml(md),
+    "cmd.compact_reply_failed",
+    md,
+  );
 }
 
-function renderCompactError(tier: TierArgSingle, errorMessage: string): string {
+function renderCompactErrorMarkdown(tier: TierArgSingle, errorMessage: string): string {
   if (errorMessage === "nothing_to_compact") {
-    return `📭 nothing to compact for <b>${tier}</b>`;
+    return `📭 nothing to compact for **${tier}**`;
   }
   if (errorMessage.startsWith("chat_cost_cap") || errorMessage.startsWith("global_cost_cap")) {
-    return `❌ ${htmlEscapeText(errorMessage)} — try again later`;
+    return `❌ ${errorMessage} — try again later`;
   }
-  return `❌ compact failed: ${htmlEscapeText(errorMessage)}`;
+  return `❌ compact failed: ${errorMessage}`;
 }
 
 function snippet(s: string, max: number): string {
@@ -716,12 +729,12 @@ async function runStatus(
   msg: Message,
   updateId: number,
 ): Promise<void> {
-  const reply = renderStatus(deps, msg.chat.id, Date.now());
-  await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.status_reply_failed");
+  const md = renderStatusMarkdown(deps, msg.chat.id, Date.now());
+  await sendOrLog(deps.tg, msg.chat.id, mdToTelegramHtml(md), "cmd.status_reply_failed", md);
   writeSystemAudit(deps, msg, updateId, "status_shown", "ok");
 }
 
-export function renderStatus(
+export function renderStatusMarkdown(
   deps: Pick<
     RunCommandDeps,
     | "db"
@@ -738,9 +751,9 @@ export function renderStatus(
   const oneHourAgo = now - 60 * 60 * 1000;
   const oneDayAgo = now - 24 * 60 * 60 * 1000;
 
-  const primaryLine = renderTierLine(deps, chatId, "primary", session, now);
-  const secondaryLine = renderTierLine(deps, chatId, "secondary", session, now);
-  const summaryLine = renderSummaryLine(session);
+  const primaryLine = renderTierLineMarkdown(deps, chatId, "primary", session, now);
+  const secondaryLine = renderTierLineMarkdown(deps, chatId, "secondary", session, now);
+  const summaryLine = renderSummaryLineMarkdown(session);
 
   const chatSpend1h = deps.db.sumChatCostSince(chatId, oneHourAgo);
   const chatSpend24h = deps.db.sumChatCostSince(chatId, oneDayAgo);
@@ -750,23 +763,25 @@ export function renderStatus(
   const uptimeSec = (now - deps.startedAt) / 1000;
 
   return [
-    "📊 <b>Solrac status</b>",
+    "## 📊 Solrac status",
     "",
-    "<b>This chat</b>",
-    `• primary session: ${primaryLine}`,
-    `• secondary session: ${secondaryLine}`,
-    `• pending summary: ${summaryLine}`,
-    `• spent (1h): $${chatSpend1h.toFixed(4)} / $${deps.hourlyCostCapUsd.toFixed(2)}`,
-    `• spent (24h): $${chatSpend24h.toFixed(4)}`,
+    "**This chat**",
     "",
-    "<b>Global</b>",
-    `• spent (1h): $${globalSpend1h.toFixed(4)} / $${deps.globalHourlyCostCapUsd.toFixed(2)}`,
-    `• in-flight turns: ${snap.inFlight} · waiting: ${snap.waiting}`,
-    `• uptime: ${formatUptime(uptimeSec)}`,
+    `- primary session: ${primaryLine}`,
+    `- secondary session: ${secondaryLine}`,
+    `- pending summary: ${summaryLine}`,
+    `- spent (1h): $${chatSpend1h.toFixed(4)} / $${deps.hourlyCostCapUsd.toFixed(2)}`,
+    `- spent (24h): $${chatSpend24h.toFixed(4)}`,
+    "",
+    "**Global**",
+    "",
+    `- spent (1h): $${globalSpend1h.toFixed(4)} / $${deps.globalHourlyCostCapUsd.toFixed(2)}`,
+    `- in-flight turns: ${snap.inFlight} · waiting: ${snap.waiting}`,
+    `- uptime: ${formatUptime(uptimeSec)}`,
   ].join("\n");
 }
 
-function renderTierLine(
+function renderTierLineMarkdown(
   deps: Pick<RunCommandDeps, "db">,
   chatId: number,
   tier: SessionTier,
@@ -778,21 +793,21 @@ function renderTierLine(
     : tier === "primary"
       ? session.primarySessionId
       : session.secondarySessionId;
-  if (sessionId === null) return "<i>none</i>";
+  if (sessionId === null) return "*none*";
   const enginePrefix = `claude:${tier}:%`;
   const count = deps.db.countChatTurnsForEngine(chatId, enginePrefix);
   const lastAt = deps.db.lastSuccessfulTurnAt(chatId, enginePrefix);
   const idShort = `${sessionId.slice(0, 4)}…${sessionId.slice(-4)}`;
   const ageStr = lastAt !== null ? ` · last ${formatAge(now - lastAt)} ago` : "";
-  return `<code>${htmlEscapeText(idShort)}</code> (${count} turn${count === 1 ? "" : "s"}${ageStr})`;
+  return `\`${idShort}\` (${count} turn${count === 1 ? "" : "s"}${ageStr})`;
 }
 
-function renderSummaryLine(session: ReturnType<SessionStore["getSession"]>): string {
-  if (!session) return "<i>none</i>";
+function renderSummaryLineMarkdown(session: ReturnType<SessionStore["getSession"]>): string {
+  if (!session) return "*none*";
   const have: string[] = [];
   if (session.primarySummary) have.push("primary");
   if (session.secondarySummary) have.push("secondary");
-  if (have.length === 0) return "<i>none</i>";
+  if (have.length === 0) return "*none*";
   return have.join(", ");
 }
 
@@ -826,12 +841,12 @@ async function runContext(
   updateId: number,
   tier: TierArgSingle,
 ): Promise<void> {
-  const reply = renderContext(deps, msg.chat.id, tier);
-  await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.context_reply_failed");
+  const md = renderContextMarkdown(deps, msg.chat.id, tier);
+  await sendOrLog(deps.tg, msg.chat.id, mdToTelegramHtml(md), "cmd.context_reply_failed", md);
   writeSystemAudit(deps, msg, updateId, `context_shown:${tier}`, "ok");
 }
 
-export function renderContext(
+export function renderContextMarkdown(
   deps: Pick<RunCommandDeps, "db" | "sessions">,
   chatId: number,
   tier: TierArgSingle,
@@ -856,21 +871,21 @@ export function renderContext(
 
   const sessionLine =
     sessionId === null
-      ? "<i>none — fresh next turn</i>"
-      : `<code>${htmlEscapeText(sessionId.slice(0, 4) + "…" + sessionId.slice(-4))}</code>`;
+      ? "*none — fresh next turn*"
+      : `\`${sessionId.slice(0, 4)}…${sessionId.slice(-4)}\``;
 
   const lines: string[] = [
-    `🪟 <b>Context</b> — <b>${tier}</b>`,
+    `## 🪟 Context — **${tier}**`,
     "",
-    `• session: ${sessionLine}`,
-    `• turns (this chat+tier): ${turnCount}`,
-    `• audit footprint: ${formatBytes(bytes)} (text on disk; <code>prompt</code> truncated at 256)`,
+    `- session: ${sessionLine}`,
+    `- turns (this chat+tier): ${turnCount}`,
+    `- audit footprint: ${formatBytes(bytes)} (text on disk; \`prompt\` truncated at 256)`,
   ];
   if (summary !== null) {
-    lines.push(`• pending summary: ${formatBytes(summary.length)} (will inject on next turn)`);
+    lines.push(`- pending summary: ${formatBytes(summary.length)} (will inject on next turn)`);
   }
   if (last === null) {
-    lines.push("", "<i>No successful turn yet for this tier.</i>");
+    lines.push("", "*No successful turn yet for this tier.*");
     return lines.join("\n");
   }
   // Real input on the wire = fresh + cache_read + cache_create. The SDK's
@@ -888,15 +903,16 @@ export function renderContext(
 
   lines.push(
     "",
-    "<b>Last turn (Anthropic API)</b>:",
-    `• fresh input: ${formatNum(fresh)} tokens`,
-    `• cache read: ${formatNum(cacheRead)} tokens`,
-    `• cache create: ${formatNum(cacheCreate)} tokens`,
-    `• output: ${formatNum(output)} tokens`,
-    `• cost: $${(last.costUsd ?? 0).toFixed(4)}`,
+    "**Last turn (Anthropic API)**",
     "",
-    `<b>Estimated next-turn replay</b>: ~${formatNum(replayEstimate)} tokens`,
-    "<i>(prior input + cache + last output, excluding new message)</i>",
+    `- fresh input: ${formatNum(fresh)} tokens`,
+    `- cache read: ${formatNum(cacheRead)} tokens`,
+    `- cache create: ${formatNum(cacheCreate)} tokens`,
+    `- output: ${formatNum(output)} tokens`,
+    `- cost: $${(last.costUsd ?? 0).toFixed(4)}`,
+    "",
+    `**Estimated next-turn replay**: ~${formatNum(replayEstimate)} tokens`,
+    "*(prior input + cache + last output, excluding new message)*",
   );
   return lines.join("\n");
 }
@@ -920,43 +936,52 @@ async function runHelp(
   msg: Message,
   updateId: number,
 ): Promise<void> {
-  await sendOrLog(deps.tg, msg.chat.id, renderHelp(deps.skillRegistry), "cmd.help_reply_failed");
+  const md = renderHelpMarkdown(deps.skillRegistry);
+  // Authored once in markdown, derived to Telegram-safe HTML for the bot
+  // path. The web transport uses `markdownSource` directly so the browser
+  // gets full headers/lists/links rendering.
+  await sendOrLog(deps.tg, msg.chat.id, mdToTelegramHtml(md), "cmd.help_reply_failed", md);
   writeSystemAudit(deps, msg, updateId, "help_shown", "ok");
 }
 
-const HELP_BASE = [
-  "🤖 <b>Solrac help</b>",
+const HELP_BASE_MD = [
+  "## 🤖 Solrac help",
   "",
-  "<b>Engines</b> (first character of your message):",
-  "• plain text or <code>@</code> → primary Claude (Sonnet)",
-  "• <code>!</code> → secondary Claude (Opus, costs more)",
-  "• <code>&gt;</code> → local Ollama (free, no tools)",
+  "**Engines** (first character of your message):",
   "",
-  "<b>Commands</b> (type <code>/cmd</code> for autocomplete, or <code>:cmd</code>)",
-  "• <b>clear</b> [primary|secondary|all] — drop session state. Default: all.",
-  "• <b>compact</b> [primary|secondary] — summarize and restart session. Costs one Claude turn. Default: primary.",
-  "• <b>context</b> [primary|secondary] — show context-window size in bytes + tokens. Default: primary.",
-  "• <b>help</b> — this card.",
-  "• <b>status</b> — show session and spend snapshot for this chat.",
+  "- plain text or `@` → primary Claude (Sonnet)",
+  "- `!` → secondary Claude (Opus, costs more)",
+  "- `>` → local Ollama (free, no tools)",
   "",
-  "<b>Customize</b>",
-  "• <code>SOUL.md</code> in the launch dir — voice, stance, safety. Restart to apply.",
-  "• <code>SOLRAC.md</code> in the launch dir — operator overlay (who runs it, project context). Re-read every turn.",
+  "**Commands** (type `/cmd` for autocomplete, or `:cmd`)",
   "",
-  "Send <code>!!literal</code> to start a message with a literal <code>!</code>.",
+  "- **clear** `[primary|secondary|all]` — drop session state. Default: all.",
+  "- **compact** `[primary|secondary]` — summarize and restart session. Costs one Claude turn. Default: primary.",
+  "- **context** `[primary|secondary]` — show context-window size in bytes + tokens. Default: primary.",
+  "- **help** — this card.",
+  "- **status** — show session and spend snapshot for this chat.",
+  "",
+  "**Customize**",
+  "",
+  "- `SOUL.md` in the launch dir — voice, stance, safety. Restart to apply.",
+  "- `SOLRAC.md` in the launch dir — operator overlay (who runs it, project context). Re-read every turn.",
+  "",
+  "Send `!!literal` to start a message with a literal `!`.",
 ].join("\n");
 
-// Render `/help` including operator-defined skills if any are loaded. Static
-// commands stay verbatim so the help card is grep-stable across deployments
-// without skills; the skills section only appears when present.
-export function renderHelp(skills: SkillRegistry): string {
-  if (skills.size() === 0) return HELP_BASE;
-  const lines = [HELP_BASE, "", "<b>Skills</b>"];
+// Render `/help` in markdown including operator-defined skills if any are
+// loaded. Static commands stay verbatim so the help card is grep-stable
+// across deployments without skills; the skills section only appears when
+// present. The Telegram path runs this through `mdToTelegramHtml`; the web
+// transport renders it with `marked` in the browser.
+export function renderHelpMarkdown(skills: SkillRegistry): string {
+  if (skills.size() === 0) return HELP_BASE_MD;
+  const lines = [HELP_BASE_MD, "", "**Skills**", ""];
   // Sort by name for stable output across runs (registry insertion order is
   // filesystem-dependent).
   const sorted = [...skills.all].sort((a, b) => a.name.localeCompare(b.name));
   for (const s of sorted) {
-    lines.push(`• <b>${htmlEscapeText(s.name)}</b> — ${htmlEscapeText(s.description)}`);
+    lines.push(`- **${s.name}** — ${s.description}`);
   }
   return lines.join("\n");
 }
@@ -1230,8 +1255,9 @@ async function sendOrLog(
   chatId: number,
   text: string,
   errEvent: string,
+  markdownSource?: string,
 ): Promise<void> {
   await tg
-    .sendMessage(chatId, text, { parse_mode: "HTML" })
+    .sendMessage(chatId, text, { parse_mode: "HTML", markdownSource })
     .catch((err) => log.warn(errEvent, { chatId, error: (err as Error).message }));
 }
