@@ -528,15 +528,95 @@ If you're sharing an integration with someone else, treat it like you would any 
 
 ### Built-in integrations
 
-solrac ships a small set of blessed integrations under `src/integrations-builtin/`:
+solrac ships a small set of blessed integrations under `src/integrations-builtin/`. They're always tried first when integrations are enabled (they win tool-name collisions over operator-authored integrations) and each self-gates: missing creds or missing optional deps → register zero tools, log a single line, boot continues normally.
 
-(none in the v1 integrations PR; planned: `time` educational + `gmail` real reference. See `solrac-dev/PLAN.md` Phase 5.)
+#### `time` — current time + timestamp formatting (no setup)
 
-When blessed integrations land, they will:
+Two tools, zero deps, no credentials. Always loads when integrations are enabled.
 
-- Always be tried first (they win tool-name collisions over operator integrations).
-- Self-gate: missing credentials or missing optional deps → register zero tools, log a single line, boot continues.
-- Be opt-out per-integration via the integration's own env vars (e.g. `SOLRAC_GMAIL_DISABLED=true`), not a global flag.
+| Tool | Tier | Description |
+|---|---|---|
+| `mcp__solrac__time_now` | auto | Current ISO 8601 UTC timestamp + human rendering in a given IANA timezone. |
+| `mcp__solrac__time_format` | auto | Format an existing ISO timestamp in a target timezone + locale. |
+
+Use cases the agent answers without flinching:
+
+- "What time is it for the team in Tokyo right now?"
+- "Convert 2026-04-12T18:30:00Z to JST."
+- "When does our 5pm New York standup happen in Berlin?"
+
+This is also the file to read first when learning to write your own integration — `src/integrations-builtin/time/index.ts` is heavily commented and demonstrates `IntegrationContext`, `meta.tier`, `alwaysLoad`, and multi-tool registration in ~200 lines.
+
+#### `gmail` — multi-account Gmail (OAuth2; opt-in deps)
+
+11 tools spanning read, organization, and send/delete. Self-gates if `googleapis` is not installed OR no accounts are configured. Setup is a one-time bootstrap per account.
+
+| Tool | Tier | Description |
+|---|---|---|
+| `gmail_list_accounts` | auto | Discover configured aliases. |
+| `gmail_list_labels` | auto | All labels (system + user) for an account. |
+| `gmail_search_messages` | auto | Gmail query syntax (from:, subject:, is:unread, etc.). |
+| `gmail_get_message` | auto | Full message: headers, plain-text + HTML body, attachments. |
+| `gmail_list_threads` | auto | Conversation groups. |
+| `gmail_apply_label` | confirm | Add labels to messages. |
+| `gmail_remove_label` | confirm | Remove labels (e.g. mark UNREAD off → mark read). |
+| `gmail_archive_message` | confirm | Remove INBOX label. |
+| `gmail_trash_message` | confirm | Move to Trash (recoverable 30 days). |
+| `gmail_delete_message` | confirm | **PERMANENT** delete. Requires `confirm: true` body field too. |
+| `gmail_send_message` | confirm | Send email with optional attachments + reply threading. Requires `confirm: true` body field too. |
+
+The destructive ops (`delete`, `send`) carry **two** safeguards: solrac's Telegram-confirm prompt (you, the user, must tap ✅) AND a `confirm: true` field the model must explicitly include in its tool call (the model must intentionally assert "I want to send/delete"). Both must be satisfied; an agent can't trip-and-send.
+
+##### Setup (~5 min one-time + ~1 min per account)
+
+```bash
+# 1. From the solrac repo root, install Gmail's optional runtime deps.
+#    They are NOT in solrac's `dependencies` (only `devDependencies`),
+#    so production deploys via `npm ci --production` skip them. To
+#    enable Gmail in production, install with --save (no --save-dev):
+npm install --save googleapis google-auth-library
+
+# 2. Get an OAuth client credentials.json from Google Cloud Console:
+#    APIs & Services → Credentials → Create credentials → OAuth client ID.
+#    Application type: "Desktop app".
+#    Save the downloaded JSON to:
+mkdir -p ~/.solrac/gmail
+mv ~/Downloads/client_secret_*.json ~/.solrac/gmail/credentials.json
+
+# 3. Authenticate one or more accounts (opens browser per call).
+bun scripts/gmail-auth.ts personal
+bun scripts/gmail-auth.ts work
+# Each writes ~/.solrac/gmail/<alias>.json + appends to accounts.json.
+
+# 4. Restart solrac. Boot log should show:
+#    integrations.gmail.loaded accountCount:2 toolCount:11
+```
+
+If Gmail is unconfigured, the boot log distinguishes which precondition failed:
+
+| Log event | Meaning |
+|---|---|
+| `integrations.gmail.deps_missing` | `googleapis` / `google-auth-library` not installed. Run the `npm install` above. |
+| `integrations.gmail.disabled` | `~/.solrac/gmail/credentials.json` not found. Get it from Google Cloud Console. |
+| `integrations.gmail.no_accounts` | Credentials present, but no accounts authed. Run `bun scripts/gmail-auth.ts <alias>`. |
+| `integrations.gmail.loaded` | All set. Tool count + account count reported. |
+
+##### Use cases
+
+```
+@ search my personal Gmail for unread newsletters older than a week
+@ archive everything in personal Gmail labeled "promotions"
+@ draft a reply to message <id> in work Gmail saying I'll respond Monday
+```
+
+The third one will require approving the send via inline-keyboard. The agent must produce the right `confirm: true` argument first; it can't accidentally trip-send.
+
+##### Limits to know
+
+- **`gmail_delete_message` is permanent.** Use `gmail_trash_message` (Trash, recoverable 30 days) for normal deletes. The permanent-delete tool exists for cases where you really mean it.
+- **OAuth refresh** is automatic. The integration writes refreshed tokens back to `~/.solrac/gmail/<alias>.json` whenever Google rotates them.
+- **Scope is fixed** at read + modify + send + userinfo (for email-address discovery). To narrow scope, edit `scripts/gmail-auth.ts` SCOPES and re-auth per account.
+- **The `googleapis` package is ~30MB.** That's why it's an optional dep, not a runtime requirement. If you don't want Gmail, skip step 1 and Gmail self-gates on `deps_missing`.
 
 ### Limits to know
 
