@@ -96,6 +96,7 @@ import {
   type PolicyDenyEvent,
 } from "./policy.ts";
 import type { SessionStore, SessionTier } from "./session.ts";
+import { mdToTelegramHtml } from "./markdown.ts";
 import { htmlEscapeText, type TelegramClient } from "./telegram.ts";
 
 const LOOP_THRESHOLD = 3;
@@ -355,10 +356,10 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
           const now = Date.now();
           if (now - lastEditAt >= EDIT_THROTTLE_MS) {
             const next = renderStub(assistantText, toolCalls, null, thinkingStub);
-            if (next !== lastEditedContent) {
+            if (next.html !== lastEditedContent) {
               lastEditAt = now;
-              lastEditedContent = next;
-              await tryEdit(deps.tg, input.chatId, stubId, next);
+              lastEditedContent = next.html;
+              await tryEdit(deps.tg, input.chatId, stubId, next.html, next.markdown);
             }
           }
         }
@@ -401,18 +402,31 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
 
   const finalText = resultText || assistantText;
   const footer = buildFooter({ numTurns, costUsd, isError });
-  const finalRender = isError
-    ? `❌ <b>error</b>: ${htmlEscapeText(errorMessage ?? "unknown")}${footer ? `\n\n${footer}` : ""}`
+  const finalRender: RenderedStub = isError
+    ? {
+        html: `❌ <b>error</b>: ${htmlEscapeText(errorMessage ?? "unknown")}${footer ? `\n\n${footer.html}` : ""}`,
+        markdown: `❌ **error**: ${errorMessage ?? "unknown"}${footer ? `\n\n${footer.markdown}` : ""}`,
+      }
     : renderStub(finalText, toolCalls, footer, thinkingStub);
 
   if (stubId !== null) {
-    if (finalRender !== lastEditedContent) {
-      await tryEdit(deps.tg, input.chatId, stubId, finalRender, "agent.edit_final_failed");
+    if (finalRender.html !== lastEditedContent) {
+      await tryEdit(
+        deps.tg,
+        input.chatId,
+        stubId,
+        finalRender.html,
+        finalRender.markdown,
+        "agent.edit_final_failed",
+      );
     }
   } else if (!isError && finalText.trim()) {
     // Stub creation failed earlier — send the answer as a fresh message instead.
     await deps.tg
-      .sendMessage(input.chatId, finalRender, { parse_mode: "HTML" })
+      .sendMessage(input.chatId, finalRender.html, {
+        parse_mode: "HTML",
+        markdownSource: finalRender.markdown,
+      })
       .catch((err) => log.warn("agent.final_send_failed", { error: (err as Error).message }));
   }
 
@@ -481,33 +495,61 @@ export function sanitizedSubprocessEnv(): Record<string, string | undefined> {
   return env;
 }
 
+interface RenderedStub {
+  html: string;
+  markdown: string;
+}
+
 function renderStub(
   text: string,
   toolCalls: ToolCallSummary[],
-  footer: string | null,
+  footer: Footer | null,
   thinkingStub: string,
-): string {
-  const parts: string[] = [];
+): RenderedStub {
+  const htmlParts: string[] = [];
+  const mdParts: string[] = [];
   if (toolCalls.length > 0) {
     const names = [...new Set(toolCalls.map((t) => t.name))].join(", ");
-    parts.push(`⚙️ <i>${htmlEscapeText(names)}</i>`);
+    htmlParts.push(`⚙️ <i>${htmlEscapeText(names)}</i>`);
+    mdParts.push(`*⚙️ ${names}*`);
   }
-  parts.push(text.trim() ? htmlEscapeText(text) : thinkingStub);
-  if (footer) parts.push(footer);
-  return truncate(parts.join("\n\n"), TELEGRAM_TEXT_MAX);
+  if (text.trim()) {
+    htmlParts.push(mdToTelegramHtml(text));
+    mdParts.push(text);
+  } else {
+    htmlParts.push(thinkingStub);
+    mdParts.push(thinkingStub);
+  }
+  if (footer) {
+    htmlParts.push(footer.html);
+    mdParts.push(footer.markdown);
+  }
+  return {
+    html: truncate(htmlParts.join("\n\n"), TELEGRAM_TEXT_MAX),
+    markdown: mdParts.join("\n\n"),
+  };
+}
+
+interface Footer {
+  html: string;
+  markdown: string;
 }
 
 function buildFooter(args: {
   numTurns: number | null;
   costUsd: number | null;
   isError: boolean;
-}): string | null {
+}): Footer | null {
   if (args.isError) return null;
   const bits: string[] = [];
   if (args.numTurns !== null) bits.push(`${args.numTurns} turn${args.numTurns === 1 ? "" : "s"}`);
   if (args.costUsd !== null) bits.push(`$${args.costUsd.toFixed(4)}`);
   if (bits.length === 0) return null;
-  return `<i>✅ ${bits.join(" · ")}</i>`;
+  const inner = bits.join(" · ");
+  return {
+    html: `<i>✅ ${inner}</i>`,
+    markdown: `*✅ ${inner}*`,
+  };
 }
 
 async function tryEdit(
@@ -515,10 +557,11 @@ async function tryEdit(
   chatId: number,
   messageId: number,
   text: string,
+  markdownSource: string | undefined,
   errEvent: string = "agent.edit_throttled",
 ): Promise<void> {
   await tg
-    .editMessageText(chatId, messageId, text, { parse_mode: "HTML" })
+    .editMessageText(chatId, messageId, text, { parse_mode: "HTML", markdownSource })
     .catch((err) => log.debug(errEvent, { error: (err as Error).message }));
 }
 

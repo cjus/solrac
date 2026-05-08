@@ -26,6 +26,11 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `OLLAMA_HISTORY_LIMIT` | no | `6` | positive int | Last N successful Ollama turns reconstructed as conversation context per chat. At 256-char prompts × 6 turns ≈ ~3k tokens worst case. |
 | `SOLRAC_SKILLS_ENABLED` | no | `false` | boolean | Master switch for operator-defined skills. When `true`, Solrac discovers `SKILL.md` files under `SOLRAC_SKILLS_DIR` at boot and exposes each as a `/<name>` slash command. |
 | `SOLRAC_SKILLS_DIR` | no | `./skills` | path | Directory scanned for `<name>/SKILL.md` files. Resolved relative to launch cwd. Loaded ONCE at boot — edit files and restart. See [USAGE.md#skills-operator-defined-commands](./USAGE.md#skills-operator-defined-commands). |
+| `SOLRAC_WEB_ENABLED` | no | `false` | boolean | Master switch for the browser web UI. When `true`, Solrac binds a second `Bun.serve` instance to `SOLRAC_WEB_HOST:SOLRAC_WEB_PORT`. `SOLRAC_WEB_TOKEN` becomes required. |
+| `SOLRAC_WEB_HOST` | no | `127.0.0.1` | string | Bind address for the web UI. `127.0.0.1`/`localhost` = loopback only. `0.0.0.0` = all interfaces (LAN/Tailscale/public — pair with a strong token). |
+| `SOLRAC_WEB_PORT` | no | `8080` | positive int | Port for the web UI. Must differ from `PORT` (which serves `/health` & `/stats`). |
+| `SOLRAC_WEB_TOKEN` | when `SOLRAC_WEB_ENABLED=true` | — | string | Login secret. **Required even on `127.0.0.1`** — a co-tenant on a shared host could otherwise reach the unauthenticated UI. Generate with `openssl rand -hex 32`. Cookie set after login is HttpOnly + SameSite=Strict + Path=/ + Max-Age=24h. |
+| `SOLRAC_WEB_CHAT_ID` | no | `-1000` | negative int | Synthetic chat id all web traffic shares. One session per Claude tier, one cost-cap bucket, one `/clear` scope. Negative to avoid collision with real Telegram chat ids. |
 
 ## Validation rules
 
@@ -38,6 +43,7 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 - **`HOURLY_COST_CAP_USD`** and **`GLOBAL_HOURLY_COST_CAP_USD`** must parse as positive numbers (float allowed). The global cap defaults to `HOURLY_COST_CAP_USD × MAX_CONCURRENT_TURNS` if unset, so bumping `MAX_CONCURRENT_TURNS` auto-tracks unless you've explicitly overridden the global. Set both explicitly for production if you want the cap independent from concurrency.
 - **Webhook constraint:** when `SOLRAC_TRANSPORT=webhook`, `TG_WEBHOOK_SECRET` must be set and ≥32 characters.
 - **Ollama constraint:** when `OLLAMA_ENABLED=true`, `OLLAMA_MODEL` must be set and non-blank. `OLLAMA_TIMEOUT_MS` and `OLLAMA_HISTORY_LIMIT` must parse as positive integers if provided. `OLLAMA_URL` has its trailing slash stripped at boot.
+- **Web UI constraint:** when `SOLRAC_WEB_ENABLED=true`, `SOLRAC_WEB_TOKEN` must be set (any value; ≥32 chars recommended). `SOLRAC_WEB_PORT` must differ from `PORT`. `SOLRAC_WEB_CHAT_ID` must be a negative integer.
 
 The returned `Config` object is `Object.freeze`d; `allowlistBootstrap` is also frozen. There's no runtime mutation path.
 
@@ -84,6 +90,13 @@ OLLAMA_HISTORY_LIMIT=6
 # Operator-defined skills. Off by default.
 SOLRAC_SKILLS_ENABLED=false       # set to true to load $SOLRAC_SKILLS_DIR/<name>/SKILL.md at boot
 SOLRAC_SKILLS_DIR=./skills        # cwd-relative; edit + restart to pick up changes
+
+# Web UI. Off by default. When SOLRAC_WEB_ENABLED=true, SOLRAC_WEB_TOKEN is required.
+SOLRAC_WEB_ENABLED=false
+SOLRAC_WEB_HOST=127.0.0.1         # 0.0.0.0 to expose on LAN/Tailscale/public
+SOLRAC_WEB_PORT=8080              # must differ from PORT
+SOLRAC_WEB_TOKEN=                 # required when enabled; generate: openssl rand -hex 32
+# SOLRAC_WEB_CHAT_ID=-1000        # synthetic shared chat id for the web transport
 ```
 
 ## Sensitive-secret handling

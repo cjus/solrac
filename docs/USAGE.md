@@ -518,6 +518,45 @@ What Solrac specifically adds on top:
 | `❌ error: result_error: tool_use` (rare) | SDK couldn't recover from a tool deny | Rerun the message; if persistent, check the audit row's `error_message` |
 | Bot replies stale; logs show `409 Conflict` | Two pollers fighting | See [RUNBOOK.md](./RUNBOOK.md#409-conflict) |
 
+## Web UI (browser interface)
+
+Off by default. Enabled via `SOLRAC_WEB_ENABLED=true` plus a token. Brings the same agent loop and slash commands into a browser, with proper markdown rendering (Telegram's HTML mode can't show headers, lists, or tables — the web UI can).
+
+### Boot
+
+```sh
+SOLRAC_WEB_ENABLED=true \
+SOLRAC_WEB_HOST=127.0.0.1 \
+SOLRAC_WEB_PORT=8080 \
+SOLRAC_WEB_TOKEN=$(openssl rand -hex 32) \
+npm run dev
+```
+
+Open `http://127.0.0.1:8080`. The login page accepts `SOLRAC_WEB_TOKEN`; on success a session cookie is set (HttpOnly + SameSite=Strict + Path=/ + Max-Age=24h) and the chat UI loads. Bind to `0.0.0.0` to expose on the LAN/Tailnet — the token is the gate, so use a strong one.
+
+The token is **required even on `127.0.0.1`** — a co-tenant on a shared host could otherwise reach the unauthenticated UI.
+
+### Feature parity with Telegram
+
+Everything you can do in Telegram works in the web UI through the same code path:
+
+- **Engine routing**: prefix `@` (primary), `!` (secondary), `>` (Ollama). The composer has a 3-state pill that prepends the prefix for you.
+- **Slash commands**: `/help`, `/status`, `/context`, `/clear [primary|secondary|all]`, `/compact`, plus any operator-defined skills.
+- **Tool confirmation**: when Claude wants to run a tier-3 tool (Edit, Write, Bash with non-trivial args), an inline Allow / Deny prompt appears. 60 s timeout — same as Telegram.
+- **Cost caps**: per-chat (web traffic shares one synthetic chat id, default `-1000`) and global. Both apply the same way.
+- **Audit log**: every web turn writes the standard audit row. Query by `chat_id = -1000` to see web-only history.
+
+### Markdown rendering
+
+Claude and Ollama both emit markdown. Solrac now converts markdown to Telegram-safe HTML for the bot (so headers become bold, lists become `• item`, tables become ASCII inside `<pre>`, etc.) and ships the original markdown to the web UI for full rendering (real `<h1..h6>`, `<ul>/<ol>`, `<table>`, fenced code with language classes for downstream syntax highlighting). The conversion uses [`marked`](https://github.com/markedjs/marked) on both sides; output is allowlist-sanitized in the browser before injection.
+
+### Notes & limits (v1)
+
+- One operator. Multiple browser tabs all share the same SSE stream and conversation — open as many as you like, they'll stay in sync.
+- File uploads are not supported (Telegram's photo flow is). Out of scope for v1.
+- Sessions are stored in process memory; restarting Solrac signs out all browsers (operator must log in again). The conversation history is hydrated from the audit log on next page load.
+- Confirmation prompts that arrive before the operator opens the UI are silently dropped on broker timeout (60 s). Same failure mode as Telegram when the operator's phone is off.
+
 ## Related docs
 
 - [GLOSSARY.md](./GLOSSARY.md) — terminology reference

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>solrac · web</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main id="app">
+  <section id="login" class="login hidden">
+    <h1>solrac</h1>
+    <form id="login-form">
+      <label for="login-token">access token</label>
+      <input id="login-token" type="password" autocomplete="off" autofocus>
+      <button type="submit">enter</button>
+      <p id="login-error" class="error" aria-live="polite"></p>
+    </form>
+  </section>
+
+  <section id="chat" class="chat hidden">
+    <header class="chat-header">
+      <span class="title">solrac · web</span>
+      <span class="spacer"></span>
+      <span id="conn-state" class="conn-state" title="stream status">…</span>
+      <button id="clear-btn" class="header-btn" title="/clear all">⨯</button>
+      <button id="logout-btn" class="header-btn" title="logout">⏻</button>
+    </header>
+    <ol id="messages" class="messages" aria-live="polite"></ol>
+    <form id="composer" class="composer">
+      <div class="engine-pill" role="group" aria-label="engine">
+        <button type="button" class="engine-opt" data-prefix="" title="primary (default)">●</button>
+        <button type="button" class="engine-opt" data-prefix="!" title="secondary (Opus)">!</button>
+        <button type="button" class="engine-opt" data-prefix=">" title="ollama (local)">&gt;</button>
+      </div>
+      <textarea id="composer-text" rows="1" placeholder="message solrac…" autofocus></textarea>
+      <button type="submit" id="send-btn" title="send (Enter)">↵</button>
+    </form>
+  </section>
+</main>
+<script src="/static/marked.min.js"></script>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

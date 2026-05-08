@@ -117,6 +117,8 @@ import {
 } from "./skills.ts";
 import { createTelegramClient, type TelegramClient } from "./telegram.ts";
 import { TurnTracker } from "./turn-tracker.ts";
+import { createWebClient, type WebClient } from "./web-client.ts";
+import { startWebServer } from "./web.ts";
 
 interface RunTurnDeps {
   tg: TelegramClient;
@@ -484,11 +486,18 @@ async function main(): Promise<void> {
     const tg = createTelegramClient(config.telegramBotToken);
     const tracker = new TurnTracker();
     const broker = createConfirmationBroker({ tg });
+    // Separate broker for the web transport so confirmation prompts go to
+    // the WebClient bus (and on into the SSE stream) instead of Telegram.
+    // The web's `/api/confirm` endpoint calls `webBroker.resolve(...)`.
+    const tgWebClient = config.webEnabled ? createWebClient() : null;
+    const webBroker = tgWebClient ? createConfirmationBroker({ tg: tgWebClient }) : null;
     const costGuard = createCostCapGuard(db, config.hourlyCostCapUsd);
     const globalCostGuard = createGlobalCostCapGuard(db, config.globalHourlyCostCapUsd);
     const denialThrottle = createDenialThrottle();
-    const createCanUseTool = ({ chatId, auditId }: { chatId: number; auditId: number }) =>
-      createPolicyHook({ chatId, auditId, costGuard, broker });
+    const createCanUseTool = ({ chatId, auditId }: { chatId: number; auditId: number }) => {
+      const b = webBroker && chatId === config.webChatId ? webBroker : broker;
+      return createPolicyHook({ chatId, auditId, costGuard, broker: b });
+    };
     // PLAN Step 11: Ollama deps are constructed once iff the feature is on.
     // When off, dispatch in makeRunTurn falls through to a "disabled" reply.
     const ollamaDeps: OllamaRunDeps | null =
@@ -565,24 +574,63 @@ async function main(): Promise<void> {
       globalHourlyCostCapUsd: config.globalHourlyCostCapUsd,
       skillRegistry,
     };
+    // Web UI transport (optional). The `webClient` was built earlier so the
+    // `webBroker` could capture it; reuse the same instance here so all bus
+    // events flow through one subscriber set.
+    const webClient: WebClient | null = tgWebClient;
+    let webCommandDeps: RunCommandDeps | null = null;
+    let webOllamaDeps: OllamaRunDeps | null = null;
+    if (webClient) {
+      webCommandDeps = {
+        ...commandDeps,
+        tg: webClient,
+      };
+      webOllamaDeps = ollamaDeps ? { ...ollamaDeps, tg: webClient } : null;
+    }
+
+    const tgRunTurn = makeRunTurn({
+      tg,
+      db,
+      sessions,
+      config,
+      soul,
+      instanceMdPath: solracMdPath,
+      primaryModel: config.primaryModel,
+      secondaryModel: config.secondaryModel,
+      costGuard,
+      globalCostGuard,
+      createCanUseTool,
+      ollamaDeps,
+      commandDeps,
+      botUsername,
+      skillRegistry,
+    });
+    const webRunTurn = webClient
+      ? makeRunTurn({
+          tg: webClient,
+          db,
+          sessions,
+          config,
+          soul,
+          instanceMdPath: solracMdPath,
+          primaryModel: config.primaryModel,
+          secondaryModel: config.secondaryModel,
+          costGuard,
+          globalCostGuard,
+          createCanUseTool,
+          ollamaDeps: webOllamaDeps,
+          commandDeps: webCommandDeps!,
+          botUsername: null,
+          skillRegistry,
+        })
+      : null;
+
     const queue = createTurnQueue({
-      runTurn: makeRunTurn({
-        tg,
-        db,
-        sessions,
-        config,
-        soul,
-        instanceMdPath: solracMdPath,
-        primaryModel: config.primaryModel,
-        secondaryModel: config.secondaryModel,
-        costGuard,
-        globalCostGuard,
-        createCanUseTool,
-        ollamaDeps,
-        commandDeps,
-        botUsername,
-        skillRegistry,
-      }),
+      runTurn: (update) => {
+        const chatId = update.message?.chat.id ?? update.callback_query?.message?.chat.id ?? 0;
+        if (webRunTurn && chatId === config.webChatId) return webRunTurn(update);
+        return tgRunTurn(update);
+      },
       maxConcurrentTurns: config.maxConcurrentTurns,
       tracker,
     });
@@ -603,7 +651,44 @@ async function main(): Promise<void> {
       },
     });
     const pollAbort = new AbortController();
-    installShutdown({ tracker, db, pidPath, pollAbort, server });
+    let webServer: ReturnType<typeof startWebServer> | null = null;
+    if (config.webEnabled && webClient && config.webToken && webBroker) {
+      let nextWebUpdateId = 1;
+      webServer = startWebServer({
+        host: config.webHost,
+        port: config.webPort,
+        token: config.webToken,
+        webChatId: config.webChatId,
+        webClient,
+        rootDir: packageDir(),
+        onMessage: (text) => {
+          const id = nextWebUpdateId++;
+          const update: Update = {
+            update_id: id,
+            message: {
+              message_id: id,
+              date: Math.floor(Date.now() / 1000),
+              chat: { id: config.webChatId, type: "private", first_name: "web" },
+              from: {
+                id: config.webChatId,
+                is_bot: false,
+                first_name: "operator",
+              },
+              text,
+            },
+          };
+          const result = queue.enqueue(update);
+          if (result.kind === "dropped_queue_full") {
+            auditQueueFull(update, db, webClient, result.depth);
+            return "queue_full";
+          }
+          return "queued";
+        },
+        onConfirm: (callbackId, decision) => webBroker.resolve(callbackId, decision),
+        loadHistory: () => db.recentChatTurns(config.webChatId, 50),
+      });
+    }
+    installShutdown({ tracker, db, pidPath, pollAbort, server, webServer });
     if (config.allowlistBootstrap.length > 0) {
       startDailyReportCron({ db, tg, targetChatId: config.allowlistBootstrap[0]! });
     }

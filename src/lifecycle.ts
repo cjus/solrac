@@ -79,6 +79,9 @@ export interface ShutdownDeps {
   pidPath: string;
   pollAbort: AbortController;
   server?: ShutdownServer | null;
+  // Optional second server for the web UI transport. Stopped right after the
+  // ops `server` so SSE writers terminate before tracker drain begins.
+  webServer?: ShutdownServer | null;
   drainTimeoutMs?: number;
   exit?: (code: number) => void;
   signals?: NodeJS.Signals[];
@@ -123,6 +126,15 @@ export function installShutdown(deps: ShutdownDeps): ShutdownHandle {
         log.info("shutdown.server_stopped");
       } catch (err) {
         log.warn("shutdown.server_stop_failed", { error: (err as Error).message });
+      }
+    }
+
+    if (deps.webServer) {
+      try {
+        await deps.webServer.stop();
+        log.info("shutdown.web_server_stopped");
+      } catch (err) {
+        log.warn("shutdown.web_server_stop_failed", { error: (err as Error).message });
       }
     }
 

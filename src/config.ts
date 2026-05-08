@@ -90,6 +90,19 @@ export interface Config {
   // for `./data` (dataDir).
   readonly skillsEnabled: boolean;
   readonly skillsDir: string;
+  // Web UI transport — second Bun.serve instance on a separate port. When
+  // off (default), Solrac is Telegram-only. When on, `webToken` is required
+  // even on loopback (a co-tenant on a shared host could otherwise reach the
+  // unauthenticated UI). `webPort` must differ from `port` (the ops server).
+  // `webChatId` is the synthetic chat id all web traffic shares — kept
+  // negative to avoid collision with real Telegram chat ids (always positive
+  // for users, negative for groups, but groups are not in the allowlist
+  // surface). Default −1000 is far from realistic group ids.
+  readonly webEnabled: boolean;
+  readonly webHost: string;
+  readonly webPort: number;
+  readonly webToken: string | null;
+  readonly webChatId: number;
 }
 
 function parseAllowlist(raw: string): number[] {
@@ -135,6 +148,15 @@ function parseBoolean(name: string, raw: string | undefined, fallback: boolean):
   if (v === "true" || v === "1" || v === "yes") return true;
   if (v === "false" || v === "0" || v === "no") return false;
   throw new Error(`${name} must be true/false (or 1/0), got "${raw}"`);
+}
+
+function parseNegativeInt(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n >= 0) {
+    throw new Error(`${name} must be a negative integer, got "${raw}"`);
+  }
+  return n;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -206,12 +228,37 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     6,
   );
 
+  const webEnabled = parseBoolean("SOLRAC_WEB_ENABLED", env.SOLRAC_WEB_ENABLED, false);
+  const webPort = parsePositiveInt("SOLRAC_WEB_PORT", env.SOLRAC_WEB_PORT, 8080);
+  const webHost =
+    env.SOLRAC_WEB_HOST && env.SOLRAC_WEB_HOST.trim() !== ""
+      ? env.SOLRAC_WEB_HOST.trim()
+      : "127.0.0.1";
+  const webToken =
+    env.SOLRAC_WEB_TOKEN && env.SOLRAC_WEB_TOKEN.trim() !== ""
+      ? env.SOLRAC_WEB_TOKEN.trim()
+      : null;
+  const webChatId = parseNegativeInt("SOLRAC_WEB_CHAT_ID", env.SOLRAC_WEB_CHAT_ID, -1000);
+  const port = parsePositiveInt("PORT", env.PORT, 8443);
+  if (webEnabled) {
+    if (!webToken) {
+      throw new Error(
+        "SOLRAC_WEB_TOKEN is required when SOLRAC_WEB_ENABLED=true (use `openssl rand -hex 32` to generate one)",
+      );
+    }
+    if (webPort === port) {
+      throw new Error(
+        `SOLRAC_WEB_PORT (${webPort}) must differ from PORT (${port}); the ops server and the web UI cannot share a port`,
+      );
+    }
+  }
+
   return Object.freeze({
     anthropicApiKey: env.ANTHROPIC_API_KEY!,
     telegramBotToken: env.TELEGRAM_BOT_TOKEN!,
     allowlistBootstrap: Object.freeze(parseAllowlist(env.ALLOWLIST_BOOTSTRAP!)),
     transport,
-    port: parsePositiveInt("PORT", env.PORT, 8443),
+    port,
     dataDir: env.DATA_DIR && env.DATA_DIR.trim() !== "" ? env.DATA_DIR : "./data",
     hourlyCostCapUsd,
     globalHourlyCostCapUsd,
@@ -236,5 +283,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       env.SOLRAC_SKILLS_DIR && env.SOLRAC_SKILLS_DIR.trim() !== ""
         ? env.SOLRAC_SKILLS_DIR.trim()
         : "./skills",
+    webEnabled,
+    webHost,
+    webPort,
+    webToken,
+    webChatId,
   });
 }
