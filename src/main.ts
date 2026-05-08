@@ -64,8 +64,13 @@
  *   - All other src/*.ts files — main is the integration test for the lot
  */
 
-import type { CanUseTool } from "@anthropic-ai/claude-agent-sdk";
+import {
+  createSdkMcpServer,
+  type CanUseTool,
+  type McpSdkServerConfigWithInstance,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { Update } from "@grammyjs/types";
+import { join } from "node:path";
 import { runAgent } from "./agent.ts";
 import { createAllowlist, type Allowlist } from "./allowlist.ts";
 import {
@@ -108,6 +113,11 @@ import {
 import { createTurnQueue } from "./queue.ts";
 import { startServer } from "./server.ts";
 import { createSessionStore, type SessionStore } from "./session.ts";
+import {
+  createIntegrationContext,
+  loadIntegrations,
+  logIntegrationLoadResult,
+} from "./integrations.ts";
 import {
   EMPTY_SKILL_REGISTRY,
   loadSkillsSync,
@@ -155,6 +165,11 @@ interface RunTurnDeps {
   // before the unknown-command fallback. `EMPTY_SKILL_REGISTRY` when the
   // feature is disabled (`SOLRAC_SKILLS_ENABLED=false`).
   skillRegistry: SkillRegistry;
+  // Phase 2 — in-process MCP server hosting operator + blessed integrations.
+  // `null` when integrations are disabled or zero tools loaded; otherwise the
+  // value created by `createSdkMcpServer` and threaded into `runAgent`'s
+  // `options.mcpServers`. Claude tiers only — Ollama path ignores this.
+  mcpServer: McpSdkServerConfigWithInstance | null;
 }
 
 function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
@@ -277,6 +292,7 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
         costGuard: deps.costGuard,
         globalCostGuard: deps.globalCostGuard,
         createCanUseTool: deps.createCanUseTool,
+        mcpServer: deps.mcpServer,
       },
       {
         chatId: msg.chat.id,
@@ -539,6 +555,30 @@ async function main(): Promise<void> {
         })()
       : EMPTY_SKILL_REGISTRY;
 
+    // Phase 2 — load integrations (blessed + operator-authored). Off by
+    // default. When enabled, both `src/integrations-builtin/` (always tried,
+    // shipped with solrac) and `$SOLRAC_INTEGRATIONS_DIR` (operator-owned)
+    // are scanned. First-dir-wins on tool-name collisions so a stale
+    // operator copy can't shadow a blessed integration. Tools registered
+    // here surface to Claude tiers as `mcp__solrac__<name>`. Ollama
+    // (`>` prefix) does NOT see integrations — see ollama.ts.
+    let integrationsMcpServer: McpSdkServerConfigWithInstance | null = null;
+    if (config.integrationsEnabled) {
+      const builtinDir = join(import.meta.dir, "integrations-builtin");
+      const result = await loadIntegrations(
+        [builtinDir, config.integrationsDir],
+        createIntegrationContext(),
+      );
+      logIntegrationLoadResult([builtinDir, config.integrationsDir], result);
+      if (result.tools.length > 0) {
+        integrationsMcpServer = createSdkMcpServer({
+          name: "solrac",
+          version: "1.0.0",
+          tools: [...result.tools],
+        });
+      }
+    }
+
     // PNX-167 — register slash commands so Telegram clients show them in the
     // bot's autocomplete menu. Non-fatal — autocomplete is a UX nicety.
     // Skills are appended after the built-in registry so the canonical
@@ -604,6 +644,7 @@ async function main(): Promise<void> {
       commandDeps,
       botUsername,
       skillRegistry,
+      mcpServer: integrationsMcpServer,
     });
     const webRunTurn = webClient
       ? makeRunTurn({
@@ -622,6 +663,7 @@ async function main(): Promise<void> {
           commandDeps: webCommandDeps!,
           botUsername: null,
           skillRegistry,
+          mcpServer: integrationsMcpServer,
         })
       : null;
 
