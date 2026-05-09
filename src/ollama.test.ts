@@ -59,7 +59,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import { openDb, type SolracDb } from "./db.ts";
-import { OLLAMA_CAPABILITY_NOTE, runOllamaTurn, type OllamaRunDeps } from "./ollama.ts";
+import { buildOllamaCapabilityNote, runOllamaTurn, type OllamaRunDeps } from "./ollama.ts";
 import type { TelegramClient } from "./telegram.ts";
 
 const TEST_SOUL = "You are Solrac (test soul).";
@@ -292,9 +292,16 @@ describe("runOllamaTurn — happy path", () => {
     };
     expect(body.model).toBe("llama3.2");
     expect(body.stream).toBe(true);
+    // The default-engine flag is unset on `defaultDeps` so the matrix picks
+    // the Claude-only-deploy variant of the note.
+    const expectedNote = buildOllamaCapabilityNote({
+      toolsEnabled: false,
+      isDefaultEngine: false,
+      toolNames: [],
+    });
     expect(body.messages[0]).toEqual({
       role: "system",
-      content: `${TEST_SOUL}\n\n${OLLAMA_CAPABILITY_NOTE}`,
+      content: `${TEST_SOUL}\n\n${expectedNote}`,
     });
     // Without a SOLRAC.md present, no second system message; user prompt is
     // immediately after the SOUL system message.

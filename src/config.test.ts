@@ -40,10 +40,15 @@
 import { describe, expect, test } from "bun:test";
 import { loadConfig } from "./config.ts";
 
+// Pin `SOLRAC_DEFAULT_ENGINE=primary` for the shared base so tests not
+// specifically about the inversion don't have to also configure Ollama.
+// The new default since PR-B is `ollama`, which requires `OLLAMA_ENABLED=true`
+// — covered by the dedicated default-engine test block below.
 const baseEnv: NodeJS.ProcessEnv = {
   ANTHROPIC_API_KEY: "sk-ant-test",
   TELEGRAM_BOT_TOKEN: "fake-tg-token",
   ALLOWLIST_BOOTSTRAP: "100",
+  SOLRAC_DEFAULT_ENGINE: "primary",
 };
 
 describe("loadConfig — required vars", () => {
@@ -121,6 +126,15 @@ describe("loadConfig — OLLAMA_ENABLED contract", () => {
 });
 
 describe("loadConfig — OLLAMA_TOOLS_ENABLED contract", () => {
+  // Tools-on requires Ollama to be the default engine since PR-B; bake that
+  // into a local helper so each test stays focused on the tool-flag contract.
+  const toolsOnEnv: NodeJS.ProcessEnv = {
+    ...baseEnv,
+    SOLRAC_DEFAULT_ENGINE: "ollama",
+    OLLAMA_ENABLED: "true",
+    OLLAMA_MODEL: "gemma4:e4b",
+  };
+
   test("default: tools off, max iterations 8, timeout 60s", () => {
     const cfg = loadConfig({ ...baseEnv });
     expect(cfg.ollamaToolsEnabled).toBe(false);
@@ -131,7 +145,7 @@ describe("loadConfig — OLLAMA_TOOLS_ENABLED contract", () => {
   test("tools on without integrations throws actionable error", () => {
     expect(() =>
       loadConfig({
-        ...baseEnv,
+        ...toolsOnEnv,
         OLLAMA_TOOLS_ENABLED: "true",
       }),
     ).toThrow(/SOLRAC_INTEGRATIONS_ENABLED=true/);
@@ -139,7 +153,7 @@ describe("loadConfig — OLLAMA_TOOLS_ENABLED contract", () => {
 
   test("tools on + integrations on passes; bumps default timeout to 120s", () => {
     const cfg = loadConfig({
-      ...baseEnv,
+      ...toolsOnEnv,
       OLLAMA_TOOLS_ENABLED: "true",
       SOLRAC_INTEGRATIONS_ENABLED: "true",
     });
@@ -150,7 +164,7 @@ describe("loadConfig — OLLAMA_TOOLS_ENABLED contract", () => {
 
   test("explicit OLLAMA_TIMEOUT_MS wins over the tools-on default bump", () => {
     const cfg = loadConfig({
-      ...baseEnv,
+      ...toolsOnEnv,
       OLLAMA_TOOLS_ENABLED: "true",
       SOLRAC_INTEGRATIONS_ENABLED: "true",
       OLLAMA_TIMEOUT_MS: "45000",
@@ -160,12 +174,92 @@ describe("loadConfig — OLLAMA_TOOLS_ENABLED contract", () => {
 
   test("OLLAMA_MAX_TOOL_ITERATIONS override accepted", () => {
     const cfg = loadConfig({
-      ...baseEnv,
+      ...toolsOnEnv,
       OLLAMA_TOOLS_ENABLED: "true",
       SOLRAC_INTEGRATIONS_ENABLED: "true",
       OLLAMA_MAX_TOOL_ITERATIONS: "12",
     });
     expect(cfg.ollamaMaxToolIterations).toBe(12);
+  });
+});
+
+describe("loadConfig — SOLRAC_DEFAULT_ENGINE", () => {
+  // Required-vars triple, but no SOLRAC_DEFAULT_ENGINE → default is "ollama".
+  const minimalEnv: NodeJS.ProcessEnv = {
+    ANTHROPIC_API_KEY: "sk-ant-test",
+    TELEGRAM_BOT_TOKEN: "fake-tg-token",
+    ALLOWLIST_BOOTSTRAP: "100",
+  };
+
+  test("default is 'ollama' (PR-B inversion); requires OLLAMA_ENABLED", () => {
+    expect(() => loadConfig({ ...minimalEnv })).toThrow(
+      /SOLRAC_DEFAULT_ENGINE=ollama requires OLLAMA_ENABLED=true/,
+    );
+  });
+
+  test("default 'ollama' with OLLAMA_ENABLED+OLLAMA_MODEL passes", () => {
+    const cfg = loadConfig({
+      ...minimalEnv,
+      OLLAMA_ENABLED: "true",
+      OLLAMA_MODEL: "gemma4:e4b",
+    });
+    expect(cfg.defaultEngine).toBe("ollama");
+    expect(cfg.defaultEngineExplicit).toBe(false);
+  });
+
+  test("explicit SOLRAC_DEFAULT_ENGINE=primary passes without Ollama", () => {
+    const cfg = loadConfig({ ...minimalEnv, SOLRAC_DEFAULT_ENGINE: "primary" });
+    expect(cfg.defaultEngine).toBe("primary");
+    expect(cfg.defaultEngineExplicit).toBe(true);
+    expect(cfg.ollamaEnabled).toBe(false);
+  });
+
+  test("explicit SOLRAC_DEFAULT_ENGINE=secondary passes without Ollama", () => {
+    const cfg = loadConfig({ ...minimalEnv, SOLRAC_DEFAULT_ENGINE: "secondary" });
+    expect(cfg.defaultEngine).toBe("secondary");
+  });
+
+  test("invalid value throws with the allowed-set hint", () => {
+    expect(() =>
+      loadConfig({ ...minimalEnv, SOLRAC_DEFAULT_ENGINE: "claude" }),
+    ).toThrow(/SOLRAC_DEFAULT_ENGINE must be "ollama", "primary", or "secondary"/);
+  });
+
+  test("default!=ollama with OLLAMA_TOOLS_ENABLED=true is unreachable; throws", () => {
+    expect(() =>
+      loadConfig({
+        ...minimalEnv,
+        SOLRAC_DEFAULT_ENGINE: "primary",
+        OLLAMA_TOOLS_ENABLED: "true",
+        SOLRAC_INTEGRATIONS_ENABLED: "true",
+      }),
+    ).toThrow(/unreachable/);
+  });
+
+  test("default=ollama + tools-on + integrations-on passes", () => {
+    const cfg = loadConfig({
+      ...minimalEnv,
+      OLLAMA_ENABLED: "true",
+      OLLAMA_MODEL: "gemma4:e4b",
+      OLLAMA_TOOLS_ENABLED: "true",
+      SOLRAC_INTEGRATIONS_ENABLED: "true",
+    });
+    expect(cfg.defaultEngine).toBe("ollama");
+    expect(cfg.ollamaToolsEnabled).toBe(true);
+  });
+
+  test("blank SOLRAC_DEFAULT_ENGINE treated as unset (defaults to ollama)", () => {
+    expect(() => loadConfig({ ...minimalEnv, SOLRAC_DEFAULT_ENGINE: "  " })).toThrow(
+      /SOLRAC_DEFAULT_ENGINE=ollama requires OLLAMA_ENABLED=true/,
+    );
+    const cfg = loadConfig({
+      ...minimalEnv,
+      SOLRAC_DEFAULT_ENGINE: "  ",
+      OLLAMA_ENABLED: "true",
+      OLLAMA_MODEL: "gemma4:e4b",
+    });
+    expect(cfg.defaultEngine).toBe("ollama");
+    expect(cfg.defaultEngineExplicit).toBe(false);
   });
 });
 

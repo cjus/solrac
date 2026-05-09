@@ -4,7 +4,7 @@ Getting Solrac running from a fresh clone to a Telegram bot replying on your mac
 
 Total time: ~20 minutes if you don't already have a Telegram bot or Anthropic API key. ~5 minutes if you do.
 
-## 1. Prerequisites
+## 1. Prerequisites: runtime
 
 | Tool | Version | Why |
 |------|---------|-----|
@@ -22,7 +22,63 @@ curl -fsSL https://bun.sh/install | bash
 bun --version   # should be ≥1.3.0
 ```
 
-### Install dependencies
+## 2. Prerequisites: Ollama daemon + model (recommended)
+
+**PR-B inversion**: the recommended Solrac config sets `SOLRAC_DEFAULT_ENGINE=ollama`, which makes a local [Ollama](https://ollama.com) daemon a hard boot requirement. No-prefix Telegram messages route to Ollama for free; `@`/`!` reach Anthropic Sonnet/Opus.
+
+Don't want Ollama? Skip to **§2-alt** for the Claude-only fallback.
+
+### 2.1 Install Ollama
+
+| Platform | Install |
+|---|---|
+| macOS | `brew install ollama` |
+| Linux | `curl -fsSL https://ollama.com/install.sh \| sh` |
+| Docker | `docker run -d -v ollama:/root/.ollama -p 11434:11434 --name ollama ollama/ollama` |
+
+### 2.2 Start the daemon
+
+`brew install` typically auto-starts. Otherwise: `ollama serve &` (or `systemctl start ollama` on Linux). Default URL: `http://localhost:11434`.
+
+### 2.3 Pull a tools-capable model
+
+**Recommended: `gemma4:e4b`** — native function-calling, ~9.6GB on disk, 128K context. Matches the operator's reference config.
+
+```sh
+ollama pull gemma4:e4b
+```
+
+Alternatives: `gemma4` (varies), `qwen2.5:7b` (~4.7GB), `llama3.2:3b` (~2.0GB). Hardware notes:
+
+| Model | Disk | Min RAM | Tools |
+|---|---|---|---|
+| `gemma4:e2b` | 7.2GB | 8GB | yes |
+| `gemma4:e4b` | 9.6GB | 16GB | yes (recommended) |
+| `qwen2.5:7b` | 4.7GB | 8GB | yes |
+| `llama3.2:3b` | 2.0GB | 6GB | yes |
+
+### 2.4 Verify
+
+```sh
+ollama list                                    # should show your pulled model
+curl -s http://localhost:11434/api/tags | jq   # daemon HTTP probe
+```
+
+If both succeed, Ollama is ready.
+
+## 2-alt. Claude-only deploy (skip if you completed §2)
+
+If you can't run Ollama (no GPU/RAM, or air-gapped from local model hosting), pin Claude as the default engine. Add this to your `.env` later:
+
+```sh
+SOLRAC_DEFAULT_ENGINE=primary    # no-prefix → Anthropic Sonnet
+OLLAMA_ENABLED=false
+OLLAMA_TOOLS_ENABLED=false
+```
+
+You'll lose the free default-Ollama path; every no-prefix message is an Anthropic call. `@` and `!` work as documented. The rest of this guide still applies.
+
+## 3. Install Solrac
 
 ```sh
 git clone https://github.com/cjus/solrac.git
@@ -30,7 +86,7 @@ cd solrac
 npm install
 ```
 
-## 2. Create a Telegram bot
+## 4. Create a Telegram bot
 
 Solrac expects a dedicated bot token. Don't reuse a personal-account bot — Telegram limits per-bot rate; sharing creates contention.
 
@@ -48,14 +104,14 @@ Recommended bot settings (set via BotFather → `/mybots` → your bot → "Bot 
 
 For production, mint a separate bot (`@solrac_prod_bot`) with the same procedure. Switching is an env flip; no code changes.
 
-## 3. Find your Telegram `from.id`
+## 5. Find your Telegram `from.id`
 
 The allowlist gates on user id, not chat id (so group forwards still resolve to the actual sender). To find yours:
 
 1. DM [@userinfobot](https://t.me/userinfobot).
 2. It replies with your `Id`. That number is your `from.id`. **This is `ALLOWLIST_BOOTSTRAP`** (or one entry of a comma-separated list).
 
-## 4. Mint an Anthropic API key
+## 6. Mint an Anthropic API key
 
 Use a **scoped** key — not your account-level key. If a tool call leaks env (it shouldn't, but defense-in-depth), revoking a scoped key can't break unrelated services.
 
@@ -65,7 +121,7 @@ Use a **scoped** key — not your account-level key. If a tool call leaks env (i
 
 Solrac authenticates via `ANTHROPIC_API_KEY` only. Bedrock and Vertex auth are explicit anti-goals in v1 (see [ARCHITECTURE.md](./ARCHITECTURE.md#anti-goals)).
 
-## 5. Write your `.env`
+## 7. Write your `.env`
 
 Copy the template:
 
@@ -76,16 +132,26 @@ cp .env.example .env
 Open `.env` and fill in the three required values:
 
 ```sh
-ANTHROPIC_API_KEY=sk-ant-…             # from step 4
-TELEGRAM_BOT_TOKEN=8123456789:AA…      # from step 2
-ALLOWLIST_BOOTSTRAP=123456789           # from step 3 (your from.id)
+ANTHROPIC_API_KEY=sk-ant-…             # from §6
+TELEGRAM_BOT_TOKEN=8123456789:AA…      # from §4
+ALLOWLIST_BOOTSTRAP=123456789           # from §5 (your from.id)
 ```
 
-Defaults are fine for local dev. Full reference: [CONFIG.md](./CONFIG.md).
+The template ships with the recommended PR-B defaults pre-set:
+
+```sh
+SOLRAC_DEFAULT_ENGINE=ollama
+OLLAMA_ENABLED=true
+OLLAMA_MODEL=gemma4:e4b
+OLLAMA_TOOLS_ENABLED=true
+SOLRAC_INTEGRATIONS_ENABLED=true
+```
+
+If you went with §2-alt (Claude-only deploy), edit those lines per the snippet there. Full reference: [CONFIG.md](./CONFIG.md).
 
 `.gitignore` excludes `.env`. Don't commit it.
 
-## 6. First boot
+## 8. First boot
 
 From the repo root:
 
@@ -116,7 +182,7 @@ curl http://localhost:8443/health
 # → {"ok":true,"uptime":3.421}
 ```
 
-## 7. Smoke-test on Telegram
+## 9. Smoke-test on Telegram
 
 Open a DM with your bot in Telegram and send any message — e.g. `what time is it?`.
 
@@ -128,7 +194,7 @@ Expected behavior:
 
 If a tool call requires confirmation (e.g. `git status` is auto-allowed; `Write file.txt` triggers a prompt), an inline keyboard appears with `✅ Allow` / `❌ Deny`. See [USAGE.md](./USAGE.md#permission-ux) for the full picture.
 
-## 8. Verify the audit trail
+## 10. Verify the audit trail
 
 Quick check: every turn writes a row to the `audit` table.
 
@@ -139,7 +205,7 @@ sqlite3 data/solrac.sqlite \
 
 For deeper queries, see [OPERATIONS.md](./OPERATIONS.md#audit-queries).
 
-## 9. (Optional) Enable `/stats`
+## 11. (Optional) Enable `/stats`
 
 To enable the `/stats` endpoint, set:
 
@@ -155,33 +221,22 @@ curl -H "Authorization: Bearer $STATS_BEARER_TOKEN" http://localhost:8443/stats
 
 You'll get RSS, uptime, in-flight turn counts, and 24h spend.
 
-## 10. (Optional) Enable local-Ollama routing
+## 12. (Optional) Tune the Ollama path
 
-Solrac can route Telegram messages prefixed with `>` to a local [Ollama](https://ollama.com) instance instead of Claude. Useful for cheap/offline chat and prompts you want to keep on the box. The feature is off by default; turning it on is two env-var flips.
+The PR-B default already enables Ollama (§2 + §7). Knobs that may matter for non-standard deploys:
 
-1. Install Ollama on the host: `brew install ollama` (macOS) or `curl -fsSL https://ollama.com/install.sh | sh` (Linux).
-2. Start the daemon (typically auto-started; otherwise `ollama serve &`).
-3. Pull a model: `ollama pull llama3.2` (or `qwen2.5`, `gemma4:e4b`, etc.).
-4. Add to `.env`:
+| Env | Default | When to override |
+|---|---|---|
+| `OLLAMA_URL` | `http://localhost:11434` | Daemon on a remote host or non-standard port. |
+| `OLLAMA_TIMEOUT_MS` | `60000` (`120000` when tools-on) | Slower hardware needs more headroom for multi-round tool loops. |
+| `OLLAMA_HISTORY_LIMIT` | `6` | Smaller context windows on 3B models; or `1` to bypass history pollution after flipping `OLLAMA_TOOLS_ENABLED` on an existing chat. |
+| `OLLAMA_MAX_TOOL_ITERATIONS` | `8` | Lower if a model loops; raise only with caution. |
 
-   ```sh
-   OLLAMA_ENABLED=true
-   OLLAMA_MODEL=llama3.2          # exact name from `ollama list`
-   # OLLAMA_URL=http://localhost:11434   # default, override only if non-standard
-   # OLLAMA_TIMEOUT_MS=60000             # streaming-fetch abort threshold
-   # OLLAMA_HISTORY_LIMIT=6              # last N chat turns reconstructed as context
-   ```
+Cross-engine context flows in **both** directions: Claude follow-ups see prior local-model exchanges (auto-injected as out-of-band context), and Ollama follow-ups see prior Claude responses. The user's mental model is "single chat thread."
 
-5. Restart Solrac. The boot log will show `"ollamaEnabled":true,"ollamaModel":"llama3.2",...`.
-6. From Telegram: send `> what is 2+2?`. The bot replies with a 🦙 stub, streams the answer, and finalizes with `<i>✅ ollama:llama3.2 · 1.2s</i>`.
+For the live-smoke harness against your local Ollama: `npm run smoke:ollama`. Set `OLLAMA_TOOLS_ENABLED=true` to also exercise the tool-loop path.
 
-Cross-engine context flows in **both** directions: Claude follow-ups see prior `>` exchanges (auto-injected as out-of-band context), and Ollama follow-ups see prior Claude responses. The user's mental model is "single chat thread."
-
-If you don't have Ollama or don't enable the flag, `>`-prefixed messages get a one-line "ollama disabled in this deployment" reply.
-
-For the full env reference and constraints, see [CONFIG.md](./CONFIG.md). For the live-smoke harness against your local Ollama, run `npm run smoke:ollama`.
-
-## 11. (Optional) Enable the browser web UI
+## 13. (Optional) Enable the browser web UI
 
 Solrac can run a second `Bun.serve` instance that hosts a minimal vanilla-JS chat interface alongside the Telegram bot. Same agent loop, same slash commands, same engine routing, same audit log — different transport. Useful when Telegram is unavailable, on a desk monitor, or for richer markdown rendering than Telegram's HTML mode supports.
 
@@ -215,7 +270,7 @@ Solrac can run a second `Bun.serve` instance that hosts a minimal vanilla-JS cha
 
 For the full env reference, see [CONFIG.md](./CONFIG.md#variables); for the architecture and security posture see [ARCHITECTURE.md#web-ui-transport-optional](./ARCHITECTURE.md#web-ui-transport-optional); for daily-use feature parity with Telegram see [USAGE.md#web-ui-browser-interface](./USAGE.md#web-ui-browser-interface).
 
-## 12. (Optional) Production deploy
+## 14. (Optional) Production deploy
 
 For systemd-managed deploys see [OPERATIONS.md](./OPERATIONS.md#systemd-deploy). The rough shape:
 

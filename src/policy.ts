@@ -147,40 +147,45 @@ export function gateUpdate(
   return { kind: "ok", fromId, chatId };
 }
 
-// PLAN Step 12: tier-aware prefix routing.
+// PR-B: tier-aware prefix routing with inverted default.
 // Engines:
-//   primary   = default Claude tier (cheap path; SOLRAC_PRIMARY_MODEL).
-//               Triggered by `@` OR no prefix at all.
-//   secondary = heavyweight Claude tier (SOLRAC_SECONDARY_MODEL).
+//   primary   = default Claude tier (SOLRAC_PRIMARY_MODEL, currently Sonnet).
+//               Triggered by `@` only (no longer the no-prefix default).
+//   secondary = heavyweight Claude tier (SOLRAC_SECONDARY_MODEL, currently Opus).
 //               Triggered by `!` (think "important / escalate").
-//   ollama    = local-model routing (Step 11; OLLAMA_MODEL).
-//               Triggered by `>`.
+//   ollama    = local-model routing (OLLAMA_MODEL).
+//               Reached only when SOLRAC_DEFAULT_ENGINE=ollama (the new default).
 //
-// The parser strips one leading `!`/`@`/`>` plus one optional space. Leading
+// The `>` prefix was removed in PR-B — a leading `>` is now literal user
+// text routed to whichever engine is the operator's default. With Ollama as
+// the default and only-non-Claude engine, `>` would be redundant.
+//
+// The parser strips one leading `!`/`@` plus one optional space. Leading
 // whitespace before the prefix is tolerated so mobile autocorrect doesn't
 // silently misroute. `explicit: false` is reserved for the no-prefix path so
 // `main.ts` can decide whether an empty payload should render a usage hint
 // (only for explicit prefixes) or be ignored.
 //
-//   "hello"        → { engine: "primary",   explicit: false, prompt: "hello" }
+// With `defaultEngine="ollama"`:
+//   "hello"        → { engine: "ollama",    explicit: false, prompt: "hello" }
 //   "@hello"       → { engine: "primary",   explicit: true,  prompt: "hello" }
 //   "@ hello"      → { engine: "primary",   explicit: true,  prompt: "hello" }
 //   "!hello"       → { engine: "secondary", explicit: true,  prompt: "hello" }
 //   "! hello"      → { engine: "secondary", explicit: true,  prompt: "hello" }
-//   "> hello"      → { engine: "ollama",    explicit: true,  prompt: "hello" }
+//   ">hello"       → { engine: "ollama",    explicit: false, prompt: ">hello" }
 //   "  ! hello"    → { engine: "secondary", explicit: true,  prompt: "hello" }
 //   "@"            → { engine: "primary",   explicit: true,  prompt: "" }
 //   "!"            → { engine: "secondary", explicit: true,  prompt: "" }
-//   ">"            → { engine: "ollama",    explicit: true,  prompt: "" }
 //   "@@literal"    → { engine: "primary",   explicit: true,  prompt: "@literal" }
 //   "!!literal"    → { engine: "secondary", explicit: true,  prompt: "!literal" }
-//   ">>literal"    → { engine: "ollama",    explicit: true,  prompt: ">literal" }
 //   "@!mixed"      → { engine: "primary",   explicit: true,  prompt: "!mixed" }
-//   ""             → { engine: "primary",   explicit: false, prompt: "" }
+//   ""             → { engine: "ollama",    explicit: false, prompt: "" }
+//
+// With `defaultEngine="primary"` (Claude-only deploys), the no-prefix branch
+// returns `{ engine: "primary", … }` instead.
 //
 // No-prefix `prompt` is returned untrimmed so the caller observes the user's
-// exact text (matches today's runAgent path that passes `msg.text` straight
-// through). Explicit-prefix `prompt` is `.trim()`'d on the residue because
+// exact text. Explicit-prefix `prompt` is `.trim()`'d on the residue because
 // the prefix character is structural punctuation — surrounding whitespace is
 // not the user's intent.
 export type Engine = "primary" | "secondary" | "ollama";
@@ -191,16 +196,15 @@ export interface EnginePrefixResult {
   prompt: string;
 }
 
-export function parseEnginePrefix(text: string): EnginePrefixResult {
+export function parseEnginePrefix(text: string, defaultEngine: Engine): EnginePrefixResult {
   let i = 0;
   while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
   const c = text[i];
   let engine: Engine | null = null;
   if (c === "@") engine = "primary";
   else if (c === "!") engine = "secondary";
-  else if (c === ">") engine = "ollama";
   if (engine === null) {
-    return { engine: "primary", explicit: false, prompt: text };
+    return { engine: defaultEngine, explicit: false, prompt: text };
   }
   i++;
   if (text[i] === " ") i++;

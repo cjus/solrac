@@ -21,7 +21,7 @@ For day-to-day operations, see [OPERATIONS.md](./OPERATIONS.md).
 - [Network drops during long-poll](#network-drops)
 - [Cost report never arrives](#cost-report-missing)
 - [Bot replies stale / out of date](#stale-replies)
-- [Ollama errors (`>` prefix path)](#ollama-errors)
+- [Ollama errors (default engine path post PR-B)](#ollama-errors)
 - [Web UI not reachable / login won't take](#web-ui-issues)
 - [Web UI streaming silent / messages don't appear](#web-ui-stream-silent)
 
@@ -701,17 +701,18 @@ Send the next message. It'll start a fresh SDK session.
 
 <a id="ollama-errors"></a>
 
-## Ollama errors (`>` prefix path)
+## Ollama errors (default engine path post PR-B)
 
 ### Symptoms
 
-User sends a `>`-prefixed message and gets one of:
+User sends a no-prefix message (which routes to Ollama under the PR-B default `SOLRAC_DEFAULT_ENGINE=ollama`) and gets one of:
 
 - `❌ ollama unreachable: http://localhost:11434`
 - `❌ ollama model not found: <model> — pull with \`ollama pull <model>\` on the host`
-- `❌ ollama timed out after 60s`
+- `❌ ollama timed out after 60s` (or `120s` when `OLLAMA_TOOLS_ENABLED=true`)
 - `❌ ollama error: <status> <body>`
-- `ollama disabled in this deployment` (one-line plain text, no ❌)
+- `⚠️ stopped after N tool iterations` (tool-loop didn't converge)
+- `ollama disabled in this deployment` (defensive — boot validation should have rejected this; investigate)
 
 ### Diagnosis
 
@@ -723,7 +724,7 @@ Each render maps to a distinct cause:
 | **model not found** | Model name in `OLLAMA_MODEL` isn't in `ollama list` | `ollama pull <model>` on the host. Verify with `ollama list` — the name must match exactly, including any tag (`gemma4:e4b` not `gemma4`). |
 | **timed out** | The model took longer than `OLLAMA_TIMEOUT_MS` (default 60s) to finish streaming | Bump `OLLAMA_TIMEOUT_MS` for slow models / cold-start hardware, or pick a smaller model. Stream timing scales with parameter count and quantization. |
 | **error: 5xx** | Ollama crashed or ran out of memory mid-request | Check `ollama serve` stderr / system log. Common cause: GPU OOM (a 31B model on a 24GB GPU). Restart Ollama; downsize model. |
-| **disabled in this deployment** | `OLLAMA_ENABLED=false` (default) — operator hasn't opted in | Set `OLLAMA_ENABLED=true` and `OLLAMA_MODEL=<name>` in `.env`, restart. See [SETUP.md#10-optional-enable-local-ollama-routing](./SETUP.md). |
+| **disabled in this deployment** | Defensive ack — should be unreachable since boot validation throws on `defaultEngine=ollama && !ollamaEnabled`. If you're seeing this, the boot threw a config error and the instance came up in a degraded state, OR you set `defaultEngine=primary/secondary` and somehow the parser still resolved to ollama (file a bug). | Set `OLLAMA_ENABLED=true` and `OLLAMA_MODEL=<name>` in `.env`, restart. See [SETUP.md#2-prerequisites-ollama-daemon--model-recommended](./SETUP.md). |
 
 The audit row also captures these:
 
@@ -734,7 +735,7 @@ sqlite3 data/solrac.sqlite \
 
 ### Recovery
 
-For most failures, the fix is one of: start Ollama, pull the model, bump timeout, or restart Ollama. None require a Solrac restart — the next `>` message picks up the new state. Solrac re-queries `OLLAMA_URL` on each turn.
+For most failures, the fix is one of: start Ollama, pull the model, bump timeout, or restart Ollama. None require a Solrac restart — the next message picks up the new state. Solrac re-queries `OLLAMA_URL` on each turn.
 
 If `OLLAMA_MODEL` itself is wrong (typo, deprecated name), you DO need a Solrac restart — `OLLAMA_MODEL` is read at boot. Edit `.env`, restart with `systemctl restart solrac.service` or kill the dev `pnpm dev` process.
 

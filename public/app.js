@@ -34,7 +34,12 @@ const els = {
 
 // Track DOM nodes by message_id so streaming edits can replace them in place.
 const messageNodes = new Map();
-let activeEngine = ""; // "" = primary
+// activeEngine carries the wire prefix the user picked: "" (server default —
+// resolved from SOLRAC_DEFAULT_ENGINE), "@" (primary Claude), or "!"
+// (secondary Claude). The actual engine identity for the default pill is
+// whatever the server resolves no-prefix to; the title attr in index.html is
+// server-injected so the operator sees the right label.
+let activeEngine = "";
 let stream = null;
 let firstTab = true;
 

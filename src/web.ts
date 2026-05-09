@@ -43,6 +43,13 @@ export interface WebServerDeps {
   webChatId: number;
   webClient: WebClient;
   /**
+   * Server-resolved label for the default-engine pill in the UI ("ollama" |
+   * "primary Claude (Sonnet)" | "secondary Claude (Opus)"). Substituted into
+   * `index.html` at serve time so the user sees what no-prefix actually does
+   * on this deploy without a `/config` round-trip.
+   */
+  defaultEngineLabel: string;
+  /**
    * Called when a user message arrives. main.ts wires this to construct a
    * synthetic `Update` and call `enqueue` on the existing turn queue.
    */
@@ -228,7 +235,9 @@ export function startWebServer(deps: WebServerDeps): WebServerHandle {
   async function rootHandler(req: Request): Promise<Response> {
     const file = Bun.file(`${deps.rootDir}/public/index.html`);
     if (!(await file.exists())) return new Response("ui missing", { status: 500 });
-    return new Response(file, { headers: { "content-type": "text/html; charset=utf-8" } });
+    const raw = await file.text();
+    const html = renderIndexHtml(raw, deps.defaultEngineLabel);
+    return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
   }
 
   const server = Bun.serve({
@@ -315,6 +324,25 @@ async function fetchSanitizeJs(rootDir: string): Promise<string> {
   const transpiler = new Bun.Transpiler({ loader: "ts", target: "browser" });
   cachedSanitizeJs = transpiler.transformSync(text);
   return cachedSanitizeJs;
+}
+
+/**
+ * Substitute the `{{DEFAULT_ENGINE_LABEL}}` placeholder in `index.html` with
+ * the operator-resolved label. HTML-escapes the label first so a future
+ * config value (or operator-controlled string) can't break out of the title
+ * attr context. Exported for `web.test.ts`.
+ */
+export function renderIndexHtml(raw: string, defaultEngineLabel: string): string {
+  return raw.replaceAll("{{DEFAULT_ENGINE_LABEL}}", htmlEscapeAttr(defaultEngineLabel));
+}
+
+function htmlEscapeAttr(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 export function formatSseEvent(event: WebBusEvent): string {

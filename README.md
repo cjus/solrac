@@ -14,6 +14,13 @@ Solrac fits if **all** of the following are true:
 
 If you'd rather use Claude Code's official Telegram plugin, that's a perfectly good choice — it's actively maintained and zero-setup. Solrac exists because we wanted custom permission rules, per-chat budget caps, an audit log we control, and a foundation extensible to email/Slack/scheduled jobs.
 
+**Operational dependencies:**
+
+- Bun ≥1.3.0 (runtime).
+- A Telegram bot token + your `from.id`.
+- An Anthropic API key (`@`/`!` paths).
+- A local **Ollama daemon + tools-capable model** for the recommended PR-B default config (no-prefix routes to local). For Claude-only deploys, set `SOLRAC_DEFAULT_ENGINE=primary` instead.
+
 ## Features
 
 - **Customizable persona via `SOUL.md` + `SOLRAC.md`** — two operator-editable markdown files at the launch directory. `SOUL.md` (voice, stance, safety) ships with the package and is read once at boot. `SOLRAC.md` (operator overlay: who runs it, channel posture, project context) is re-read every turn so live edits land on the next message without a restart. See [docs/USAGE.md#customizing-solrac-soulmd-and-solracmd](./docs/USAGE.md#customizing-solrac-soulmd-and-solracmd).
@@ -24,8 +31,9 @@ If you'd rather use Claude Code's official Telegram plugin, that's a perfectly g
 - **Per-chat hourly cost cap** — sliding 60-minute window over the audit log. Default $1.00/chat/hour.
 - **Loop detector** — denies the third call to the same `(toolName, input)` within a turn. Order-insensitive over JSON keys.
 - **Persistent audit trail** — every turn (allowed, denied, queue-full) writes a SQLite row with prompt, response, tool calls, cost, tokens, session id, status, **and engine** (`claude:primary:<modelId>` / `claude:secondary:<modelId>` / `ollama:<name>`).
-- **Dual-Claude tier routing** — message prefix picks the model: no prefix or `@` → primary tier (`SOLRAC_PRIMARY_MODEL`, default `claude-sonnet-4-6` — cheap default), `!` → secondary tier (`SOLRAC_SECONDARY_MODEL`, default `claude-opus-4-7` — heavyweight, "escalate"). Each tier keeps its own SDK session id so prompt caching survives same-tier turns; cross-tier context bridge means the other tier's recent turns get prepended as out-of-band context. Per-tier thinking-stub emoji (🙂 primary / 🤔 secondary) makes the routing visible in chat.
-- **Local-Ollama escape hatch** — messages prefixed with `>` route to a local Ollama instance instead of Claude. Free, offline-capable, pure inference (no tools). Cross-engine context bridge means the conversation thread flows in every direction: each Claude tier sees prior `>` exchanges and the other tier's turns; Ollama sees both Claude tiers' responses.
+- **PR-B inverted default** — *Claude only when explicitly requested.* No-prefix routes to local Ollama (free) by default; `@` escalates to Sonnet, `!` escalates to Opus. Pinable via `SOLRAC_DEFAULT_ENGINE` for Claude-only deploys. Boot validation rejects unreachable combinations.
+- **Local Ollama with tool support** — when `OLLAMA_TOOLS_ENABLED=true`, the local model (e.g. `gemma4:e4b`) calls the same `mcp__solrac__*` integrations the Claude tiers see. Multi-round tool loop with shared loop detector, broker UX, and iteration cap (`OLLAMA_MAX_TOOL_ITERATIONS=8`). Cross-engine context bridge means switching between local and Claude preserves the conversation thread.
+- **Dual-Claude tier routing** — `@` → primary tier (Sonnet by default), `!` → secondary tier (Opus by default). Each tier keeps its own SDK session id so prompt caching survives same-tier turns. Per-tier thinking-stub emoji (🙂 primary / 🤔 secondary) makes the routing visible in chat.
 - **Optional browser web UI** — a second `Bun.serve` instance on a configurable port serves a minimal vanilla-JS chat interface with the same agent loop, slash commands, engine routing, and tool-confirm UX as Telegram. Full markdown rendering (headers, lists, tables, fenced code) on both transports — Claude/Ollama responses get a server-side markdown→HTML pass for Telegram and the raw markdown to the browser. Off by default; enable with `SOLRAC_WEB_ENABLED=true` plus a token. See [docs/USAGE.md#web-ui-browser-interface](./docs/USAGE.md#web-ui-browser-interface).
 - **Session resume across restarts** — SDK session ids persisted per chat **and per tier**; conversations survive process death.
 - **Inline-keyboard confirm UX** — 60-second timeout, fail-closed on send failure, verdict stamped into chat history after tap.
@@ -54,15 +62,15 @@ Then DM your bot. You should see a 🤔 stub within a second.
 
 If you don't have Bun, a Telegram bot, or an Anthropic API key — see [docs/SETUP.md](./docs/SETUP.md). Total walkthrough: ~20 minutes.
 
-**Engine routing — at a glance.** First non-whitespace char of your message picks the engine:
+**Engine routing — at a glance** (with the PR-B default `SOLRAC_DEFAULT_ENGINE=ollama`):
 
 | Prefix | Engine | Model env | Default |
 |--------|--------|-----------|---------|
-| (none) or `@` | Primary Claude | `SOLRAC_PRIMARY_MODEL` | `claude-sonnet-4-6` |
-| `!` | Secondary Claude (escalate) | `SOLRAC_SECONDARY_MODEL` | `claude-opus-4-7` |
-| `>` | Local Ollama | `OLLAMA_MODEL` | (unset; opt-in) |
+| (none) | Local Ollama (default) | `OLLAMA_MODEL` | `gemma4:e4b` (recommended) |
+| `@` | Primary Claude — escalate | `SOLRAC_PRIMARY_MODEL` | `claude-sonnet-4-6` |
+| `!` | Secondary Claude — heaviest | `SOLRAC_SECONDARY_MODEL` | `claude-opus-4-7` |
 
-**Optional — local-Ollama routing.** Set `OLLAMA_ENABLED=true` and `OLLAMA_MODEL=<pulled-model>` in `.env` (e.g. `gemma4:e4b`, `llama3.2`, `qwen2.5`); Solrac then routes any message starting with `>` to your local Ollama at `OLLAMA_URL` (default `http://localhost:11434`) instead of Claude. See [docs/USAGE.md#routing-to-local-ollama--prefix](./docs/USAGE.md#routing-to-local-ollama--prefix) and [docs/ARCHITECTURE.md#engine-routing](./docs/ARCHITECTURE.md#engine-routing).
+The `>` prefix was removed in PR-B; a leading `>` is now literal user text routed via the default engine. For Claude-only deploys, set `SOLRAC_DEFAULT_ENGINE=primary` (no-prefix → Sonnet) and `OLLAMA_ENABLED=false`. See [docs/USAGE.md#engine-routing-prefix-table](./docs/USAGE.md#engine-routing-prefix-table) and [docs/ARCHITECTURE.md#engine-routing](./docs/ARCHITECTURE.md#engine-routing).
 
 **Optional — browser web UI.** Set `SOLRAC_WEB_ENABLED=true` and `SOLRAC_WEB_TOKEN=$(openssl rand -hex 32)` in `.env`; browse to `http://127.0.0.1:8080` for a chat interface with full markdown rendering. Bind `SOLRAC_WEB_HOST=0.0.0.0` to expose it on a LAN/Tailnet (token gates access). See [docs/USAGE.md#web-ui-browser-interface](./docs/USAGE.md#web-ui-browser-interface) and [docs/ARCHITECTURE.md#web-ui-transport-optional](./docs/ARCHITECTURE.md#web-ui-transport-optional).
 
