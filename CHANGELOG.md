@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — Notion query truncation defenses
+
+Live `/clear ollama` verification under gemma4:e4b surfaced a tool-result overflow: a "list my in-progress tickets" query against the PNX projects database returned 7 rows but the 7th rendered with `(null)` for every property except title because `notion_query_database`'s JSON payload exceeded the 8 KB `TOOL_RESULT_MAX_LEN` cap and got cut mid-object. The model honestly narrated the gap; the cap had been chosen in the abstract before any integration emitted real volume, and the most useful Notion read overflowed on a single call. See `solrac-dev/PLAN-B.md` §1.
+
+- **`TOOL_RESULT_MAX_LEN`: 8192 → 16384** (`src/ollama-tools.ts`). 16 KB ≈ 4k tokens — comfortable headroom for mid-size structured responses while still keeping multi-iteration tool-loop budgets bounded. Bumping was strictly preferable to per-tool caps for the volume we observed; if a future tool genuinely needs to stay smaller, that's a localized override, not a global tuning.
+- **Length-aware truncation marker.** The trailing `…` becomes `…[truncated: <shown>/<total> bytes shown]` so the model can paginate or narrow the query rather than guessing how much was lost. Final string length still equals `TOOL_RESULT_MAX_LEN` exactly (head is sized to fit), so callers relying on the length invariant are unaffected.
+- **`notion_query_database` page_size default: 25 → 10** (`src/integrations-builtin/notion/index.ts`). Localized via a new `QUERY_DATABASE_DEFAULT_PAGE_SIZE` constant — the shared `DEFAULT_PAGE_SIZE = 25` stays put for `notion_search`, `notion_list_databases`, `notion_list_users` (slim summaries that don't truncate). Per-row property serialization in `query_database` is heavier than the other read tools and was the actual overflow source. Tool's `page_size` describe text updated so the model knows it can opt up to 25/100 when rows are slim.
+- **Tests.** Updated `src/ollama-tools.test.ts` truncation test to assert the structured `shown/total` marker and length invariant. Added two `src/integrations-builtin/notion/index.test.ts` tests asserting the new query_database default (10) and that caller-provided `page_size` still wins.
+
+No anti-goal reversal. No SDK pin bump. PLAN-B §2 (web-UI bold-markdown artifacts) deferred pending DevTools verification.
+
 ## Unreleased — `/clear ollama` (per-chat Ollama context cutoff)
 
 Closes a long-standing UX hole: `/clear` previously did nothing for Ollama. The dispatcher only touched `sessions` (Claude SDK session ids + summaries), but Ollama's per-turn history is reconstructed from `audit` via `db.recentChatTurns` — so the operator-visible "🧹 Cleared … session state. Next turn starts fresh." reply was a lie for the `>` prefix. Symptom in the wild: a chain of failed Notion lookups under gemma4:e4b kept poisoning subsequent Ollama turns even after `/clear`, eventually causing the model to skip tool calls entirely and fabricate a "persistent API client error" narrative.

@@ -62,6 +62,10 @@ type ToolResult = { content: Array<{ type: "text"; text: string }> };
 
 const PROBE_TIMEOUT_MS = 3000;
 const DEFAULT_PAGE_SIZE = 25;
+// notion_query_database returns full per-property serialization per row, which
+// overflows TOOL_RESULT_MAX_LEN on mid-size DBs. Default smaller; the model
+// can opt up via `page_size: 25` when it knows the rows are slim.
+const QUERY_DATABASE_DEFAULT_PAGE_SIZE = 10;
 
 function jsonResult(payload: unknown): ToolResult {
   return {
@@ -485,7 +489,18 @@ export default async function setup(
             "Array of sort descriptors per Notion spec, e.g. " +
               '[{"property":"Priority","direction":"descending"}].',
           ),
-        page_size: ctx.z.number().min(1).max(100).optional(),
+        page_size: ctx.z
+          .number()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe(
+            "Default 10 (lower than the 25 used by other notion_* tools " +
+              "because per-row property serialization is heavier here and " +
+              "overflows the tool-result cap on mid-size DBs). Max 100. " +
+              "Opt up when you know the rows are slim or you've already " +
+              "paginated the heavier ones away.",
+          ),
         start_cursor: ctx.z.string().optional(),
       },
       async (args): Promise<ToolResult> => {
@@ -513,7 +528,7 @@ export default async function setup(
           // because the SDK v5 dropped `client.databases.query` in favor of
           // `dataSources.query`. See `client.ts::queryDatabase`.
           const body: Record<string, unknown> = {
-            page_size: args.page_size ?? DEFAULT_PAGE_SIZE,
+            page_size: args.page_size ?? QUERY_DATABASE_DEFAULT_PAGE_SIZE,
           };
           if (filter !== undefined) body.filter = filter;
           if (args.sorts !== undefined) body.sorts = args.sorts;

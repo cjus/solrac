@@ -456,8 +456,9 @@ describe("executeToolCall", () => {
     expect(r.disposition).toBe("error_invalid_args");
   });
 
-  test("content truncated when over the cap, marked truncated:true", async () => {
-    const big = "x".repeat(TOOL_RESULT_MAX_LEN + 100);
+  test("content truncated when over the cap, marked truncated:true with shown/total marker", async () => {
+    const totalLen = TOOL_RESULT_MAX_LEN + 100;
+    const big = "x".repeat(totalLen);
     const def = textTool("big", big);
     const deps = buildDeps([{ def, tier: "auto" }]);
     const r = await executeToolCall(deps, {
@@ -468,7 +469,13 @@ describe("executeToolCall", () => {
     expect(r.disposition).toBe("ok");
     expect(r.truncated).toBe(true);
     expect(r.content.length).toBe(TOOL_RESULT_MAX_LEN);
-    expect(r.content.endsWith("…")).toBe(true);
+    // Marker is length-aware: actionable signal so the model can paginate or
+    // narrow rather than guessing how much was lost.
+    expect(r.content).toMatch(
+      new RegExp(
+        ` …\\[truncated: ${TOOL_RESULT_MAX_LEN}/${totalLen} bytes shown\\]$`,
+      ),
+    );
   });
 
   test("multiple text content blocks are concatenated", async () => {

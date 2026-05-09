@@ -625,6 +625,44 @@ describe("notion_query_database filter coercion", () => {
 });
 
 // ---------------------------------------------------------------------------
+// notion_query_database page_size defaults — the cap-overflow defense.
+// Per-row property serialization is heavy enough that the shared
+// DEFAULT_PAGE_SIZE = 25 overflows TOOL_RESULT_MAX_LEN on mid-size DBs;
+// query_database uses its own smaller default (10).
+// ---------------------------------------------------------------------------
+
+describe("notion_query_database page_size defaults", () => {
+  function capturePageSize(): { observed: { page_size: unknown } } {
+    const observed: { page_size: unknown } = { page_size: null };
+    queryFetchHandler = async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      observed.page_size = body.page_size;
+      return new Response(
+        JSON.stringify({ results: [], has_more: false, next_cursor: null }),
+        { status: 200 },
+      );
+    };
+    return { observed };
+  }
+
+  test("defaults to 10 when caller omits page_size", async () => {
+    const { observed } = capturePageSize();
+    const result = await setup(makeCtx());
+    const tool = findTool(result.tools, "notion_query_database");
+    await callTool(tool, { database_id: "db-1" });
+    expect(observed.page_size).toBe(10);
+  });
+
+  test("honors caller-provided page_size up to 100", async () => {
+    const { observed } = capturePageSize();
+    const result = await setup(makeCtx());
+    const tool = findTool(result.tools, "notion_query_database");
+    await callTool(tool, { database_id: "db-1", page_size: 25 });
+    expect(observed.page_size).toBe(25);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // notion_get_database_schema — emits filter_template per property
 // ---------------------------------------------------------------------------
 
