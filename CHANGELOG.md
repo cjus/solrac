@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — `/clear ollama` (per-chat Ollama context cutoff)
+
+Closes a long-standing UX hole: `/clear` previously did nothing for Ollama. The dispatcher only touched `sessions` (Claude SDK session ids + summaries), but Ollama's per-turn history is reconstructed from `audit` via `db.recentChatTurns` — so the operator-visible "🧹 Cleared … session state. Next turn starts fresh." reply was a lie for the `>` prefix. Symptom in the wild: a chain of failed Notion lookups under gemma4:e4b kept poisoning subsequent Ollama turns even after `/clear`, eventually causing the model to skip tool calls entirely and fabricate a "persistent API client error" narrative.
+
+- **Schema.** New `sessions.ollama_cutoff_ms INTEGER` column (idempotent ALTER, nullable). Per-chat ms timestamp; NULL = never cleared.
+- **`/clear ollama` (alias `/clear >`).** Sets the cutoff to `Date.now()` for the current chat. `/clear all` now iterates `[primary, secondary, ollama]` instead of just the two Claude tiers; the reply text composes the same way (e.g. `Cleared <b>primary</b> + <b>ollama</b>`). Dirty check for the ollama tier asks `db.hasOllamaTurnsSince(chatId, currentCutoff)` so back-to-back `/clear ollama` honestly returns "Already clean."
+- **Decision B (cutoff is source-of-truth).** Both `db.recentChatTurns` (Ollama's history reconstruction, both single-shot and tool-loop variants in `ollama.ts`) AND `db.outOfBandForEngine` (Claude's cross-engine bridge in `agent.ts`) honor the cutoff. So `/clear ollama` truly hides the cleared turns from every engine, not just Ollama itself — otherwise an operator would clear Ollama, then `@ ...` and watch Sonnet recite the freshly-cleared turns out of the bridge.
+- **Audit-log untouched.** Operator queries against `audit` (and the web client's chat view) still see every row. The cutoff filters at read time only; the audit log remains append-only.
+- **`/compact` and `/context` reject `ollama`.** Ollama has no SDK session to summarize or inspect. The parser surfaces `unknown` so the user gets a clear error.
+- **Tests.** 14 new tests across `db.test.ts` (cutoff filtering on both helpers, `hasOllamaTurnsSince` predicate, migration idempotency), `session.test.ts` (cutoff CRUD + UPSERT-on-cold-start), `commands.test.ts` (parser tier tokens, runClear ollama-tier behavior, back-to-back already-clean, `/clear all` includes ollama, `/compact ollama` rejection, `/context ollama` rejection).
+- **Docs.** `docs/USAGE.md` slash-commands subsection updated with the new tier and cutoff semantics; `docs/CONFIG.md` cross-links from `OLLAMA_HISTORY_LIMIT`; `docs/ARCHITECTURE.md` updated.
+
+No anti-goal reversal. No SDK pin bump.
+
 ## Unreleased — `notion` built-in integration
 
 Adds a blessed in-process Notion integration: 10 tools (6 reads `auto`, 4 writes `confirm`), single `NOTION_API_KEY` env var (no OAuth dance), reachable from both Claude tiers (`@`, `!`) and the local Ollama tool loop (`OLLAMA_TOOLS_ENABLED=true`). Patterned after `gmail/` but lighter (no per-account state, no MIME handling).

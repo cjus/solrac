@@ -340,7 +340,17 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
     prevSessionId === null
       ? deps.sessions.getSummary(input.chatId, input.engine)
       : null;
-  const oobTurns = deps.db.outOfBandForEngine(input.chatId, enginePrefix, OUT_OF_BAND_LIMIT);
+  // Decision B for `/clear ollama`: the cutoff hides Ollama turns from
+  // Claude's cross-engine bridge too, not just from Ollama's own history.
+  // Without this, /clear would feel half-broken — the operator would clear
+  // Ollama, then `@ ...` and watch Sonnet recite the freshly-cleared turns.
+  const ollamaCutoff = deps.sessions.getOllamaCutoff(input.chatId) ?? 0;
+  const oobTurns = deps.db.outOfBandForEngine(
+    input.chatId,
+    enginePrefix,
+    OUT_OF_BAND_LIMIT,
+    ollamaCutoff,
+  );
   // PNX-167 (system-prompt externalization). Re-read SOLRAC.md per turn so
   // operator edits take effect on the next message without a restart.
   // Returns null if the file is missing OR carries the unedited-template

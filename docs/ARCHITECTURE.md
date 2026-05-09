@@ -133,7 +133,9 @@ Tracing a single user message through the system:
    ├── parseCommand(msg.text, { botUsername })
    │     ├── kind="ignore"       → group-chat command for another bot; drop
    │     ├── kind="run"          → runCommand(deps, msg, cmd, update_id)
-   │     │     ├── /clear        → sessions.clearAll(); audit (model='system')
+   │     │     ├── /clear        → sessions.clearAll() per Claude tier AND/OR
+   │     │     │                   sessions.setOllamaCutoff() for `ollama` (sets
+   │     │     │                   per-chat ms cutoff); audit (model='system')
    │     │     ├── /compact      → runCompactTurn() → setSummary + clearSessionId
    │     │     ├── /context      → render token breakdown; audit
    │     │     ├── /status       → render snapshot; audit
@@ -148,7 +150,8 @@ Tracing a single user message through the system:
    ├── db.insertAudit (status=in_progress)
    ├── tg.sendMessage("🤔 thinking…")        (the stub)
    ├── read sessions.getSummary(chatId, engine) IFF prevSessionId === null
-   ├── read db.outOfBandForEngine(chatId, prefix, 6)
+   ├── read sessions.getOllamaCutoff(chatId)         (decision B for /clear ollama)
+   ├── read db.outOfBandForEngine(chatId, prefix, 6, ollamaCutoff)
    ├── if summary || OOB → buildAugmentedPrompt(summary, oobTurns, prompt)
    ├── build createPolicyHook (canUseTool)
    ├── build createPreToolUseHook (cost cap + loop)

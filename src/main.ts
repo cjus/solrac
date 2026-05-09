@@ -639,6 +639,7 @@ async function main(): Promise<void> {
         ? {
             tg,
             db,
+            sessions,
             url: config.ollamaUrl,
             model: config.ollamaModel,
             timeoutMs: config.ollamaTimeoutMs,

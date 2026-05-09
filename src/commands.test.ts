@@ -199,6 +199,9 @@ describe("parseCommand", () => {
       ["secondary", "secondary"],
       ["s", "secondary"],
       ["!", "secondary"],
+      ["ollama", "ollama"],
+      ["o", "ollama"],
+      [">", "ollama"],
       ["all", "all"],
       ["*", "all"],
     ] as const) {
@@ -207,6 +210,28 @@ describe("parseCommand", () => {
         cmd: { kind: "clear", tier },
       });
     }
+  });
+
+  test("/compact rejects ollama tier — Ollama has no SDK session to summarize", () => {
+    expect(parseCommand("/compact ollama", DEPS)).toEqual({
+      kind: "run",
+      cmd: { kind: "unknown", raw: "/compact ollama" },
+    });
+    expect(parseCommand("/compact >", DEPS)).toEqual({
+      kind: "run",
+      cmd: { kind: "unknown", raw: "/compact >" },
+    });
+  });
+
+  test("/context rejects ollama tier — Ollama has no SDK session to inspect", () => {
+    expect(parseCommand("/context ollama", DEPS)).toEqual({
+      kind: "run",
+      cmd: { kind: "unknown", raw: "/context ollama" },
+    });
+    expect(parseCommand("/context >", DEPS)).toEqual({
+      kind: "run",
+      cmd: { kind: "unknown", raw: "/context >" },
+    });
   });
 
   test("/clear with unknown tier token surfaces as unknown", () => {
@@ -564,7 +589,74 @@ describe("runCommand /clear", () => {
     expect(h.tg.sent[0]!.text).toContain("Already clean");
     expect(h.sessions.getSessionId(100, "primary")).toBe("p-uuid");
   });
+
+  // --- Ollama tier (cutoff-based clear) ---
+
+  test("/clear ollama on a chat with prior ollama turns sets the cutoff and replies 'Cleared'", async () => {
+    const h = await makeHarness();
+    seedOllamaTurn(h.db, 100, 5000);
+    const before = Date.now();
+    await runCommand(h.deps, fakeMsg("/clear ollama"), { kind: "clear", tier: "ollama" }, 1);
+    expect(h.tg.sent[0]!.text).toContain("Cleared <b>ollama</b>");
+    const cutoff = h.sessions.getOllamaCutoff(100);
+    expect(cutoff).not.toBeNull();
+    expect(cutoff!).toBeGreaterThanOrEqual(before);
+    expect(lastAudit(h.db).response).toBe("cleared:ollama");
+  });
+
+  test("/clear ollama on a chat with no prior ollama turns reports 'Already clean'", async () => {
+    const h = await makeHarness();
+    await runCommand(h.deps, fakeMsg("/clear ollama"), { kind: "clear", tier: "ollama" }, 1);
+    expect(h.tg.sent[0]!.text).toContain("Already clean");
+    expect(h.sessions.getOllamaCutoff(100)).toBeNull();
+  });
+
+  test("back-to-back /clear ollama reports 'Already clean' the second time", async () => {
+    const h = await makeHarness();
+    seedOllamaTurn(h.db, 100, 5000);
+    await runCommand(h.deps, fakeMsg("/clear ollama"), { kind: "clear", tier: "ollama" }, 1);
+    expect(h.tg.sent[0]!.text).toContain("Cleared");
+    await runCommand(h.deps, fakeMsg("/clear ollama"), { kind: "clear", tier: "ollama" }, 2);
+    expect(h.tg.sent[1]!.text).toContain("Already clean");
+  });
+
+  test("/clear all includes ollama when ollama turns exist", async () => {
+    const h = await makeHarness();
+    h.sessions.setSessionId(100, "primary", "p-uuid");
+    seedOllamaTurn(h.db, 100, 5000);
+    await runCommand(h.deps, fakeMsg("/clear"), { kind: "clear", tier: "all" }, 1);
+    expect(h.tg.sent[0]!.text).toContain("primary");
+    expect(h.tg.sent[0]!.text).toContain("ollama");
+    expect(h.sessions.getOllamaCutoff(100)).not.toBeNull();
+    expect(lastAudit(h.db).response).toBe("cleared:primary,ollama");
+  });
 });
+
+// Insert a successful Ollama audit row so /clear ollama can find something to clear.
+function seedOllamaTurn(db: SolracDb, chatId: number, startedAt: number): void {
+  const id = db.insertAudit({
+    chatId,
+    fromId: 200,
+    updateId: 0,
+    prompt: "hi",
+    startedAt,
+    model: "ollama:gemma",
+  });
+  db.updateAuditEnd({
+    id,
+    response: "hello",
+    toolCalls: null,
+    inputTokens: null,
+    outputTokens: null,
+    cacheCreationInputTokens: null,
+    cacheReadInputTokens: null,
+    costUsd: 0,
+    agentSessionId: null,
+    status: "ok",
+    errorMessage: null,
+    endedAt: startedAt + 1,
+  });
+}
 
 // ---------------------------------------------------------------------------
 // /help and unknown

@@ -154,7 +154,7 @@ Slash commands give you control over conversation context and visibility into sp
 
 | Command | Default | Behavior | Cost |
 |---------|---------|----------|------|
-| `/clear [primary\|secondary\|all]` | `all` | Drop SDK session id and any pending compaction summary for the targeted tier(s). Next turn starts fresh. | Free |
+| `/clear [primary\|secondary\|ollama\|all]` | `all` | For Claude tiers: drop the SDK session id and any pending compaction summary. For `ollama`: write a per-chat cutoff timestamp; both Ollama's own history reconstruction AND Claude's cross-engine bridge then hide every prior Ollama turn for this chat. Next turn for the targeted tier(s) starts fresh. | Free |
 | `/compact @\|!` | **none** — tier required | Run a one-shot Claude turn that summarizes this tier's recent conversation, store the summary, drop the SDK session id. The summary is prepended into a fresh SDK session on the next user turn for that tier. **Bare `/compact` rejects** — Ollama has no SDK session to summarize. | One Claude turn (Sonnet ≈ $0.001-0.005, Opus ≈ $0.005-0.025) |
 | `/context @\|!` | **none** — tier required | Show audit-table footprint (bytes), turn count, last turn's token breakdown (fresh / cache read / cache create / output), and estimated next-turn replay size. **Bare `/context` rejects** for the same reason as `/compact`. | Free |
 | `/help` | — | Engine prefix table + command reference. Engine section is dynamic (renders the deploy's actual default). | Free |
@@ -168,18 +168,23 @@ For `/clear` and `/compact` and `/context`, the optional argument selects a tier
 |-------|---------|
 | `primary`, `p`, `@` | primary |
 | `secondary`, `s`, `!` | secondary |
-| `all`, `*` | both (only valid for `/clear`) |
+| `ollama`, `o`, `>` | ollama (only valid for `/clear`) |
+| `all`, `*` | all three (only valid for `/clear`) |
 
 Examples:
 
 ```
-/clear              → drops both tiers (default = all)
-/clear primary      → drops primary only
-/clear !            → drops secondary only (`!` mnemonic from engine prefix)
+/clear              → drops all three (default = all)
+/clear primary      → drops primary Claude session only
+/clear !            → drops secondary Claude session only (`!` mnemonic from engine prefix)
+/clear ollama       → sets Ollama context cutoff for this chat (no SDK session to drop — see below)
+/clear >            → same as /clear ollama (`>` mnemonic from engine prefix)
 /compact            → compacts primary
 /compact !          → compacts secondary
 :context            → same as /context (alternate prefix)
 ```
+
+`/clear ollama` semantics differ from the Claude tiers because Ollama is stateless — there's no SDK session id to drop. Instead, the dispatcher writes `Date.now()` to `sessions.ollama_cutoff_ms` for this chat. Subsequent `recentChatTurns` lookups (Ollama's history reconstruction) and `outOfBandForEngine` lookups (Claude's cross-engine bridge) filter out Ollama rows with `started_at <= cutoff`. The audit log itself is untouched — operator queries against `audit` still show every turn. The cutoff is per-chat and survives restarts. A back-to-back `/clear ollama` with no intervening turn reports "Already clean" (the cutoff is already past every existing row).
 
 ### `/compact` semantics
 
@@ -883,7 +888,7 @@ The token is **required even on `127.0.0.1`** — a co-tenant on a shared host c
 Everything you can do in Telegram works in the web UI through the same code path:
 
 - **Engine routing**: prefix `@` (primary Claude), `!` (secondary Claude), or no prefix (the configured default — Ollama in the standard config). The composer has a pill row matching the available engines: `default → @ → !`. The default-pill label is server-injected so the UI shows `default (ollama)` or `default (primary Claude)` to match the deploy.
-- **Slash commands**: `/help`, `/status`, `/context`, `/clear [primary|secondary|all]`, `/compact`, plus any operator-defined skills.
+- **Slash commands**: `/help`, `/status`, `/context`, `/clear [primary|secondary|ollama|all]`, `/compact`, plus any operator-defined skills.
 - **Tool confirmation**: when Claude wants to run a tier-3 tool (Edit, Write, Bash with non-trivial args), an inline Allow / Deny prompt appears. 60 s timeout — same as Telegram.
 - **Cost caps**: per-chat (web traffic shares one synthetic chat id, default `-1000`) and global. Both apply the same way.
 - **Audit log**: every web turn writes the standard audit row. Query by `chat_id = -1000` to see web-only history.

@@ -281,6 +281,30 @@ describe("openDb migrations", () => {
     expect(auditCols.get("cache_read_input_tokens")!.notnull).toBe(0);
   });
 
+  test("adds sessions.ollama_cutoff_ms on upgrade and is nullable", async () => {
+    const dir = newDir();
+    {
+      const db1 = await openDb(dir);
+      db1.raw.run("ALTER TABLE sessions DROP COLUMN ollama_cutoff_ms");
+      db1.raw.run(`
+        INSERT INTO sessions (chat_id, primary_session_id, created_at, updated_at)
+          VALUES (888, 'p-uuid', 100, 100);
+      `);
+      db1.close();
+    }
+    const db2 = await openDb(dir);
+    dbs.push(db2);
+    const sessionCols = columns(db2.raw, "sessions");
+    expect(sessionCols.has("ollama_cutoff_ms")).toBe(true);
+    expect(sessionCols.get("ollama_cutoff_ms")!.notnull).toBe(0);
+    const row = db2.raw.query("SELECT * FROM sessions WHERE chat_id = 888").get() as {
+      primary_session_id: string;
+      ollama_cutoff_ms: number | null;
+    };
+    expect(row.primary_session_id).toBe("p-uuid");
+    expect(row.ollama_cutoff_ms).toBeNull();
+  });
+
   test("PNX-167 — adds summary columns on a pre-Step-167 schema", async () => {
     // Boot once with the old schema, then again to walk forward. The first
     // boot here creates the modern schema, but verifies idempotency on the
@@ -494,6 +518,54 @@ describe("openDb engine-scoped helpers (PNX-167)", () => {
       cacheReadInputTokens: 8000,
       costUsd: 0.005,
     });
+  });
+
+  test("recentChatTurns honors sinceMs cutoff and treats `0` as no-op", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    seedTurns(db, [
+      { chatId: 1, model: "claude:primary:m", startedAt: 100, response: "old", cost: 0.01, status: "ok" },
+      { chatId: 1, model: "ollama:gemma", startedAt: 200, response: "mid", cost: 0, status: "ok" },
+      { chatId: 1, model: "claude:primary:m", startedAt: 300, response: "new", cost: 0.01, status: "ok" },
+    ]);
+    expect(db.recentChatTurns(1, 10).map((r) => r.response)).toEqual(["old", "mid", "new"]);
+    expect(db.recentChatTurns(1, 10, 0).map((r) => r.response)).toEqual(["old", "mid", "new"]);
+    expect(db.recentChatTurns(1, 10, 200).map((r) => r.response)).toEqual(["new"]);
+    expect(db.recentChatTurns(1, 10, 999)).toHaveLength(0);
+  });
+
+  test("outOfBandForEngine respects ollamaCutoffMs (decision B)", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    seedTurns(db, [
+      { chatId: 1, model: "ollama:gemma", startedAt: 100, response: "ollama-old", cost: 0, status: "ok" },
+      { chatId: 1, model: "ollama:gemma", startedAt: 200, response: "ollama-new", cost: 0, status: "ok" },
+      { chatId: 1, model: "claude:secondary:m", startedAt: 150, response: "opus", cost: 0.02, status: "ok" },
+    ]);
+    const all = db.outOfBandForEngine(1, "claude:primary:%", 10).map((r) => r.response);
+    expect(all).toEqual(["ollama-old", "opus", "ollama-new"]);
+    const filtered = db.outOfBandForEngine(1, "claude:primary:%", 10, 150).map((r) => r.response);
+    expect(filtered).toEqual(["opus", "ollama-new"]);
+    const onlyOpus = db.outOfBandForEngine(1, "claude:primary:%", 10, 999).map((r) => r.response);
+    expect(onlyOpus).toEqual(["opus"]);
+  });
+
+  test("hasOllamaTurnsSince returns true only for ok rows with started_at > sinceMs", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    expect(db.hasOllamaTurnsSince(1, 0)).toBe(false);
+    seedTurns(db, [
+      { chatId: 1, model: "ollama:gemma", startedAt: 100, response: "hi", cost: 0, status: "ok" },
+      { chatId: 1, model: "ollama:gemma", startedAt: 200, response: null, cost: null, status: "error" },
+      { chatId: 2, model: "ollama:gemma", startedAt: 300, response: "hi", cost: 0, status: "ok" },
+      { chatId: 1, model: "claude:primary:m", startedAt: 400, response: "hi", cost: 0.01, status: "ok" },
+    ]);
+    expect(db.hasOllamaTurnsSince(1, 0)).toBe(true);
+    expect(db.hasOllamaTurnsSince(1, 99)).toBe(true);
+    expect(db.hasOllamaTurnsSince(1, 100)).toBe(false);
   });
 
   test("sumChatBytesForEngine totals prompt+response over status='ok' rows", async () => {

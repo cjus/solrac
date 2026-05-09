@@ -86,7 +86,7 @@ import { htmlEscapeText, type BotCommand, type TelegramClient } from "./telegram
 // Types
 // ---------------------------------------------------------------------------
 
-export type TierArg = "primary" | "secondary" | "all";
+export type TierArg = "primary" | "secondary" | "ollama" | "all";
 export type TierArgSingle = "primary" | "secondary";
 
 export type SolracCommand =
@@ -156,6 +156,9 @@ const TIER_ARG_MAP: Record<string, TierArg> = {
   secondary: "secondary",
   s: "secondary",
   "!": "secondary",
+  ollama: "ollama",
+  o: "ollama",
+  ">": "ollama",
   all: "all",
   "*": "all",
 };
@@ -235,7 +238,10 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
       };
     }
     const tierC = TIER_ARG_MAP[argRaw.toLowerCase()];
-    if (tierC === undefined || tierC === "all") {
+    // `/context` and `/compact` are SDK-session affordances; `ollama` and
+    // `all` aren't valid — Ollama has no SDK session, and the dispatcher's
+    // SolracCommand carries a single tier.
+    if (tierC === undefined || tierC === "all" || tierC === "ollama") {
       return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}context ${argRaw}` } };
     }
     return { kind: "run", cmd: { kind: "context", tier: tierC } };
@@ -255,7 +261,7 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
     };
   }
   const tier = TIER_ARG_MAP[argRaw.toLowerCase()];
-  if (tier === undefined || tier === "all") {
+  if (tier === undefined || tier === "all" || tier === "ollama") {
     return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}compact ${argRaw}` } };
   }
   return { kind: "run", cmd: { kind: "compact", tier } };
@@ -364,6 +370,11 @@ function writeSystemAudit(
 // /clear
 // ---------------------------------------------------------------------------
 
+// One label per tier-state we actually clear. Claude tiers are SessionTier;
+// "ollama" lives outside that union (no SDK session). Using a string union
+// keeps the dirty list ordered and self-describing for the reply text.
+type ClearableTier = SessionTier | "ollama";
+
 async function runClear(
   deps: RunCommandDeps,
   msg: Message,
@@ -371,18 +382,24 @@ async function runClear(
   tier: TierArg,
 ): Promise<void> {
   const session = deps.sessions.getSession(msg.chat.id);
-  const tiers: SessionTier[] = tier === "all" ? ["primary", "secondary"] : [tier];
+  const tiers: ClearableTier[] =
+    tier === "all" ? ["primary", "secondary", "ollama"] : [tier];
 
-  // Determine which tiers actually had anything to drop. A tier is "dirty"
-  // when its session id OR its summary is non-null. Used to render the
-  // "already clean" reply rather than pretending we did something.
-  const dirty: SessionTier[] = [];
-  if (session) {
-    for (const t of tiers) {
-      const id = t === "primary" ? session.primarySessionId : session.secondarySessionId;
-      const summary = t === "primary" ? session.primarySummary : session.secondarySummary;
-      if (id !== null || summary !== null) dirty.push(t);
+  // Determine which tiers actually had anything to drop. A Claude tier is
+  // "dirty" when its session id OR its summary is non-null. Ollama is
+  // "dirty" when there's at least one successful audit row past the current
+  // cutoff — set-cutoff-twice is reported honestly as "Already clean".
+  const dirty: ClearableTier[] = [];
+  for (const t of tiers) {
+    if (t === "ollama") {
+      const cutoff = session?.ollamaCutoffMs ?? 0;
+      if (deps.db.hasOllamaTurnsSince(msg.chat.id, cutoff)) dirty.push(t);
+      continue;
     }
+    if (!session) continue;
+    const id = t === "primary" ? session.primarySessionId : session.secondarySessionId;
+    const summary = t === "primary" ? session.primarySummary : session.secondarySummary;
+    if (id !== null || summary !== null) dirty.push(t);
   }
 
   if (dirty.length === 0) {
@@ -393,7 +410,13 @@ async function runClear(
     return;
   }
 
-  for (const t of dirty) deps.sessions.clearAll(msg.chat.id, t);
+  for (const t of dirty) {
+    if (t === "ollama") {
+      deps.sessions.setOllamaCutoff(msg.chat.id, Date.now());
+      continue;
+    }
+    deps.sessions.clearAll(msg.chat.id, t);
+  }
 
   const cleared = dirty.map((t) => `<b>${t}</b>`).join(" + ");
   const reply = `🧹 Cleared ${cleared} session state. Next turn starts fresh.`;
@@ -402,7 +425,7 @@ async function runClear(
 }
 
 function tierLabel(tier: TierArg): string {
-  if (tier === "all") return "primary + secondary";
+  if (tier === "all") return "primary + secondary + ollama";
   return tier;
 }
 
@@ -1020,7 +1043,7 @@ function renderEngineSection(opts: {
 const HELP_COMMANDS_MD = [
   "**Commands** (type `/cmd` for autocomplete, or `:cmd`)",
   "",
-  "- **clear** `[primary|secondary|all]` — drop session state. Default: all.",
+  "- **clear** `[primary|secondary|ollama|all]` — drop session state (Claude tiers) or set the Ollama context cutoff. Default: all.",
   "- **compact** `@|!` — summarize and restart Claude session for that tier. Costs one Claude turn.",
   "- **context** `@|!` — show context-window size in bytes + tokens for that tier.",
   "- **help** — this card.",
