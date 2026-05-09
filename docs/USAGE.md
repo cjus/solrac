@@ -68,9 +68,9 @@ The footer reports turn count and cost in USD.
 
 ## Engine routing (prefix table)
 
-The first non-whitespace character of your message picks the engine. **PR-B
-inverted the default**: Anthropic burn happens only on a deliberate `@` or
-`!`; everything else stays local and free.
+The first non-whitespace character of your message picks the engine. The
+default routes to local Ollama, so Anthropic burn happens only on a
+deliberate `@` or `!`; everything else stays local and free.
 
 | Prefix | Engine | Default model | Use when |
 |--------|--------|---------------|----------|
@@ -87,8 +87,8 @@ what's the capital of france?  → local Ollama (default)
 !hard architectural question   → secondary Opus (heaviest)
 ```
 
-The `>` prefix was **removed in PR-B**. A leading `>` is now literal user
-text routed to the default engine like any other message.
+There is no `>`-style escape prefix. A leading `>` is literal user text
+routed to the default engine like any other message.
 
 **Escalation.** Switch tiers mid-conversation freely. All three engines share
 the same audit-table thread for a chat; the bot prepends the other tier's
@@ -155,10 +155,10 @@ Slash commands give you control over conversation context and visibility into sp
 | Command | Default | Behavior | Cost |
 |---------|---------|----------|------|
 | `/clear [primary\|secondary\|all]` | `all` | Drop SDK session id and any pending compaction summary for the targeted tier(s). Next turn starts fresh. | Free |
-| `/compact @\|!` | **none** (PR-B: explicit) | Run a one-shot Claude turn that summarizes this tier's recent conversation, store the summary, drop the SDK session id. The summary is prepended into a fresh SDK session on the next user turn for that tier. **Bare `/compact` rejects** — Ollama has no SDK session to summarize. | One Claude turn (Sonnet ≈ $0.001-0.005, Opus ≈ $0.005-0.025) |
-| `/context @\|!` | **none** (PR-B: explicit) | Show audit-table footprint (bytes), turn count, last turn's token breakdown (fresh / cache read / cache create / output), and estimated next-turn replay size. **Bare `/context` rejects** for the same reason as `/compact`. | Free |
+| `/compact @\|!` | **none** — tier required | Run a one-shot Claude turn that summarizes this tier's recent conversation, store the summary, drop the SDK session id. The summary is prepended into a fresh SDK session on the next user turn for that tier. **Bare `/compact` rejects** — Ollama has no SDK session to summarize. | One Claude turn (Sonnet ≈ $0.001-0.005, Opus ≈ $0.005-0.025) |
+| `/context @\|!` | **none** — tier required | Show audit-table footprint (bytes), turn count, last turn's token breakdown (fresh / cache read / cache create / output), and estimated next-turn replay size. **Bare `/context` rejects** for the same reason as `/compact`. | Free |
 | `/help` | — | Engine prefix table + command reference. Engine section is dynamic (renders the deploy's actual default). | Free |
-| `/status` | — | Per-chat session/spend snapshot + global rollup + queue depth + uptime. **PR-B**: Claude session lines render only when a session exists; an `ollama turns (24h): N` bullet is added when applicable. | Free |
+| `/status` | — | Per-chat session/spend snapshot + global rollup + queue depth + uptime. Claude session lines render only when a session exists; an `ollama turns (24h): N` bullet is added when applicable. | Free |
 
 ### Tier args
 
@@ -358,7 +358,7 @@ This means skills are best for:
 
 If you need tool use, file an issue — that's a v1.1 conversation.
 
-**Skills always run on Claude.** The `tier:` frontmatter accepts `primary` (default) or `secondary` only. Skills are **not affected by `SOLRAC_DEFAULT_ENGINE`** — even with the inversion default Ollama, a `/<skill>` invocation always hits Claude. If you want a free / local-Ollama-backed shortcut, just type the prompt without a slash so it routes via the default engine.
+**Skills always run on Claude.** The `tier:` frontmatter accepts `primary` (default) or `secondary` only. Skills are **not affected by `SOLRAC_DEFAULT_ENGINE`** — even when the default engine is Ollama, a `/<skill>` invocation always hits Claude. If you want a free / local-Ollama-backed shortcut, just type the prompt without a slash so it routes via the default engine.
 
 ### Cost & caps
 
@@ -402,7 +402,7 @@ EOF
 
 An **integration** is a TypeScript module under `$SOLRAC_INTEGRATIONS_DIR/<name>/index.ts` (or, for shipped reference integrations, `src/integrations-builtin/<name>/index.ts`) that adds new tools to the agent without touching solrac's source. Each module default-exports `setup(ctx)` and returns `{ apiVersion, tools, meta }`. Tools surface to the model as `mcp__solrac__<name>`.
 
-> ⚠️ **Ollama limitation.** Integrations are reachable from the Claude tiers (`@`, `!`) only. The Ollama path (`>`) does NOT consume integrations — the local model is text-completion only in v1, and `OLLAMA_CAPABILITY_NOTE` (`ollama.ts:112`) explicitly tells it "you do not have tools." If a user prefixes a tool-shaped request with `>`, the local model will refuse or hallucinate; that's expected. Route tool work via `@` or `!` instead. Adding tool support to Ollama is tracked as [`ROADMAP.md` OQ#16](./ROADMAP.md#oq16--integrations-on-ollama) — deferred because Ollama tool-call reliability varies sharply by model.
+> **Engine reach.** Integrations are reachable from both Claude tiers (`@`, `!`) and the local Ollama default — the latter when `OLLAMA_TOOLS_ENABLED=true` (precondition: `SOLRAC_INTEGRATIONS_ENABLED=true`). With Ollama tools-on, the local model gets the same `mcp__solrac__*` tool surface; `ollama.ts::buildOllamaCapabilityNote` advertises the loaded tool names so the model knows what it can call. With `OLLAMA_TOOLS_ENABLED=false`, Ollama falls back to single-shot inference and the capability note tells it to redirect tool-shaped requests to `@`/`!`. Reliability still varies by Ollama model — `gemma4:e4b` is the recommended baseline.
 
 ### Shipping model
 
@@ -560,7 +560,7 @@ Use cases the agent answers without flinching:
 - "Convert 2026-04-12T18:30:00Z to JST."
 - "When does our 5pm New York standup happen in Berlin?"
 
-This is also the file to read first when learning to write your own integration — `src/integrations-builtin/time/index.ts` is heavily commented and demonstrates `IntegrationContext`, `meta.tier`, `alwaysLoad`, and multi-tool registration in ~200 lines.
+This is also the file to read first when learning to write your own integration — `src/integrations-builtin/time/index.ts` is heavily commented and demonstrates `IntegrationContext`, `meta.tier`, `alwaysLoad`, and multi-tool registration end-to-end in a small focused file.
 
 #### `gmail` — multi-account Gmail (OAuth2; opt-in deps)
 
@@ -637,7 +637,7 @@ The third one will require approving the send via inline-keyboard. The agent mus
 
 - **Hot-reload is intentionally absent.** Edit your `index.ts`, restart solrac. Same boot-once story as skills and config.
 - **One MCP server.** All integrations share the namespace `mcp__solrac__*` — there is no per-integration MCP server. Tool name collisions across integrations are resolved first-dir-wins (blessed first, operator second), with a warn log. Pick distinctive prefixes: `linear_*`, `gmail_*`, `shopify_*`.
-- **Audit + cost cap apply.** Every integration tool call writes to `audit.tool_calls` (the same column Claude tools use), and every call passes through `PreToolUse` (cost cap + loop detector). Verified live; see `solrac-dev/PLAN.md` Phase 3 verification.
+- **Audit + cost cap apply.** Every integration tool call writes to `audit.tool_calls` (the same column Claude tools use), and every call passes through `PreToolUse` (cost cap + loop detector). Tier-3 tools (`tier:"confirm"`) additionally route through `canUseTool` for the Telegram-confirm prompt.
 
 ## Permission UX
 
@@ -798,7 +798,7 @@ The token is **required even on `127.0.0.1`** — a co-tenant on a shared host c
 
 Everything you can do in Telegram works in the web UI through the same code path:
 
-- **Engine routing**: prefix `@` (primary), `!` (secondary), `>` (Ollama). The composer has a 3-state pill that prepends the prefix for you.
+- **Engine routing**: prefix `@` (primary Claude), `!` (secondary Claude), or no prefix (the configured default — Ollama in the standard config). The composer has a pill row matching the available engines: `default → @ → !`. The default-pill label is server-injected so the UI shows `default (ollama)` or `default (primary Claude)` to match the deploy.
 - **Slash commands**: `/help`, `/status`, `/context`, `/clear [primary|secondary|all]`, `/compact`, plus any operator-defined skills.
 - **Tool confirmation**: when Claude wants to run a tier-3 tool (Edit, Write, Bash with non-trivial args), an inline Allow / Deny prompt appears. 60 s timeout — same as Telegram.
 - **Cost caps**: per-chat (web traffic shares one synthetic chat id, default `-1000`) and global. Both apply the same way.

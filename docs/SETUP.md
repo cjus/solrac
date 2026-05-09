@@ -24,7 +24,7 @@ bun --version   # should be ≥1.3.0
 
 ## 2. Prerequisites: Ollama daemon + model (recommended)
 
-**PR-B inversion**: the recommended Solrac config sets `SOLRAC_DEFAULT_ENGINE=ollama`, which makes a local [Ollama](https://ollama.com) daemon a hard boot requirement. No-prefix Telegram messages route to Ollama for free; `@`/`!` reach Anthropic Sonnet/Opus.
+The recommended Solrac config sets `SOLRAC_DEFAULT_ENGINE=ollama`, which makes a local [Ollama](https://ollama.com) daemon a hard boot requirement. No-prefix Telegram messages route to Ollama for free; `@`/`!` reach Anthropic Sonnet/Opus.
 
 Don't want Ollama? Skip to **§2-alt** for the Claude-only fallback.
 
@@ -137,7 +137,7 @@ TELEGRAM_BOT_TOKEN=8123456789:AA…      # from §4
 ALLOWLIST_BOOTSTRAP=123456789           # from §5 (your from.id)
 ```
 
-The template ships with the recommended PR-B defaults pre-set:
+The template ships with the recommended Ollama-default values pre-set:
 
 ```sh
 SOLRAC_DEFAULT_ENGINE=ollama
@@ -223,7 +223,7 @@ You'll get RSS, uptime, in-flight turn counts, and 24h spend.
 
 ## 12. (Optional) Tune the Ollama path
 
-The PR-B default already enables Ollama (§2 + §7). Knobs that may matter for non-standard deploys:
+The recommended config already enables Ollama (§2 + §7). Knobs that may matter for non-standard deploys:
 
 | Env | Default | When to override |
 |---|---|---|
