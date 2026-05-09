@@ -44,6 +44,13 @@ const BUILTIN_DIR = join(REPO_ROOT, "src", "integrations-builtin");
 const OPERATOR_DIR = join(REPO_ROOT, "examples", "integrations");
 
 async function run(): Promise<void> {
+  // Hermetic env: ensure operator's local `.env` doesn't accidentally
+  // configure self-gating integrations into success state during the smoke.
+  // We assert that gated integrations register zero tools, so any token in
+  // the operator's shell would flip that assertion. Restore on exit not
+  // required — the smoke is a one-shot script.
+  delete process.env.NOTION_API_KEY;
+
   const ctx = createIntegrationContext();
   const phases: Phase[] = [];
 
@@ -53,10 +60,10 @@ async function run(): Promise<void> {
 
   const blessedOnly = await loadIntegrations([BUILTIN_DIR], ctx);
   phases.push({
-    name: "blessed-only: 2 sources discovered",
-    expected: "2",
+    name: "blessed-only: 3 sources discovered",
+    expected: "3",
     actual: String(blessedOnly.sources.length),
-    pass: blessedOnly.sources.length === 2,
+    pass: blessedOnly.sources.length === 3,
   });
   phases.push({
     name: "blessed-only: 0 errors",
@@ -109,10 +116,10 @@ async function run(): Promise<void> {
   const both = await loadIntegrations([BUILTIN_DIR, OPERATOR_DIR], ctx);
   const sourceNames = both.sources.map((s) => s.name).sort();
   phases.push({
-    name: "blessed+operator: source names include all four dirs",
-    expected: "echo, gmail, linear, time",
+    name: "blessed+operator: source names include all blessed + operator dirs",
+    expected: "echo, gmail, linear, notion, time",
     actual: sourceNames.join(", "),
-    pass: sourceNames.join(", ") === "echo, gmail, linear, time",
+    pass: sourceNames.join(", ") === "echo, gmail, linear, notion, time",
   });
   phases.push({
     name: "blessed+operator: zero loader errors",

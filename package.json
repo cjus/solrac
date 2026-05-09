@@ -34,6 +34,7 @@
     "test": "bun test",
     "smoke:flood": "bun test/smokes/flood.ts",
     "smoke:integrations": "bun test/smokes/integrations.ts",
+    "smoke:notion": "bun test/smokes/notion-smoke.ts",
     "smoke:ollama": "bun test/smokes/ollama.ts",
     "clean": "rm -rf dist"
   },
@@ -47,6 +48,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.2.119",
+    "@notionhq/client": "^5.20.0",
     "marked": "^18.0.3",
     "zod": "^4.4.3"
   }

@@ -529,6 +529,12 @@ const defaultAllowAll: CanUseTool = async (toolName) => {
 // `telegram@claude-plugins-official` plugin reads TELEGRAM_BOT_TOKEN from env
 // and calls getUpdates, racing our own poller).
 //
+// Integration tokens (NOTION_API_KEY, …) are scrubbed for a different reason:
+// the integration handler runs in solrac's main process — the SDK subprocess
+// never needs the token. Without scrubbing, an auto-allowed `Bash(echo …)`
+// call (per policy.ts BASH_SAFE_PREFIXES) lets a compromised model exfiltrate
+// the token in plaintext.
+//
 // Exported (PNX-167) so the `/compact` runner in commands.ts can reuse the
 // same sanitize without duplicating the deny-list. If you add a new var that
 // must NOT leak to the SDK subprocess, add it here — both call sites pick it
@@ -540,6 +546,7 @@ export function sanitizedSubprocessEnv(): Record<string, string | undefined> {
     if (key.startsWith("TG_")) continue;
     if (key === "STATS_BEARER_TOKEN") continue;
     if (key === "ALLOWLIST_BOOTSTRAP") continue;
+    if (key === "NOTION_API_KEY") continue;
     env[key] = value;
   }
   return env;
