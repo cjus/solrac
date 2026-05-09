@@ -95,6 +95,7 @@
 
 import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { SolracDb } from "./db.ts";
+import type { SessionStore } from "./session.ts";
 import { readInstanceMd, wrapInstanceMd } from "./instance.ts";
 import type { IntegrationTier } from "./integrations.ts";
 import { log } from "./log.ts";
@@ -188,6 +189,12 @@ function buildToolCapabilityNote(
 export interface OllamaRunDeps {
   tg: TelegramClient;
   db: SolracDb;
+  // `/clear ollama` cutoff store. Reads `getOllamaCutoff(chatId)` once per
+  // turn before assembling history. NULL is the cold-start case (no clear
+  // ever issued for this chat). Optional for back-compat with existing
+  // tests that construct deps inline; production wiring in main.ts always
+  // provides it.
+  sessions?: SessionStore;
   url: string; // base, no trailing slash
   model: string;
   timeoutMs: number;
@@ -295,7 +302,12 @@ export async function runOllamaTurn(
   // so a user who started in either Claude tier and follows up via `>`
   // doesn't lose context. Each row's `model` field tags origin but the role
   // mapping is identical: (user, prompt) + (assistant, response).
-  const history = deps.db.recentChatTurns(input.chatId, deps.historyLimit);
+  //
+  // `/clear ollama` cutoff hides every turn at or before the cutoff. The
+  // cutoff is per-chat (not per-engine) because the audit log is the only
+  // history Ollama has — clearing means clearing.
+  const cutoff = deps.sessions?.getOllamaCutoff(input.chatId) ?? 0;
+  const history = deps.db.recentChatTurns(input.chatId, deps.historyLimit, cutoff);
   for (const h of history) {
     messages.push({ role: "user", content: h.prompt });
     messages.push({ role: "assistant", content: h.response });
@@ -559,7 +571,10 @@ async function runOllamaTurnWithTools(
   if (instanceMd !== null) {
     initialMessages.push({ role: "system", content: wrapInstanceMd(instanceMd) });
   }
-  const history = deps.db.recentChatTurns(input.chatId, deps.historyLimit);
+  // Same cutoff treatment as the single-shot path above; the tool-loop
+  // variant must agree so /clear ollama is consistent across both modes.
+  const cutoff = deps.sessions?.getOllamaCutoff(input.chatId) ?? 0;
+  const history = deps.db.recentChatTurns(input.chatId, deps.historyLimit, cutoff);
   for (const h of history) {
     initialMessages.push({ role: "user", content: h.prompt });
     initialMessages.push({ role: "assistant", content: h.response });

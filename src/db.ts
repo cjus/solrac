@@ -206,7 +206,13 @@ export interface SolracDb {
   // origin. The Ollama runner uses this for its messages array so Claude
   // turns aren't invisible to follow-up Ollama questions. PLAN Step 11.5
   // (generalized in Step 12).
-  recentChatTurns: (chatId: number, limit: number) => ChatHistoryRow[];
+  //
+  // `sinceMs` (default 0) filters out rows with `started_at <= sinceMs`.
+  // Ollama callers pass `sessions.getOllamaCutoff(chatId) ?? 0` so a
+  // `/clear ollama` cutoff truncates the visible history. Other callers
+  // (web client) leave it at 0 — the audit log is still the source of
+  // truth for operator-facing views.
+  recentChatTurns: (chatId: number, limit: number, sinceMs?: number) => ChatHistoryRow[];
   // Returns successful turns from OTHER engines that happened AFTER this
   // engine's most recent successful turn. `currentEnginePrefix` is a SQL LIKE
   // pattern naming this engine (e.g. 'claude:primary:%', 'claude:secondary:%',
@@ -221,11 +227,22 @@ export interface SolracDb {
   // prefix without `%` (or with extra wildcards) the NOT-LIKE-exclusion
   // could silently match too few or too many rows. The current call sites
   // (agent.ts, ollama.ts) construct this safely; new callers must too.
+  //
+  // `ollamaCutoffMs` (default 0) hides Ollama rows with `started_at <=
+  // cutoff` from the bridge — implements the source-of-truth semantics of
+  // `/clear ollama` for Claude tiers (the cleared turns disappear from
+  // Sonnet/Opus's bridge too, not just from Ollama's own history).
   outOfBandForEngine: (
     chatId: number,
     currentEnginePrefix: string,
     limit: number,
+    ollamaCutoffMs?: number,
   ) => ChatHistoryRow[];
+  // Cheap existence probe: any successful Ollama turn for this chat with
+  // `started_at > sinceMs`? Used by `/clear ollama` to render an honest
+  // "Already clean" reply when the cutoff is already at or past the most
+  // recent turn. O(1) via `idx_audit_chat_model_started`.
+  hasOllamaTurnsSince: (chatId: number, sinceMs: number) => boolean;
   // PNX-167 — count of successful turns for a chat scoped to a single engine.
   // Used by `/status` to surface "12 turns on primary in this chat." Same
   // index path as `outOfBandForEngine` (`idx_audit_chat_model_started`).
@@ -338,6 +355,16 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
     db.run("ALTER TABLE sessions ADD COLUMN secondary_summary_at INTEGER");
     log.info("db.migrated", { migration: "sessions.secondary_summary_at_added" });
   }
+  // `/clear ollama` cutoff — millisecond timestamp at which the operator
+  // wiped this chat's Ollama context. `recentChatTurns` (Ollama's own history
+  // reconstruction) AND `outOfBandForEngine` (Claude's cross-engine bridge)
+  // both filter Ollama rows with `started_at <= cutoff`. NULL = never cleared.
+  // Ollama is stateless so there's no SDK session to drop; the cutoff IS the
+  // session boundary. Additive + nullable so existing rows survive.
+  if (!sessionCols.some((c) => c.name === "ollama_cutoff_ms")) {
+    db.run("ALTER TABLE sessions ADD COLUMN ollama_cutoff_ms INTEGER");
+    log.info("db.migrated", { migration: "sessions.ollama_cutoff_ms_added" });
+  }
   // PLAN Step 12 — retag legacy `audit.model='claude'` rows. They ran on the
   // then-default SOLRAC_MODEL=claude-opus-4-7, which is now the secondary
   // tier. Cross-tier out-of-band queries key off the prefix
@@ -410,10 +437,15 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   // Returns DESC for cheap LIMIT, then the consumer reverses for chronological
   // order. Each row carries its own `model` tag so the consumer can render an
   // origin label.
+  // `started_at > ?` floor (default 0 from caller) implements the
+  // `/clear ollama` cutoff. Strict `>` matches the back-to-back-/clear
+  // semantics in commands.ts: setting cutoff to `Date.now()` immediately
+  // hides every existing turn including any inserted in the same ms.
   const stRecentChat = db.prepare(
     "SELECT prompt, response, model FROM audit " +
       "WHERE chat_id = ? AND status = 'ok' " +
       "AND prompt IS NOT NULL AND response IS NOT NULL " +
+      "AND started_at > ? " +
       "ORDER BY started_at DESC LIMIT ?",
   );
   // Out-of-band turns for any engine. Caller passes their own engine's prefix
@@ -425,15 +457,28 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   // Excludes 'system' rows (denials/queue-full) and Ollama uses this query
   // too — the symmetry means Ollama's own history reconstruction can layer
   // on top if needed (today it uses `recentChatTurns` directly).
+  // `(model NOT LIKE 'ollama:%' OR started_at > ?)` honors the ollama
+  // cutoff for the cross-engine bridge (decision B in PLAN). When the caller
+  // passes 0 (no cutoff set) the clause is a no-op. When set, Ollama turns
+  // pre-cutoff stay invisible to Claude tiers too — the user said /clear
+  // means /clear, not "/clear-but-only-from-its-own-history".
   const stOutOfBandOther = db.prepare(
     "SELECT prompt, response, model FROM audit " +
       "WHERE chat_id = ? AND model NOT LIKE ? AND status = 'ok' " +
       "AND prompt IS NOT NULL AND response IS NOT NULL " +
+      "AND (model NOT LIKE 'ollama:%' OR started_at > ?) " +
       "AND started_at > COALESCE(" +
       "  (SELECT MAX(started_at) FROM audit WHERE chat_id = ? AND model LIKE ? AND status = 'ok'), " +
       "  0" +
       ") " +
       "ORDER BY started_at ASC LIMIT ?",
+  );
+  // Existence probe used by `/clear ollama` for the "Already clean" reply.
+  const stHasOllamaSince = db.prepare(
+    "SELECT 1 FROM audit " +
+      "WHERE chat_id = ? AND model LIKE 'ollama:%' AND status = 'ok' " +
+      "AND prompt IS NOT NULL AND response IS NOT NULL " +
+      "AND started_at > ? LIMIT 1",
   );
   // PNX-167 — engine-scoped helpers. All three use the
   // `idx_audit_chat_model_started` index. `countChatTurnsForEngine` and
@@ -541,26 +586,31 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
       }>;
       return rows.map((r) => ({ chatId: r.chat_id, spent: r.spent, turns: r.turns }));
     },
-    recentChatTurns(chatId, limit) {
-      const rows = stRecentChat.all(chatId, limit) as ChatHistoryRow[];
+    recentChatTurns(chatId, limit, sinceMs = 0) {
+      const rows = stRecentChat.all(chatId, sinceMs, limit) as ChatHistoryRow[];
       // Reverse to chronological order so the caller can append directly to a
       // chat-style messages array.
       return rows.reverse();
     },
-    outOfBandForEngine(chatId, currentEnginePrefix, limit) {
+    outOfBandForEngine(chatId, currentEnginePrefix, limit, ollamaCutoffMs = 0) {
       // Already ordered ASC. Args:
       //   1: chatId (outer SELECT scope)
       //   2: currentEnginePrefix (NOT LIKE — exclude this engine's own rows)
-      //   3: chatId (correlated subquery scope)
-      //   4: currentEnginePrefix (subquery LIKE — find this engine's cutoff)
-      //   5: limit
+      //   3: ollamaCutoffMs (the decision-B clause; 0 = no cutoff)
+      //   4: chatId (correlated subquery scope)
+      //   5: currentEnginePrefix (subquery LIKE — find this engine's cutoff)
+      //   6: limit
       return stOutOfBandOther.all(
         chatId,
         currentEnginePrefix,
+        ollamaCutoffMs,
         chatId,
         currentEnginePrefix,
         limit,
       ) as ChatHistoryRow[];
+    },
+    hasOllamaTurnsSince(chatId, sinceMs) {
+      return stHasOllamaSince.get(chatId, sinceMs) !== null;
     },
     countChatTurnsForEngine(chatId, enginePrefix) {
       const row = stCountChatForEngine.get(chatId, enginePrefix) as { n: number } | null;
