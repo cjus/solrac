@@ -11,8 +11,8 @@
  *     hard-fails if missing or empty. Joined into Claude's
  *     `systemPrompt.append` and Ollama's first `system` message. Per-engine
  *     capability deltas ("you have tools" / "you don't") stay in code next to
- *     each engine's wiring (see `agent.ts::CLAUDE_CAPABILITY_NOTE` and
- *     `ollama.ts::OLLAMA_CAPABILITY_NOTE`) so SOUL.md stays portable.
+ *     each engine's wiring (see `agent.ts::buildClaudeCapabilityNote` and
+ *     `ollama.ts::buildOllamaCapabilityNote`) so SOUL.md stays portable.
  *
  *   - `SOLRAC.md` — operator overlay (operator name, channel posture, project
  *     hints). Re-read per turn via `readInstanceMd` so live edits take effect

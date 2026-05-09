@@ -614,21 +614,34 @@ Global is checked first because if the host is over its absolute budget, every c
 
 **v1 limitation:** both caps measure Anthropic API spend only. Tools that call paid third-party APIs (e.g. a `replicate` CLI) aren't measured; auto-deny rules in the classifier are the v1 mitigation. See [Open Question #5 in PLAN.md](../changelog/pnx-155-solrac-open-claude-agent/PLAN.md).
 
+**Ollama tool calls are NOT gated by either cost cap.** Ollama is free; the cap exists to bound Anthropic spend. The `OLLAMA_MAX_TOOL_ITERATIONS` ceiling and the per-turn loop detector are the runaway-loop defenses for the local path. Confirm-tier tools still go through the same `ConfirmationBroker` regardless of engine.
+
 ---
 
 <a id="engine-routing"></a>
 
 ## Engine routing (prefix table)
 
-The first non-whitespace character of `msg.text` picks the engine:
+**PR-B inverted the default.** The first non-whitespace character of `msg.text` picks the engine; with no prefix, `SOLRAC_DEFAULT_ENGINE` (default `ollama`) decides.
 
 | Prefix | Engine label | Model | Tools | Audit `model` value |
 |--------|--------------|-------|-------|---------------------|
-| (none) or `@` | `primary` (Claude) | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | `claude_code` preset + integrations | `claude:primary:<modelId>` |
-| `!` | `secondary` (Claude) | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | `claude_code` preset + integrations | `claude:secondary:<modelId>` |
-| `>` | `ollama` | `OLLAMA_MODEL` (required when `OLLAMA_ENABLED=true`) | none — local model is text-completion only | `ollama:<modelId>` |
+| (none) | depends on `SOLRAC_DEFAULT_ENGINE` (`ollama` by default) | `OLLAMA_MODEL` for default-Ollama; otherwise the matching tier model | integrations only on Ollama (when `OLLAMA_TOOLS_ENABLED=true`); `claude_code` preset + integrations on Claude | matches the resolved engine |
+| `@` | `primary` (Claude) — escalation | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | `claude_code` preset + integrations | `claude:primary:<modelId>` |
+| `!` | `secondary` (Claude) — heaviest | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | `claude_code` preset + integrations | `claude:secondary:<modelId>` |
 
-`policy.ts::parseEnginePrefix(text)` returns `{ engine, explicit, prompt }`. `explicit` is true only when an actual prefix character was consumed; the `main.ts` dispatcher uses it to decide whether an empty payload should render a usage hint (only for explicit prefixes — no-prefix-empty messages can't reach us; Telegram rejects empty text).
+The `>` prefix was **removed in PR-B**. A leading `>` is now literal user text routed via no-prefix → `defaultEngine`.
+
+`policy.ts::parseEnginePrefix(text, defaultEngine)` returns `{ engine, explicit, prompt }`. `explicit` is true only when an actual prefix character (`@` or `!`) was consumed; `main.ts` uses it to render usage hints on empty explicit-prefix payloads.
+
+**Why invert.** *Claude only when explicitly requested.* Anthropic burn happens on a deliberate `@` (Sonnet) or `!` (Opus); everything else stays local and free. The integration surface (operator-authored + blessed `mcp__solrac__*` tools) becomes the workhorse for tool-driven chats on the local path.
+
+**Boot validation enforces reachability:**
+
+- `defaultEngine === "ollama" && !ollamaEnabled` → throw (the default would error every turn).
+- `defaultEngine !== "ollama" && ollamaToolsEnabled` → throw (with `>` removed, Ollama is unreachable when not the default).
+
+When `defaultEngine === "ollama"`, boot fires a one-shot `GET /api/tags` health probe; failures are logged (`ollama.boot_health_failed`) but non-fatal — daemon may come up after Solrac under systemd, and we don't want to crash the unit on a transient.
 
 ```
 poll → gate → throttle → queue.enqueue
@@ -695,9 +708,11 @@ The retag migration is an idempotent `UPDATE audit SET model = 'claude:secondary
 
 <a id="ollama-routing"></a>
 
-## Ollama local-model routing (`>` prefix)
+## Ollama local-model routing
 
-The `>` engine is the third row of the routing table above. The motivation is two-fold: (1) a lot of casual chat doesn't need Claude's tool-using horsepower, so a free local model is enough; (2) when Anthropic is unreachable or the prompt is sensitive, an offline path that never leaves the box is useful.
+**PR-B promoted Ollama to the default engine.** `SOLRAC_DEFAULT_ENGINE=ollama` (the new default) routes no-prefix messages here. Claude tiers are reached only via explicit `@` / `!`. The `>` prefix was removed; with Ollama as the default, it was redundant.
+
+Motivation: (1) most casual chat doesn't need Claude's reasoning, so the free local path becomes the workhorse; (2) when `OLLAMA_TOOLS_ENABLED=true`, the local model can call the same `mcp__solrac__*` integrations Claude does — the operator's tool surface is what makes default-Ollama useful for tool-driven work.
 
 ### What's the same as Claude
 

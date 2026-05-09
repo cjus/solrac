@@ -214,31 +214,23 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
       return;
     }
 
-    const parsed = parseEnginePrefix(msg.text);
+    const parsed = parseEnginePrefix(msg.text, deps.config.defaultEngine);
 
     if (parsed.engine === "ollama") {
       if (!deps.ollamaDeps) {
-        // Feature off in this deployment. The handler is fire-and-forget; we
-        // don't enqueue a turn and don't write an audit row. Cheap reply so
-        // silence isn't ambiguous.
+        // Defensive: shouldn't fire in practice — boot validation requires
+        // `OLLAMA_ENABLED=true` whenever `defaultEngine === "ollama"`. Kept as
+        // a safety net so a misconfigured deploy ack-replies rather than
+        // hangs on the no-deps path.
         await deps.tg
           .sendMessage(msg.chat.id, "ollama disabled in this deployment")
           .catch((err) => log.warn("ollama.disabled_ack_failed", { error: (err as Error).message }));
         log.info("turn.done", { update_id: update.update_id, chat_id: msg.chat.id, route: "ollama_disabled" });
         return;
       }
-      if (parsed.prompt === "") {
-        // Empty payload after `>`. Render a usage hint; no audit row, no enqueue.
-        await deps.tg
-          .sendMessage(
-            msg.chat.id,
-            `usage: <code>&gt; &lt;prompt&gt;</code> — sends to local Ollama (model: ${deps.ollamaDeps.model})`,
-            { parse_mode: "HTML" },
-          )
-          .catch((err) => log.warn("ollama.usage_ack_failed", { error: (err as Error).message }));
-        log.info("turn.done", { update_id: update.update_id, chat_id: msg.chat.id, route: "ollama_usage" });
-        return;
-      }
+      // No-prefix Ollama: empty body is unreachable on Telegram (the platform
+      // rejects empty messages) and the web UI guards against it. Send the
+      // user's text straight to the runner.
       await runOllamaTurn(deps.ollamaDeps, {
         chatId: msg.chat.id,
         fromId: msg.from.id,
@@ -249,11 +241,10 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
       return;
     }
 
-    // Claude tier path. PLAN Step 12: explicit `!` → primary, `@` → secondary,
-    // no prefix → primary (default cheap tier). Empty payload after an
-    // explicit prefix renders a usage hint; the no-prefix-empty case can't
-    // happen on Telegram (the platform rejects empty messages) but we still
-    // pass `msg.text` through to the runner unchanged in that case.
+    // Claude tier path. PR-B: `@` → primary, `!` → secondary; no-prefix only
+    // routes here when the operator pinned `SOLRAC_DEFAULT_ENGINE=primary` (or
+    // `=secondary`). Empty payload after an explicit prefix renders a usage
+    // hint.
     if (parsed.explicit && parsed.prompt === "") {
       const tierLabel = parsed.engine === "primary" ? "primary Claude" : "secondary Claude";
       const prefixChar = parsed.engine === "primary" ? "@" : "!";
@@ -288,6 +279,9 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
         dataDir: deps.config.dataDir,
         soul: deps.soul,
         instanceMdPath: deps.instanceMdPath,
+        // PR-B — `true` only when the operator pinned a Claude tier as
+        // default (Claude-only deploys). Drives the capability-note tone.
+        isDefaultEngine: deps.config.defaultEngine !== "ollama",
         primaryModel: deps.primaryModel,
         secondaryModel: deps.secondaryModel,
         costGuard: deps.costGuard,
@@ -452,6 +446,58 @@ export function auditQueueFull(update: Update, db: SolracDb, tg: TelegramClient,
   }
 }
 
+// PR-B — operator-readable label for the web UI's default-engine pill. The
+// pill itself ships with the empty `data-prefix=""`, but the title attr is
+// substituted at serve time (see `web.ts::renderIndexHtml`) so the user
+// hovers over a label matching the deploy.
+function defaultEngineLabel(engine: "ollama" | "primary" | "secondary"): string {
+  if (engine === "ollama") return "ollama";
+  if (engine === "primary") return "primary Claude (Sonnet)";
+  return "secondary Claude (Opus)";
+}
+
+// PR-B — boot-time Ollama health probe. Non-fatal: any failure is logged
+// (warn) so the operator sees the misconfiguration but the process keeps
+// running. Daemon may come up after Solrac under systemd; the next user
+// turn will succeed once the daemon is reachable.
+async function probeOllamaHealth(url: string, model: string): Promise<void> {
+  try {
+    const res = await fetch(`${url}/api/tags`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) {
+      log.warn("ollama.boot_health_failed", {
+        url,
+        status: res.status,
+        hint: "ensure the Ollama daemon is running (e.g., `ollama serve`)",
+      });
+      return;
+    }
+    const body = (await res.json().catch(() => ({}))) as {
+      models?: Array<{ name?: unknown }>;
+    };
+    const models = Array.isArray(body.models)
+      ? body.models.map((m) => (typeof m.name === "string" ? m.name : "")).filter(Boolean)
+      : [];
+    if (!models.includes(model)) {
+      log.warn("ollama.boot_health_model_missing", {
+        url,
+        model,
+        availableModels: models,
+        hint: `pull the model: \`ollama pull ${model}\``,
+      });
+      return;
+    }
+    log.info("ollama.boot_health_ok", { url, model });
+  } catch (err) {
+    log.warn("ollama.boot_health_failed", {
+      url,
+      error: (err as Error).message,
+      hint: "ensure the Ollama daemon is running (e.g., `ollama serve`)",
+    });
+  }
+}
+
 async function main(): Promise<void> {
   const startedAt = Date.now();
   let config: Config;
@@ -464,6 +510,7 @@ async function main(): Promise<void> {
 
   log.info("solrac.boot", {
     transport: config.transport,
+    defaultEngine: config.defaultEngine,
     primaryModel: config.primaryModel,
     secondaryModel: config.secondaryModel,
     port: config.port,
@@ -476,6 +523,18 @@ async function main(): Promise<void> {
     ollamaModel: config.ollamaModel,
     ollamaUrl: config.ollamaUrl,
   });
+  // PR-B — one-release-cycle silent-flip guard. Operators upgrading from a
+  // pre-PR-B build without setting `SOLRAC_DEFAULT_ENGINE` would see no-prefix
+  // messages start hitting Ollama. Boot validation throws if Ollama isn't
+  // enabled, so we never silently route to a broken backend — but we still
+  // warn so the diff in posture is visible. Remove this branch in the next
+  // minor release.
+  if (!config.defaultEngineExplicit) {
+    log.warn("solrac.default_engine_implicit", {
+      value: config.defaultEngine,
+      hint: "set SOLRAC_DEFAULT_ENGINE explicitly to silence; default flipped from primary to ollama in PR-B",
+    });
+  }
 
   // PNX-167 (system-prompt externalization). Bootstrap SOUL.md + SOLRAC.md
   // into the launch cwd from the package defaults if absent, then load SOUL
@@ -518,7 +577,7 @@ async function main(): Promise<void> {
     // are scanned. First-dir-wins on tool-name collisions so a stale
     // operator copy can't shadow a blessed integration. Tools registered
     // here surface to Claude tiers as `mcp__solrac__<name>`. Ollama
-    // (`>` prefix) does NOT see integrations — see ollama.ts.
+    // path does NOT see integrations on the tools-off branch — see ollama.ts.
     let integrationsMcpServer: McpSdkServerConfigWithInstance | null = null;
     let integrationToolTiers: ReadonlyMap<string, "auto" | "confirm"> = new Map();
     // PR-A — capture the tools array so the Ollama tools-on path can reuse
@@ -574,6 +633,7 @@ async function main(): Promise<void> {
     // before.
     const ollamaToolsActive =
       config.ollamaToolsEnabled && integrationTools.length > 0;
+    const ollamaIsDefault = config.defaultEngine === "ollama";
     const ollamaDeps: OllamaRunDeps | null =
       config.ollamaEnabled && config.ollamaModel
         ? {
@@ -585,6 +645,7 @@ async function main(): Promise<void> {
             historyLimit: config.ollamaHistoryLimit,
             soul,
             instanceMdPath: solracMdPath,
+            isDefaultEngine: ollamaIsDefault,
             toolEnabled: ollamaToolsActive,
             tools: ollamaToolsActive ? integrationTools : undefined,
             toolTiers: ollamaToolsActive ? integrationToolTiers : undefined,
@@ -596,6 +657,7 @@ async function main(): Promise<void> {
       log.info("ollama.boot", {
         url: config.ollamaUrl,
         model: config.ollamaModel,
+        isDefaultEngine: ollamaIsDefault,
         toolsEnabled: ollamaToolsActive,
         toolCount: ollamaToolsActive ? integrationTools.length : 0,
         maxToolIterations: ollamaToolsActive
@@ -603,6 +665,15 @@ async function main(): Promise<void> {
           : null,
         timeoutMs: config.ollamaTimeoutMs,
       });
+    }
+    // PR-B — Ollama is the recommended default; probe the daemon at boot so
+    // operators see a misconfiguration immediately (vs. on first user turn).
+    // Non-fatal: a slow-starting daemon may not be ready yet under systemd
+    // (After=ollama.service ordering helps but doesn't guarantee readiness),
+    // and crashing Solrac because of a transient probe failure is worse than
+    // logging it.
+    if (ollamaIsDefault && ollamaDeps && config.ollamaModel) {
+      void probeOllamaHealth(config.ollamaUrl, config.ollamaModel);
     }
     // PNX-167 — boot-time bot identity for `/cmd@<bot>` group-chat targeting.
     // Failure is non-fatal: we proceed with `botUsername=null`, which causes
@@ -664,6 +735,8 @@ async function main(): Promise<void> {
       hourlyCostCapUsd: config.hourlyCostCapUsd,
       globalHourlyCostCapUsd: config.globalHourlyCostCapUsd,
       skillRegistry,
+      defaultEngine: config.defaultEngine,
+      ollamaToolsEnabled: config.ollamaToolsEnabled,
     };
     // Web UI transport (optional). The `webClient` was built earlier so the
     // `webBroker` could capture it; reuse the same instance here so all bus
@@ -764,6 +837,7 @@ async function main(): Promise<void> {
         webChatId: config.webChatId,
         webClient,
         rootDir: packageDir(),
+        defaultEngineLabel: defaultEngineLabel(config.defaultEngine),
         onMessage: (text) => {
           const id = nextWebUpdateId++;
           const update: Update = {

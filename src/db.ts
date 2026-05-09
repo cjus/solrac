@@ -230,6 +230,15 @@ export interface SolracDb {
   // Used by `/status` to surface "12 turns on primary in this chat." Same
   // index path as `outOfBandForEngine` (`idx_audit_chat_model_started`).
   countChatTurnsForEngine: (chatId: number, enginePrefix: string) => number;
+  // PR-B — time-windowed variant. Counts successful turns for chat+engine
+  // started at or after `sinceMs`. Used by `/status` to surface "ollama
+  // turns: N (last 24h)" so the inversion-default chat shows its activity
+  // even when no Claude session state exists.
+  countChatTurnsForEngineSince: (
+    chatId: number,
+    enginePrefix: string,
+    sinceMs: number,
+  ) => number;
   // PNX-167 — MAX(started_at) for a chat+engine where status='ok'. Returns
   // null when no successful row matches. Powers the "last 14:32 UTC" line in
   // `/status`.
@@ -436,6 +445,15 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
     "SELECT COUNT(*) AS n FROM audit " +
       "WHERE chat_id = ? AND model LIKE ? AND status = 'ok'",
   );
+  // PR-B — time-windowed engine count. Powers the "ollama turns: N (last
+  // 24h)" line in `/status`; with the inversion most chats no longer have
+  // Claude session-state to surface, but Ollama turns can still be tallied
+  // for at-a-glance activity. Same `idx_audit_chat_model_started` index path
+  // as `stCountChatForEngine`.
+  const stCountChatForEngineSince = db.prepare(
+    "SELECT COUNT(*) AS n FROM audit " +
+      "WHERE chat_id = ? AND model LIKE ? AND status = 'ok' AND started_at >= ?",
+  );
   const stLastChatForEngine = db.prepare(
     "SELECT MAX(started_at) AS at FROM audit " +
       "WHERE chat_id = ? AND model LIKE ? AND status = 'ok'",
@@ -546,6 +564,12 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
     },
     countChatTurnsForEngine(chatId, enginePrefix) {
       const row = stCountChatForEngine.get(chatId, enginePrefix) as { n: number } | null;
+      return row?.n ?? 0;
+    },
+    countChatTurnsForEngineSince(chatId, enginePrefix, sinceMs) {
+      const row = stCountChatForEngineSince.get(chatId, enginePrefix, sinceMs) as
+        | { n: number }
+        | null;
       return row?.n ?? 0;
     },
     lastSuccessfulTurnAt(chatId, enginePrefix) {

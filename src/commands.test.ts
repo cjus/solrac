@@ -105,7 +105,9 @@ describe("parseCommand", () => {
       kind: "run",
       cmd: { kind: "compact", tier: "secondary" },
     });
-    expect(parseCommand(":context", DEPS)).toEqual({
+    // PR-B: bare `:context` rejects with usage hint (kind: "unknown") instead
+    // of silently defaulting to primary. Same contract as the `/` prefix.
+    expect(parseCommand(":context @", DEPS)).toEqual({
       kind: "run",
       cmd: { kind: "context", tier: "primary" },
     });
@@ -241,18 +243,24 @@ describe("parseCommand", () => {
     });
   });
 
-  test("/compact bare defaults to primary", () => {
-    expect(parseCommand("/compact", DEPS)).toEqual({
-      kind: "run",
-      cmd: { kind: "compact", tier: "primary" },
-    });
+  test("/compact bare rejects with usage hint (PR-B: explicit tier required)", () => {
+    // PR-B: silent default to primary is misleading post-inversion since most
+    // chats don't have a Claude session. Force the operator to specify @ or !.
+    const result = parseCommand("/compact", DEPS);
+    expect(result.kind).toBe("run");
+    expect((result as { cmd: { kind: string; raw: string } }).cmd.kind).toBe("unknown");
+    expect((result as { cmd: { kind: string; raw: string } }).cmd.raw).toContain(
+      "compact",
+    );
   });
 
-  test("/context bare defaults to primary", () => {
-    expect(parseCommand("/context", DEPS)).toEqual({
-      kind: "run",
-      cmd: { kind: "context", tier: "primary" },
-    });
+  test("/context bare rejects with usage hint (PR-B: explicit tier required)", () => {
+    const result = parseCommand("/context", DEPS);
+    expect(result.kind).toBe("run");
+    expect((result as { cmd: { kind: string; raw: string } }).cmd.kind).toBe("unknown");
+    expect((result as { cmd: { kind: string; raw: string } }).cmd.raw).toContain(
+      "context",
+    );
   });
 
   test("/context tier tokens (single only)", () => {
@@ -470,6 +478,8 @@ async function makeHarness(
     hourlyCostCapUsd: opts.capUsd ?? 1.0,
     globalHourlyCostCapUsd: opts.globalCapUsd ?? 4.0,
     skillRegistry: opts.skillRegistry ?? EMPTY_SKILL_REGISTRY,
+    defaultEngine: "ollama",
+    ollamaToolsEnabled: false,
   };
   const h: Harness = { dir, db, sessions, tg, costGuard, globalCostGuard, deps };
   harnesses.push(h);
@@ -596,15 +606,16 @@ describe("runCommand /help and /unknown", () => {
 // ---------------------------------------------------------------------------
 
 describe("runCommand /status", () => {
-  test("fresh chat renders all 'none'", async () => {
+  test("fresh chat suppresses the wall of 'none' (PR-B trim)", async () => {
     const h = await makeHarness();
     await runCommand(h.deps, fakeMsg("/status"), { kind: "status" }, 1);
     const text = h.tg.sent[0]!.text;
     expect(text).toContain("Solrac status");
-    // Both tier lines should report none on a fresh chat.
-    expect(text).toContain("primary session: <i>none</i>");
-    expect(text).toContain("secondary session: <i>none</i>");
-    expect(text).toContain("pending summary: <i>none</i>");
+    // PR-B: session/summary bullets only render when present. Fresh chat
+    // shows neither — operators using default-Ollama don't see Claude noise.
+    expect(text).not.toContain("primary session:");
+    expect(text).not.toContain("secondary session:");
+    expect(text).not.toContain("pending summary:");
     expect(lastAudit(h.db).response).toBe("status_shown");
   });
 

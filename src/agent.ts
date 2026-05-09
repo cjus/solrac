@@ -18,7 +18,7 @@
  * `instance.ts::loadSoul`) and is layered onto the SDK's `claude_code` preset
  * (NOT replaced) so the SDK's tool guidance stays intact while the Solrac
  * voice + safety clauses ride on top. The Claude-engine capability sentence
- * (`CLAUDE_CAPABILITY_NOTE`) lives here next to the cost-cap wiring, so the
+ * (`buildClaudeCapabilityNote`) lives here next to the cost-cap wiring, so the
  * factual statement about tool-call gating travels with the code that
  * enforces it. See docs/ARCHITECTURE.md#system-prompt-preset-append for the
  * rationale.
@@ -35,7 +35,7 @@
  *   - `AgentRunDeps` — runtime deps (tg, db, sessions, dataDir, soul,
  *     instanceMdPath, model, optional hooks).
  *   - `AgentRunInput` — per-turn input (chatId, fromId, updateId, prompt).
- *   - `CLAUDE_CAPABILITY_NOTE` — the engine-specific clause appended to SOUL
+ *   - `buildClaudeCapabilityNote` — the engine-specific clause appended to SOUL
  *     before it ships as `systemPrompt.append`.
  *
  * Key invariants:
@@ -136,13 +136,30 @@ const OUT_OF_BAND_LIMIT = 6;
 
 // Engine-specific capability statement appended to SOUL.md before it ships as
 // `systemPrompt.append`. Stays in code (Option B from the externalization
-// design) because it is a fact about THIS runtime — gated tool calls, cost
-// cap — not a personality trait. Keeping it next to the cost-cap wiring also
-// means a future deletion of the cap will surface as a stale prompt sentence
-// in the same diff. SOUL.md ships engine-agnostic so the same file can serve
-// every engine path.
-export const CLAUDE_CAPABILITY_NOTE =
-  "Tool calls are gated by a per-chat policy and a per-hour cost cap; assume each tool call must justify itself.";
+// design) because it's a fact about THIS runtime — gated tool calls, cost
+// cap — not a personality trait. SOUL.md ships engine-agnostic so the same
+// file can serve every engine path.
+//
+// PR-B inversion: when Claude isn't the default engine, the note acknowledges
+// the user explicitly escalated via `@`/`!` so the model leans into heavier
+// reasoning instead of treating itself as the casual default.
+export interface ClaudeCapabilityNoteOpts {
+  isDefaultEngine: boolean;
+  tier: "primary" | "secondary";
+}
+
+export function buildClaudeCapabilityNote(opts: ClaudeCapabilityNoteOpts): string {
+  const base =
+    "Tool calls are gated by a per-chat policy and a per-hour cost cap; " +
+    "assume each tool call must justify itself.";
+  if (opts.isDefaultEngine) return base;
+  const tierLabel = opts.tier === "primary" ? "Sonnet (primary)" : "Opus (secondary)";
+  return (
+    base +
+    ` The operator chose ${opts.tier === "primary" ? "`@`" : "`!`"} to escalate to ` +
+    `${tierLabel}; lean into heavier reasoning rather than deferring back to a cheaper engine.`
+  );
+}
 
 export interface AgentRunDeps {
   tg: TelegramClient;
@@ -150,12 +167,18 @@ export interface AgentRunDeps {
   sessions: SessionStore;
   dataDir: string;
   // PNX-167 (system-prompt externalization). `soul` is the SOUL.md text read
-  // once at boot via `instance.ts::loadSoul`; this runner appends
-  // `CLAUDE_CAPABILITY_NOTE` and ships the join as `systemPrompt.append`.
-  // `instanceMdPath` is re-read per turn so live edits take effect on the
-  // next message; null/empty content injects nothing.
+  // once at boot via `instance.ts::loadSoul`; this runner appends a Claude
+  // capability note (built from §3c matrix) and ships the join as
+  // `systemPrompt.append`. `instanceMdPath` is re-read per turn so live edits
+  // take effect on the next message; null/empty content injects nothing.
   soul: string;
   instanceMdPath: string;
+  // PR-B — `true` when `config.defaultEngine === "primary" || "secondary"`.
+  // Drives the capability-note tone (heavyweight escalation acknowledgment
+  // when Claude isn't the default). Optional; defaults to `true` so existing
+  // tests (and Claude-only deployments) keep the established Claude-as-default
+  // behaviour.
+  isDefaultEngine?: boolean;
   // PLAN Step 12: two-tier Claude routing. The runner picks one of these
   // based on `input.engine`; both are passed in so the deps object stays
   // stable across turns instead of being rebuilt with a different `model`
@@ -262,7 +285,10 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
-      append: `${deps.soul}\n\n${CLAUDE_CAPABILITY_NOTE}`,
+      append: `${deps.soul}\n\n${buildClaudeCapabilityNote({
+        isDefaultEngine: deps.isDefaultEngine !== false,
+        tier: input.engine,
+      })}`,
     },
     // Belt-and-suspenders: classifyTool also denies "Agent"/"Task", but the
     // SDK-level disallow keeps the tool out of the model's context entirely.

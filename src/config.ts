@@ -47,6 +47,12 @@
 
 type Transport = "poll" | "webhook";
 
+// Engine selected when a user message has no `@` or `!` prefix. Mirrors
+// `policy.Engine` minus the wire-prefix coupling: kept as its own string-set
+// here so config.ts has zero internal deps. Default `"ollama"` since PR-B —
+// Anthropic burn happens only on a deliberate `@` (Sonnet) or `!` (Opus).
+export type DefaultEngine = "ollama" | "primary" | "secondary";
+
 // Cap on prompt text persisted to the audit table. A single user can flood
 // strings of arbitrary length; truncating before insert bounds per-row size.
 // Not env-tunable in v1 — the value is a defensive constant, not policy.
@@ -75,9 +81,20 @@ export interface Config {
   readonly secondaryModel: string;
   readonly statsBearerToken: string | null;
   readonly tgWebhookSecret: string | null;
-  // PLAN Step 11: local-model routing via `>` prefix. Off by default — when
-  // false, `>`-prefixed messages get a "disabled" reply instead of being
-  // routed. When true, `ollamaModel` MUST be set (validated at boot).
+  // PR-B — engine routing inversion. Picks the engine for messages with no
+  // `@` or `!` prefix. Default `"ollama"` shifts cost to $0 by default;
+  // operators on hosts that can't run Ollama set `"primary"` (or
+  // `"secondary"`). Boot validates: `"ollama"` requires `ollamaEnabled`;
+  // anything else with `ollamaToolsEnabled=true` is rejected (Ollama is
+  // unreachable when it's not the default since PR-B removed the `>` prefix).
+  readonly defaultEngine: DefaultEngine;
+  // True when the operator set `SOLRAC_DEFAULT_ENGINE` explicitly. Lets
+  // main.ts emit a one-release-cycle silent-flip warning so upgrades can't
+  // silently route messages to a different engine. Removed in the next minor.
+  readonly defaultEngineExplicit: boolean;
+  // PLAN Step 11: local-model routing. Off by default. When true,
+  // `ollamaModel` MUST be set (validated at boot). PR-B removed the `>`
+  // prefix; with `ollamaEnabled=true`, Ollama is reached via `defaultEngine`.
   readonly ollamaEnabled: boolean;
   readonly ollamaUrl: string;
   readonly ollamaModel: string | null;
@@ -168,6 +185,15 @@ function parseBoolean(name: string, raw: string | undefined, fallback: boolean):
   if (v === "true" || v === "1" || v === "yes") return true;
   if (v === "false" || v === "0" || v === "no") return false;
   throw new Error(`${name} must be true/false (or 1/0), got "${raw}"`);
+}
+
+function parseDefaultEngine(raw: string | undefined): DefaultEngine {
+  if (raw === undefined || raw.trim() === "") return "ollama";
+  const v = raw.trim().toLowerCase();
+  if (v === "ollama" || v === "primary" || v === "secondary") return v;
+  throw new Error(
+    `SOLRAC_DEFAULT_ENGINE must be "ollama", "primary", or "secondary", got "${raw}"`,
+  );
 }
 
 function parseNegativeInt(name: string, raw: string | undefined, fallback: number): number {
@@ -284,6 +310,28 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
+  // PR-B — default-engine validation. Two cells of the §3c capability matrix
+  // are unreachable; refuse them at boot rather than letting them run with
+  // confusing UX (Ollama unreachable, or a default engine that errors every
+  // turn).
+  const defaultEngine = parseDefaultEngine(env.SOLRAC_DEFAULT_ENGINE);
+  const defaultEngineExplicit =
+    env.SOLRAC_DEFAULT_ENGINE !== undefined && env.SOLRAC_DEFAULT_ENGINE.trim() !== "";
+  if (defaultEngine === "ollama" && !ollamaEnabled) {
+    throw new Error(
+      "SOLRAC_DEFAULT_ENGINE=ollama requires OLLAMA_ENABLED=true; " +
+        "set OLLAMA_ENABLED=true (and OLLAMA_MODEL=<model>) to run Ollama as the default, or " +
+        "SOLRAC_DEFAULT_ENGINE=primary to make Anthropic Sonnet the default",
+    );
+  }
+  if (defaultEngine !== "ollama" && ollamaToolsEnabled) {
+    throw new Error(
+      `SOLRAC_DEFAULT_ENGINE=${defaultEngine} with OLLAMA_TOOLS_ENABLED=true is unreachable: ` +
+        "the `>` prefix was removed in PR-B, so Ollama only runs when it's the default. " +
+        "Set OLLAMA_TOOLS_ENABLED=false or SOLRAC_DEFAULT_ENGINE=ollama",
+    );
+  }
+
   const webEnabled = parseBoolean("SOLRAC_WEB_ENABLED", env.SOLRAC_WEB_ENABLED, false);
   const webPort = parsePositiveInt("SOLRAC_WEB_PORT", env.SOLRAC_WEB_PORT, 8080);
   const webHost =
@@ -329,6 +377,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         : "claude-opus-4-7",
     statsBearerToken: env.STATS_BEARER_TOKEN && env.STATS_BEARER_TOKEN.trim() !== "" ? env.STATS_BEARER_TOKEN : null,
     tgWebhookSecret: env.TG_WEBHOOK_SECRET && env.TG_WEBHOOK_SECRET.trim() !== "" ? env.TG_WEBHOOK_SECRET : null,
+    defaultEngine,
+    defaultEngineExplicit,
     ollamaEnabled,
     ollamaUrl,
     ollamaModel,

@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { formatSseEvent, parseCookieValue } from "./web.ts";
+import { formatSseEvent, parseCookieValue, renderIndexHtml } from "./web.ts";
 
 describe("parseCookieValue", () => {
   test("returns null on empty header", () => {
@@ -96,5 +96,30 @@ describe("formatSseEvent", () => {
     });
     const payload = JSON.parse(out.slice("data: ".length).trim());
     expect(payload.reply_markup).toEqual(keyboard);
+  });
+});
+
+describe("renderIndexHtml", () => {
+  const TEMPLATE = `<button title="default ({{DEFAULT_ENGINE_LABEL}})">●</button>`;
+
+  test("substitutes the placeholder with the operator label", () => {
+    expect(renderIndexHtml(TEMPLATE, "ollama")).toBe(
+      `<button title="default (ollama)">●</button>`,
+    );
+  });
+
+  test("HTML-escapes the label so it can't break out of the title attr", () => {
+    expect(renderIndexHtml(TEMPLATE, 'evil"><script>alert(1)</script>')).not.toContain(
+      "<script>alert(1)</script>",
+    );
+  });
+
+  test("replaces every occurrence (replaceAll, not replace)", () => {
+    const t = `a:{{DEFAULT_ENGINE_LABEL}} b:{{DEFAULT_ENGINE_LABEL}}`;
+    expect(renderIndexHtml(t, "x")).toBe("a:x b:x");
+  });
+
+  test("leaves text alone when the placeholder is absent", () => {
+    expect(renderIndexHtml("<html>plain</html>", "ollama")).toBe("<html>plain</html>");
   });
 });

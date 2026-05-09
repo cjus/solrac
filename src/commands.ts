@@ -220,10 +220,20 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
   }
 
   if (name === "context") {
-    // Same shape as /compact: single tier, no `all`. /context shows the
-    // estimated context-window size for ONE tier at a time; rendering both
-    // would be cluttered and most users default to primary anyway.
-    if (argRaw === "") return { kind: "run", cmd: { kind: "context", tier: "primary" } };
+    // PR-B: no-arg → reject. Pre-PR-B defaulted to primary because Claude was
+    // the default engine; post-inversion most users haven't used a Claude
+    // session, so a silent `tier: "primary"` would render "context: empty"
+    // and look broken. Make the contract explicit; Ollama has no SDK session
+    // to inspect.
+    if (argRaw === "") {
+      return {
+        kind: "run",
+        cmd: {
+          kind: "unknown",
+          raw: `${prefix}context (specify @|! — Ollama has no SDK session)`,
+        },
+      };
+    }
     const tierC = TIER_ARG_MAP[argRaw.toLowerCase()];
     if (tierC === undefined || tierC === "all") {
       return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}context ${argRaw}` } };
@@ -231,10 +241,19 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
     return { kind: "run", cmd: { kind: "context", tier: tierC } };
   }
 
-  // /compact — `all` is invalid for compact (compacting both tiers in one
-  // command is two real Claude calls and surprising; require explicit
-  // `/compact !` for secondary).
-  if (argRaw === "") return { kind: "run", cmd: { kind: "compact", tier: "primary" } };
+  // /compact — `all` is invalid (compacting both tiers in one command is two
+  // real Claude calls and surprising). PR-B: no-arg → reject for the same
+  // reason as /context above (silent `primary` default would summarize an
+  // empty session post-inversion). Operators must specify `@` or `!`.
+  if (argRaw === "") {
+    return {
+      kind: "run",
+      cmd: {
+        kind: "unknown",
+        raw: `${prefix}compact (specify @|! — Ollama has no SDK session to summarize)`,
+      },
+    };
+  }
   const tier = TIER_ARG_MAP[argRaw.toLowerCase()];
   if (tier === undefined || tier === "all") {
     return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}compact ${argRaw}` } };
@@ -268,6 +287,11 @@ export interface RunCommandDeps {
   // are disabled. `/help` enumerates loaded skills; the parser dispatches to
   // them by name.
   skillRegistry: SkillRegistry;
+  // PR-B — `/help` renders the engine section dynamically from these two
+  // fields so the card matches the deploy. Static text would lie in three
+  // of four config combinations (default-Ollama vs default-Claude × tools on/off).
+  defaultEngine: "ollama" | "primary" | "secondary";
+  ollamaToolsEnabled: boolean;
 }
 
 const COMPACT_SOURCE_LIMIT = 50;
@@ -751,9 +775,16 @@ export function renderStatusMarkdown(
   const oneHourAgo = now - 60 * 60 * 1000;
   const oneDayAgo = now - 24 * 60 * 60 * 1000;
 
-  const primaryLine = renderTierLineMarkdown(deps, chatId, "primary", session, now);
-  const secondaryLine = renderTierLineMarkdown(deps, chatId, "secondary", session, now);
+  // PR-B — only render Claude session lines when a session actually exists.
+  // Post-inversion most chats default to Ollama and have no Claude session;
+  // showing "primary session: *none*" twice is a wall of nothing. Suppress
+  // the line entirely when the session is null.
+  const primaryLine = renderTierLineMarkdownIfPresent(deps, chatId, "primary", session, now);
+  const secondaryLine = renderTierLineMarkdownIfPresent(deps, chatId, "secondary", session, now);
   const summaryLine = renderSummaryLineMarkdown(session);
+  // PR-B — Ollama activity tally. Engine prefix `ollama:%` matches every
+  // model variant the audit row tags it with (`ollama:gemma4:e4b`, etc).
+  const ollamaTurns24h = deps.db.countChatTurnsForEngineSince(chatId, "ollama:%", oneDayAgo);
 
   const chatSpend1h = deps.db.sumChatCostSince(chatId, oneHourAgo);
   const chatSpend24h = deps.db.sumChatCostSince(chatId, oneDayAgo);
@@ -762,16 +793,22 @@ export function renderStatusMarkdown(
   const snap = deps.getQueueSnapshot();
   const uptimeSec = (now - deps.startedAt) / 1000;
 
+  const chatLines: string[] = [];
+  if (primaryLine !== null) chatLines.push(`- primary session: ${primaryLine}`);
+  if (secondaryLine !== null) chatLines.push(`- secondary session: ${secondaryLine}`);
+  if (summaryLine !== null) chatLines.push(`- pending summary: ${summaryLine}`);
+  if (ollamaTurns24h > 0) {
+    chatLines.push(`- ollama turns (24h): ${ollamaTurns24h}`);
+  }
+  chatLines.push(`- spent (1h): $${chatSpend1h.toFixed(4)} / $${deps.hourlyCostCapUsd.toFixed(2)}`);
+  chatLines.push(`- spent (24h): $${chatSpend24h.toFixed(4)}`);
+
   return [
     "## 📊 Solrac status",
     "",
     "**This chat**",
     "",
-    `- primary session: ${primaryLine}`,
-    `- secondary session: ${secondaryLine}`,
-    `- pending summary: ${summaryLine}`,
-    `- spent (1h): $${chatSpend1h.toFixed(4)} / $${deps.hourlyCostCapUsd.toFixed(2)}`,
-    `- spent (24h): $${chatSpend24h.toFixed(4)}`,
+    ...chatLines,
     "",
     "**Global**",
     "",
@@ -781,19 +818,21 @@ export function renderStatusMarkdown(
   ].join("\n");
 }
 
-function renderTierLineMarkdown(
+// PR-B — null when the tier has no session id (post-inversion most chats
+// fall here for both tiers). Caller suppresses the bullet entirely when null.
+function renderTierLineMarkdownIfPresent(
   deps: Pick<RunCommandDeps, "db">,
   chatId: number,
   tier: SessionTier,
   session: ReturnType<SessionStore["getSession"]>,
   now: number,
-): string {
+): string | null {
   const sessionId = !session
     ? null
     : tier === "primary"
       ? session.primarySessionId
       : session.secondarySessionId;
-  if (sessionId === null) return "*none*";
+  if (sessionId === null) return null;
   const enginePrefix = `claude:${tier}:%`;
   const count = deps.db.countChatTurnsForEngine(chatId, enginePrefix);
   const lastAt = deps.db.lastSuccessfulTurnAt(chatId, enginePrefix);
@@ -802,12 +841,15 @@ function renderTierLineMarkdown(
   return `\`${idShort}\` (${count} turn${count === 1 ? "" : "s"}${ageStr})`;
 }
 
-function renderSummaryLineMarkdown(session: ReturnType<SessionStore["getSession"]>): string {
-  if (!session) return "*none*";
+// PR-B — null when no pending summary exists; caller suppresses the bullet.
+function renderSummaryLineMarkdown(
+  session: ReturnType<SessionStore["getSession"]>,
+): string | null {
+  if (!session) return null;
   const have: string[] = [];
   if (session.primarySummary) have.push("primary");
   if (session.secondarySummary) have.push("secondary");
-  if (have.length === 0) return "*none*";
+  if (have.length === 0) return null;
   return have.join(", ");
 }
 
@@ -936,7 +978,10 @@ async function runHelp(
   msg: Message,
   updateId: number,
 ): Promise<void> {
-  const md = renderHelpMarkdown(deps.skillRegistry);
+  const md = renderHelpMarkdown(deps.skillRegistry, {
+    defaultEngine: deps.defaultEngine,
+    ollamaToolsEnabled: deps.ollamaToolsEnabled,
+  });
   // Authored once in markdown, derived to Telegram-safe HTML for the bot
   // path. The web transport uses `markdownSource` directly so the browser
   // gets full headers/lists/links rendering.
@@ -944,20 +989,40 @@ async function runHelp(
   writeSystemAudit(deps, msg, updateId, "help_shown", "ok");
 }
 
-const HELP_BASE_MD = [
-  "## 🤖 Solrac help",
-  "",
-  "**Engines** (first character of your message):",
-  "",
-  "- plain text or `@` → primary Claude (Sonnet)",
-  "- `!` → secondary Claude (Opus, costs more)",
-  "- `>` → local Ollama (free, no tools)",
-  "",
+// PR-B — engine section reads `defaultEngine` + `ollamaToolsEnabled` and
+// renders one of the §3c-matrix-shaped descriptions. Static text would lie
+// in three of four deploys (default-Claude vs default-Ollama, tools on/off);
+// the dynamic render is one config-read per `/help` call which is free.
+function renderEngineSection(opts: {
+  defaultEngine: "ollama" | "primary" | "secondary";
+  ollamaToolsEnabled: boolean;
+}): string[] {
+  const lines: string[] = ["**Engines** (first character of your message):", ""];
+  if (opts.defaultEngine === "ollama") {
+    const ollamaDesc = opts.ollamaToolsEnabled
+      ? "local Ollama (free, with operator-authored tools)"
+      : "local Ollama (free, no tools)";
+    lines.push(`- plain text → ${ollamaDesc} *(default)*`);
+    lines.push("- `@` → primary Claude (Sonnet) — heavier reasoning");
+    lines.push("- `!` → secondary Claude (Opus) — heaviest reasoning, costs more");
+  } else {
+    const cheapTier =
+      opts.defaultEngine === "primary"
+        ? "primary Claude (Sonnet)"
+        : "secondary Claude (Opus)";
+    lines.push(`- plain text → ${cheapTier} *(default)*`);
+    lines.push("- `@` → primary Claude (Sonnet)");
+    lines.push("- `!` → secondary Claude (Opus, costs more)");
+  }
+  return lines;
+}
+
+const HELP_COMMANDS_MD = [
   "**Commands** (type `/cmd` for autocomplete, or `:cmd`)",
   "",
   "- **clear** `[primary|secondary|all]` — drop session state. Default: all.",
-  "- **compact** `[primary|secondary]` — summarize and restart session. Costs one Claude turn. Default: primary.",
-  "- **context** `[primary|secondary]` — show context-window size in bytes + tokens. Default: primary.",
+  "- **compact** `@|!` — summarize and restart Claude session for that tier. Costs one Claude turn.",
+  "- **context** `@|!` — show context-window size in bytes + tokens for that tier.",
   "- **help** — this card.",
   "- **status** — show session and spend snapshot for this chat.",
   "",
@@ -970,13 +1035,20 @@ const HELP_BASE_MD = [
 ].join("\n");
 
 // Render `/help` in markdown including operator-defined skills if any are
-// loaded. Static commands stay verbatim so the help card is grep-stable
-// across deployments without skills; the skills section only appears when
-// present. The Telegram path runs this through `mdToTelegramHtml`; the web
-// transport renders it with `marked` in the browser.
-export function renderHelpMarkdown(skills: SkillRegistry): string {
-  if (skills.size() === 0) return HELP_BASE_MD;
-  const lines = [HELP_BASE_MD, "", "**Skills**", ""];
+// loaded. Engine section is dynamic per-deploy; commands and customization
+// sections are stable. The Telegram path runs this through
+// `mdToTelegramHtml`; the web transport renders it with `marked` in the
+// browser.
+export function renderHelpMarkdown(
+  skills: SkillRegistry,
+  opts: {
+    defaultEngine: "ollama" | "primary" | "secondary";
+    ollamaToolsEnabled: boolean;
+  },
+): string {
+  const head = ["## 🤖 Solrac help", "", ...renderEngineSection(opts), "", HELP_COMMANDS_MD];
+  if (skills.size() === 0) return head.join("\n");
+  const lines = [head.join("\n"), "", "**Skills**", ""];
   // Sort by name for stable output across runs (registry insertion order is
   // filesystem-dependent).
   const sorted = [...skills.all].sort((a, b) => a.name.localeCompare(b.name));

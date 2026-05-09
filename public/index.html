@@ -30,9 +30,9 @@
     <ol id="messages" class="messages" aria-live="polite"></ol>
     <form id="composer" class="composer">
       <div class="engine-pill" role="group" aria-label="engine">
-        <button type="button" class="engine-opt" data-prefix="" title="primary (default)">●</button>
-        <button type="button" class="engine-opt" data-prefix="!" title="secondary (Opus)">!</button>
-        <button type="button" class="engine-opt" data-prefix=">" title="ollama (local)">&gt;</button>
+        <button type="button" class="engine-opt" data-prefix="" title="default ({{DEFAULT_ENGINE_LABEL}})">●</button>
+        <button type="button" class="engine-opt" data-prefix="@" title="primary Claude (Sonnet)">@</button>
+        <button type="button" class="engine-opt" data-prefix="!" title="secondary Claude (Opus)">!</button>
       </div>
       <textarea id="composer-text" rows="1" placeholder="message solrac…" autofocus></textarea>
       <button type="submit" id="send-btn" title="send (Enter)">↵</button>

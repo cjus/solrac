@@ -68,72 +68,85 @@ The footer reports turn count and cost in USD.
 
 ## Engine routing (prefix table)
 
-The first non-whitespace character of your message picks the engine:
+The first non-whitespace character of your message picks the engine. **PR-B
+inverted the default**: Anthropic burn happens only on a deliberate `@` or
+`!`; everything else stays local and free.
 
 | Prefix | Engine | Default model | Use when |
 |--------|--------|---------------|----------|
-| (none) | Primary Claude | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | The cheap default. Sonnet handles 90 % of turns at ~⅕ of Opus's cost. |
-| `@` | Primary Claude (explicit) | same as above | When you want to spell out "this is a primary turn" — useful in shared chats. |
-| `!` | Secondary Claude (escalate) | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | When the task needs Opus-level reasoning. Costs more per turn. Mnemonic: `!` = "important". |
-| `>` | Local Ollama | `OLLAMA_MODEL` (must be set) | Casual chat, offline / privacy-sensitive prompts, or when Anthropic is unreachable. |
+| (none) | **Default** (per `SOLRAC_DEFAULT_ENGINE`, ships as Ollama) | `OLLAMA_MODEL` (recommended `gemma4:e4b`) | The free default. Local model handles casual chat + tool-driven work via integrations. |
+| `@` | Primary Claude — escalate | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | When the task needs Sonnet-level reasoning, file ops, or the SDK's preset tools. Costs $$$. |
+| `!` | Secondary Claude — heaviest | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | When Sonnet isn't enough. Costs $$$$. Mnemonic: `!` = "important / hardest". |
 
-Examples:
+Examples (with the recommended default `SOLRAC_DEFAULT_ENGINE=ollama`):
 
 ```
-hello                          → primary Sonnet
-@hello                         → primary Sonnet (explicit)
-!hard architectural question   → secondary Opus
-> what's the capital of france? → local Ollama
+hello                          → local Ollama (default)
+what's the capital of france?  → local Ollama (default)
+@dive deep into this codebase  → primary Sonnet (escalate)
+!hard architectural question   → secondary Opus (heaviest)
 ```
 
-**Cross-engine context.** All three engines share the same conversation thread for a chat: switching tiers mid-conversation injects an "out-of-band" block of recent other-engine turns into the next prompt so each model sees what the user has been discussing. You can switch freely.
+The `>` prefix was **removed in PR-B**. A leading `>` is now literal user
+text routed to the default engine like any other message.
 
-The `!` / `@` / `>` and one optional space are stripped from the start of the message. To send a literal `!` / `@` / `>` as the first character of your prompt, double it (`!!literal` produces `!literal`).
+**Escalation.** Switch tiers mid-conversation freely. All three engines share
+the same audit-table thread for a chat; the bot prepends the other tier's
+recent turns as an "out-of-band" block so the next message picks up the
+thread regardless of which engine ran the prior turn.
 
-### Primary vs secondary Claude
+The `@` / `!` and one optional space are stripped from the start of the
+message. To send a literal `@` or `!` as the first character of your prompt,
+double it (`!!literal` produces `!literal`).
 
-Both tiers run through the same SDK preset (`claude_code`), the same tools, the same `canUseTool` policy, and the same `<untrusted-content>` clause. Only the model id differs:
-- Primary defaults to Sonnet — fast, cheap, good for most things.
-- Secondary defaults to Opus — slower, ~5× pricier per token, deeper reasoning.
+### Escalation (when to reach for Claude)
 
-Each tier keeps its own SDK session id, so prompt caching survives across same-tier turns. When you switch from primary to secondary (or vice versa), the new tier doesn't share the SDK session — but the bot prepends the other tier's recent turns as out-of-band context so it picks up the thread anyway.
+Reach for `@` (Sonnet) when:
+- The task needs structured tool use beyond the operator's integrations (file edits, web fetches, complex shell).
+- You want strong code reasoning or multi-step planning the local model can't sustain.
+- The conversation needs a long context window the local model truncates.
 
-Failure modes specific to Claude tiers:
+Reach for `!` (Opus) when:
+- `@` already responded but missed the nuance.
+- You're doing architecture review, hard math, or anything where extra cost is justified by extra correctness.
+
+Stay on the default (Ollama) when:
+- The question is casual / one-shot / self-contained.
+- The operator has integrations the local model can call (`OLLAMA_TOOLS_ENABLED=true`).
+- You want zero Anthropic burn.
+
+Both Claude tiers run through the same SDK preset (`claude_code`), the same
+tools, the same `canUseTool` policy, and the same `<untrusted-content>`
+clause. Only the model id differs. Each tier keeps its own SDK session id, so
+prompt caching survives across same-tier turns.
+
+### Default engine details
+
+The default-engine identity is server-resolved from `SOLRAC_DEFAULT_ENGINE`:
+
+| `SOLRAC_DEFAULT_ENGINE` | What no-prefix routes to | Capability note tone |
+|---|---|---|
+| `ollama` (default) | Local Ollama (`OLLAMA_MODEL`) | "you are the default chat engine; tools when `OLLAMA_TOOLS_ENABLED=true`; escalate via `@` / `!`" |
+| `primary` | Anthropic Sonnet | Same as `@` Sonnet (Claude-only deploys) |
+| `secondary` | Anthropic Opus | Same as `!` Opus (Claude-only deploys) |
+
+**Default-Ollama details:**
+- **Free** — `cost_usd = 0`; the per-chat and global cost caps don't apply.
+- **Footer** — `<i>✅ ollama:gemma4:e4b · 1.2s</i>` (or `· N tools · 1.2s` when tools fired).
+- **Tools** — when `OLLAMA_TOOLS_ENABLED=true` and integrations are loaded, the local model can call `mcp__solrac__*` tools the same way Claude does.
+- **Cross-engine context** — sees prior Claude turns (both tiers).
+
+**Default-Ollama failure modes:**
 
 | Condition | What you see |
 |-----------|--------------|
-| `@` or `!` alone with no payload | `usage: @<prompt> — sends to primary Claude (model: <model>)` (or `!<prompt> — secondary Claude`) |
-
-### Routing to local Ollama (`>` prefix)
-
-If `OLLAMA_ENABLED=true` is set in the deployment, prefixing a message with `>` routes it to a local Ollama model instead of Claude. Useful for casual chat where Claude's tool-using horsepower is overkill, or when you want a prompt that never leaves the box.
-
-> `> what's the capital of france?`
->
-> `>summarize what we just discussed in two bullets`
-
-What's the same as the Claude path:
-- Allowlist gating, denial throttle, queue, per-chat sequencing.
-- Streaming UX: same 🦙 stub → throttled edits → final-edit footer.
-- Audit row written for each turn.
-- **Cross-engine context** — sees prior Claude turns (both tiers) the same way Claude tiers see prior Ollama turns.
-
-What's different:
-- **No tools** — pure inference. The local model can't read files, run shell, or call APIs.
-- **Free** — `cost_usd = 0` in the audit row; the per-chat and global cost caps don't apply.
-- **Footer** — `<i>✅ ollama:llama3.2 · 1.2s</i>` shows model + wall time instead of turns + dollars.
-
-Failure modes:
-
-| Condition | What you see |
-|-----------|--------------|
-| `OLLAMA_ENABLED=false` and you sent `> ...` | "ollama disabled in this deployment" |
-| `>` alone with no payload | `usage: > <prompt> — sends to local Ollama (model: <model>)` |
-| Ollama not running | `❌ ollama unreachable: http://localhost:11434` |
+| `@` / `!` alone with no payload | `usage: @<prompt> — sends to primary Claude (model: <model>)` |
+| Ollama not running | `❌ ollama unreachable: http://localhost:11434` (boot also logs `ollama.boot_health_failed`) |
 | Model not pulled on the host | `❌ ollama model not found: <model> — pull with 'ollama pull <model>' on the host` |
+| Tool loop didn't converge | `⚠️ stopped after N tool iterations` |
 | Inference exceeds `OLLAMA_TIMEOUT_MS` | `❌ ollama timed out after 60s` |
 
-See [CONFIG.md](./CONFIG.md) for the full env list (`OLLAMA_ENABLED`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT_MS`, `OLLAMA_HISTORY_LIMIT`).
+See [CONFIG.md](./CONFIG.md) for the full env list.
 
 ## Slash commands
 
@@ -142,10 +155,10 @@ Slash commands give you control over conversation context and visibility into sp
 | Command | Default | Behavior | Cost |
 |---------|---------|----------|------|
 | `/clear [primary\|secondary\|all]` | `all` | Drop SDK session id and any pending compaction summary for the targeted tier(s). Next turn starts fresh. | Free |
-| `/compact [primary\|secondary]` | `primary` | Run a one-shot Claude turn that summarizes this tier's recent conversation, store the summary, drop the SDK session id. The summary is prepended into a fresh SDK session on the next user turn for that tier. | One Claude turn (Sonnet ≈ $0.001-0.005, Opus ≈ $0.005-0.025) |
-| `/context [primary\|secondary]` | `primary` | Show audit-table footprint (bytes), turn count, last turn's token breakdown (fresh / cache read / cache create / output), and estimated next-turn replay size. | Free |
-| `/help` | — | Engine prefix table + command reference. | Free |
-| `/status` | — | Per-chat session/spend snapshot + global rollup + queue depth + uptime. | Free |
+| `/compact @\|!` | **none** (PR-B: explicit) | Run a one-shot Claude turn that summarizes this tier's recent conversation, store the summary, drop the SDK session id. The summary is prepended into a fresh SDK session on the next user turn for that tier. **Bare `/compact` rejects** — Ollama has no SDK session to summarize. | One Claude turn (Sonnet ≈ $0.001-0.005, Opus ≈ $0.005-0.025) |
+| `/context @\|!` | **none** (PR-B: explicit) | Show audit-table footprint (bytes), turn count, last turn's token breakdown (fresh / cache read / cache create / output), and estimated next-turn replay size. **Bare `/context` rejects** for the same reason as `/compact`. | Free |
+| `/help` | — | Engine prefix table + command reference. Engine section is dynamic (renders the deploy's actual default). | Free |
+| `/status` | — | Per-chat session/spend snapshot + global rollup + queue depth + uptime. **PR-B**: Claude session lines render only when a session exists; an `ollama turns (24h): N` bullet is added when applicable. | Free |
 
 ### Tier args
 
@@ -243,7 +256,7 @@ HTML comments inside `SOLRAC.md` (`<!-- ... -->`) are stripped before the file s
 
 ### Tier independence
 
-Both files apply to **all** engines: primary Claude (Sonnet, no prefix or `!`), secondary Claude (Opus, `@`), and Ollama (`>`). The only engine-specific text is a single capability sentence Solrac appends in code ("you have tools, gated by cap" vs "you have no tools"), so your `SOUL.md` doesn't need conditional sections.
+Both files apply to **all** engines: the default (Ollama unless overridden), primary Claude (`@`, Sonnet), and secondary Claude (`!`, Opus). The only engine-specific text is a single capability sentence Solrac appends in code (the §3c matrix in `agent.ts::buildClaudeCapabilityNote` and `ollama.ts::buildOllamaCapabilityNote`), so your `SOUL.md` doesn't need conditional sections.
 
 ### Re-read cadence (`SOLRAC.md`)
 
@@ -344,6 +357,8 @@ This means skills are best for:
 - **Quick lookups** that don't require fetching anything (Claude's training data only).
 
 If you need tool use, file an issue — that's a v1.1 conversation.
+
+**Skills always run on Claude.** The `tier:` frontmatter accepts `primary` (default) or `secondary` only. Skills are **not affected by `SOLRAC_DEFAULT_ENGINE`** — even with the inversion default Ollama, a `/<skill>` invocation always hits Claude. If you want a free / local-Ollama-backed shortcut, just type the prompt without a slash so it routes via the default engine.
 
 ### Cost & caps
 

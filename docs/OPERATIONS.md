@@ -349,7 +349,7 @@ Canonical event names:
 - `agent.oob_ollama_injected` — cross-engine bridge injected N Ollama turns into the user prompt (only fires when there are out-of-band Ollama exchanges since the last successful Claude turn)
 - `agent.done` — per-turn summary (cost, turns, isError)
 
-### Ollama (`>` prefix path)
+### Ollama (default engine path post PR-B)
 - `ollama.stub_send_failed` — couldn't send the 🦙 stub
 - `ollama.bad_frame` — NDJSON parse failure on a stream chunk (logged, line skipped, stream continues)
 - `ollama.fetch_failed` — fetch to `OLLAMA_URL` threw (unreachable, abort/timeout, etc.)
@@ -428,7 +428,9 @@ ORDER BY spent DESC;
 
 ### Engine breakdown for a chat
 
-`audit.model` distinguishes engines: `'claude'` for the SDK path, `'ollama:<name>'` for the `>` prefix path, `'system'` for queue-full / denial rows that predate engine selection.
+`audit.model` distinguishes engines: `'claude:primary:<modelId>'` / `'claude:secondary:<modelId>'` for the SDK paths (`@`/`!` prefixes), `'ollama:<name>'` for the local Ollama path (no-prefix when `SOLRAC_DEFAULT_ENGINE=ollama`), `'system'` for queue-full / denial rows that predate engine selection.
+
+**Note on `spend24hUsd` and `/stats`:** Anthropic burn only. Ollama turns are $0 and don't appear in spend metrics. To count Ollama activity, query `audit.model LIKE 'ollama:%'` directly.
 
 ```sql
 SELECT model, COUNT(*) AS turns,

@@ -216,124 +216,121 @@ describe("gateUpdate", () => {
 });
 
 describe("parseEnginePrefix", () => {
-  test("no-prefix → primary, explicit: false, untrimmed prompt", () => {
-    expect(parseEnginePrefix("hello world")).toEqual({
+  test("no-prefix → defaultEngine, explicit: false, untrimmed prompt", () => {
+    // PR-B: no-prefix routes to whichever engine the operator picked as default.
+    expect(parseEnginePrefix("hello world", "ollama")).toEqual({
+      engine: "ollama",
+      explicit: false,
+      prompt: "hello world",
+    });
+    expect(parseEnginePrefix("hello world", "primary")).toEqual({
       engine: "primary",
       explicit: false,
       prompt: "hello world",
     });
-    expect(parseEnginePrefix("")).toEqual({ engine: "primary", explicit: false, prompt: "" });
-    expect(parseEnginePrefix("   ")).toEqual({ engine: "primary", explicit: false, prompt: "   " });
+    expect(parseEnginePrefix("hello world", "secondary")).toEqual({
+      engine: "secondary",
+      explicit: false,
+      prompt: "hello world",
+    });
+    expect(parseEnginePrefix("", "ollama")).toEqual({ engine: "ollama", explicit: false, prompt: "" });
+    expect(parseEnginePrefix("   ", "primary")).toEqual({ engine: "primary", explicit: false, prompt: "   " });
   });
 
-  test("`>` routes to ollama (Step 11 behaviour preserved)", () => {
-    expect(parseEnginePrefix("> hello")).toEqual({
-      engine: "ollama",
-      explicit: true,
-      prompt: "hello",
-    });
-    expect(parseEnginePrefix(">hello")).toEqual({
-      engine: "ollama",
-      explicit: true,
-      prompt: "hello",
-    });
-  });
-
-  test("`@` routes to primary explicitly", () => {
-    expect(parseEnginePrefix("@ hello")).toEqual({
+  test("`@` routes to primary explicitly regardless of default", () => {
+    expect(parseEnginePrefix("@ hello", "ollama")).toEqual({
       engine: "primary",
       explicit: true,
       prompt: "hello",
     });
-    expect(parseEnginePrefix("@hello")).toEqual({
+    expect(parseEnginePrefix("@hello", "primary")).toEqual({
       engine: "primary",
       explicit: true,
       prompt: "hello",
     });
   });
 
-  test("`!` routes to secondary (escalate)", () => {
-    expect(parseEnginePrefix("! hard problem")).toEqual({
+  test("`!` routes to secondary regardless of default", () => {
+    expect(parseEnginePrefix("! hard problem", "ollama")).toEqual({
       engine: "secondary",
       explicit: true,
       prompt: "hard problem",
     });
-    expect(parseEnginePrefix("!hard problem")).toEqual({
+    expect(parseEnginePrefix("!hard problem", "primary")).toEqual({
       engine: "secondary",
       explicit: true,
       prompt: "hard problem",
+    });
+  });
+
+  test("`>` is no longer a prefix — it falls through as literal text to default", () => {
+    // PR-B: removed the `>` prefix entirely. A leading `>` is preserved as
+    // user text and routed via no-prefix → defaultEngine.
+    expect(parseEnginePrefix(">hello", "ollama")).toEqual({
+      engine: "ollama",
+      explicit: false,
+      prompt: ">hello",
+    });
+    expect(parseEnginePrefix("> hello", "ollama")).toEqual({
+      engine: "ollama",
+      explicit: false,
+      prompt: "> hello",
+    });
+    expect(parseEnginePrefix(">hello", "primary")).toEqual({
+      engine: "primary",
+      explicit: false,
+      prompt: ">hello",
     });
   });
 
   test("empty payload after explicit prefix → prompt: \"\"", () => {
-    expect(parseEnginePrefix("@")).toEqual({ engine: "primary", explicit: true, prompt: "" });
-    expect(parseEnginePrefix("!")).toEqual({ engine: "secondary", explicit: true, prompt: "" });
-    expect(parseEnginePrefix(">")).toEqual({ engine: "ollama", explicit: true, prompt: "" });
-    expect(parseEnginePrefix("@  ")).toEqual({ engine: "primary", explicit: true, prompt: "" });
-    expect(parseEnginePrefix("!\t ")).toEqual({ engine: "secondary", explicit: true, prompt: "" });
+    expect(parseEnginePrefix("@", "ollama")).toEqual({ engine: "primary", explicit: true, prompt: "" });
+    expect(parseEnginePrefix("!", "ollama")).toEqual({ engine: "secondary", explicit: true, prompt: "" });
+    expect(parseEnginePrefix("@  ", "primary")).toEqual({ engine: "primary", explicit: true, prompt: "" });
+    expect(parseEnginePrefix("!\t ", "primary")).toEqual({ engine: "secondary", explicit: true, prompt: "" });
   });
 
   test("leading whitespace before any prefix is tolerated", () => {
-    expect(parseEnginePrefix("  @ hello")).toEqual({
+    expect(parseEnginePrefix("  @ hello", "ollama")).toEqual({
       engine: "primary",
       explicit: true,
       prompt: "hello",
     });
-    expect(parseEnginePrefix("\t! hello")).toEqual({
+    expect(parseEnginePrefix("\t! hello", "ollama")).toEqual({
       engine: "secondary",
-      explicit: true,
-      prompt: "hello",
-    });
-    expect(parseEnginePrefix("  > hello")).toEqual({
-      engine: "ollama",
       explicit: true,
       prompt: "hello",
     });
   });
 
   test("only one prefix char consumed; doubles become literal residue", () => {
-    expect(parseEnginePrefix("@@literal")).toEqual({
+    expect(parseEnginePrefix("@@literal", "ollama")).toEqual({
       engine: "primary",
       explicit: true,
       prompt: "@literal",
     });
-    expect(parseEnginePrefix("!!literal")).toEqual({
+    expect(parseEnginePrefix("!!literal", "ollama")).toEqual({
       engine: "secondary",
       explicit: true,
       prompt: "!literal",
     });
-    expect(parseEnginePrefix(">>foo")).toEqual({
-      engine: "ollama",
-      explicit: true,
-      prompt: ">foo",
-    });
-    expect(parseEnginePrefix(">> foo")).toEqual({
-      engine: "ollama",
-      explicit: true,
-      prompt: "> foo",
-    });
   });
 
   test("mixed prefixes — first one wins, the rest are residue", () => {
-    expect(parseEnginePrefix("@!mixed")).toEqual({
+    expect(parseEnginePrefix("@!mixed", "ollama")).toEqual({
       engine: "primary",
       explicit: true,
       prompt: "!mixed",
     });
-    expect(parseEnginePrefix("!@flipped")).toEqual({
+    expect(parseEnginePrefix("!@flipped", "ollama")).toEqual({
       engine: "secondary",
       explicit: true,
       prompt: "@flipped",
     });
-    expect(parseEnginePrefix(">!ollama-bang")).toEqual({
-      engine: "ollama",
-      explicit: true,
-      prompt: "!ollama-bang",
-    });
   });
 
   test("multiline preserved after the prefix", () => {
-    expect(parseEnginePrefix("! line one\nline two")).toEqual({
+    expect(parseEnginePrefix("! line one\nline two", "ollama")).toEqual({
       engine: "secondary",
       explicit: true,
       prompt: "line one\nline two",
@@ -341,23 +338,23 @@ describe("parseEnginePrefix", () => {
   });
 
   test("unicode preserved", () => {
-    expect(parseEnginePrefix("> 你好 🦙")).toEqual({
-      engine: "ollama",
+    expect(parseEnginePrefix("@ 你好 🦙", "ollama")).toEqual({
+      engine: "primary",
       explicit: true,
       prompt: "你好 🦙",
     });
   });
 
   test("trailing whitespace trimmed only on explicit prefix residue", () => {
-    expect(parseEnginePrefix("! hello   ")).toEqual({
+    expect(parseEnginePrefix("! hello   ", "ollama")).toEqual({
       engine: "secondary",
       explicit: true,
       prompt: "hello",
     });
     // No-prefix preserves trailing whitespace so the agent sees the user's
     // text untouched; trimming is the runner's call.
-    expect(parseEnginePrefix("hello   ")).toEqual({
-      engine: "primary",
+    expect(parseEnginePrefix("hello   ", "ollama")).toEqual({
+      engine: "ollama",
       explicit: false,
       prompt: "hello   ",
     });
