@@ -120,6 +120,55 @@ describe("loadConfig — OLLAMA_ENABLED contract", () => {
   });
 });
 
+describe("loadConfig — OLLAMA_TOOLS_ENABLED contract", () => {
+  test("default: tools off, max iterations 8, timeout 60s", () => {
+    const cfg = loadConfig({ ...baseEnv });
+    expect(cfg.ollamaToolsEnabled).toBe(false);
+    expect(cfg.ollamaMaxToolIterations).toBe(8);
+    expect(cfg.ollamaTimeoutMs).toBe(60_000);
+  });
+
+  test("tools on without integrations throws actionable error", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        OLLAMA_TOOLS_ENABLED: "true",
+      }),
+    ).toThrow(/SOLRAC_INTEGRATIONS_ENABLED=true/);
+  });
+
+  test("tools on + integrations on passes; bumps default timeout to 120s", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      OLLAMA_TOOLS_ENABLED: "true",
+      SOLRAC_INTEGRATIONS_ENABLED: "true",
+    });
+    expect(cfg.ollamaToolsEnabled).toBe(true);
+    expect(cfg.integrationsEnabled).toBe(true);
+    expect(cfg.ollamaTimeoutMs).toBe(120_000);
+  });
+
+  test("explicit OLLAMA_TIMEOUT_MS wins over the tools-on default bump", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      OLLAMA_TOOLS_ENABLED: "true",
+      SOLRAC_INTEGRATIONS_ENABLED: "true",
+      OLLAMA_TIMEOUT_MS: "45000",
+    });
+    expect(cfg.ollamaTimeoutMs).toBe(45_000);
+  });
+
+  test("OLLAMA_MAX_TOOL_ITERATIONS override accepted", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      OLLAMA_TOOLS_ENABLED: "true",
+      SOLRAC_INTEGRATIONS_ENABLED: "true",
+      OLLAMA_MAX_TOOL_ITERATIONS: "12",
+    });
+    expect(cfg.ollamaMaxToolIterations).toBe(12);
+  });
+});
+
 describe("loadConfig — web UI", () => {
   test("default: webEnabled=false, defaults filled in", () => {
     const cfg = loadConfig({ ...baseEnv });
