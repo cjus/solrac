@@ -83,6 +83,17 @@ export interface Config {
   readonly ollamaModel: string | null;
   readonly ollamaTimeoutMs: number;
   readonly ollamaHistoryLimit: number;
+  // PR-A — Ollama tool-calling. When true (and `integrationsEnabled` is also
+  // true), the `>` engine path runs through `runToolLoop` instead of single-
+  // shot streaming, exposing the same `mcp__solrac__*` integration tools that
+  // Claude tiers see. Default false — tools-on is opt-in for v1. Boot fails
+  // loud if `ollamaToolsEnabled && !integrationsEnabled` (no tools to expose).
+  readonly ollamaToolsEnabled: boolean;
+  // Hard ceiling on tool-loop rounds per turn. 8 is enough for "fetch X then
+  // process it then format the answer" multi-step tool use without giving an
+  // infinite-loop bug too much rope. Loop detector bites earlier on duplicate
+  // calls.
+  readonly ollamaMaxToolIterations: number;
   // PNX-167.1 — operator-defined skills loaded from the filesystem at boot.
   // `skillsEnabled` is the master switch; `skillsDir` is resolved from cwd
   // so the same Solrac binary can ship to multiple operators each with their
@@ -230,12 +241,48 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (ollamaProtocol !== "http:" && ollamaProtocol !== "https:") {
     throw new Error(`OLLAMA_URL must use http:// or https://, got "${ollamaProtocol}//" in "${ollamaUrl}"`);
   }
-  const ollamaTimeoutMs = parsePositiveInt("OLLAMA_TIMEOUT_MS", env.OLLAMA_TIMEOUT_MS, 60_000);
+  // PR-A: tools-on adds tool-loop rounds (model + tool execution) on top of
+  // a single inference. A 60s ceiling that's fine for single-shot can be
+  // tight when one mid-loop confirm prompt eats up to 60s on its own —
+  // bump the default to 120s when tools are enabled. Operator override
+  // (any explicit `OLLAMA_TIMEOUT_MS`) wins regardless.
+  const ollamaToolsEnabled = parseBoolean(
+    "OLLAMA_TOOLS_ENABLED",
+    env.OLLAMA_TOOLS_ENABLED,
+    false,
+  );
+  const ollamaTimeoutDefault = ollamaToolsEnabled ? 120_000 : 60_000;
+  const ollamaTimeoutMs = parsePositiveInt(
+    "OLLAMA_TIMEOUT_MS",
+    env.OLLAMA_TIMEOUT_MS,
+    ollamaTimeoutDefault,
+  );
   const ollamaHistoryLimit = parsePositiveInt(
     "OLLAMA_HISTORY_LIMIT",
     env.OLLAMA_HISTORY_LIMIT,
     6,
   );
+  const ollamaMaxToolIterations = parsePositiveInt(
+    "OLLAMA_MAX_TOOL_ITERATIONS",
+    env.OLLAMA_MAX_TOOL_ITERATIONS,
+    8,
+  );
+  // Boot guard: tools-on with no integration source = nothing for the model
+  // to call. Fail loud at boot rather than silently shipping an empty
+  // `tools[]` to /api/chat (which would also work but waste tokens listing
+  // nothing).
+  const integrationsEnabled = parseBoolean(
+    "SOLRAC_INTEGRATIONS_ENABLED",
+    env.SOLRAC_INTEGRATIONS_ENABLED,
+    false,
+  );
+  if (ollamaToolsEnabled && !integrationsEnabled) {
+    throw new Error(
+      "OLLAMA_TOOLS_ENABLED=true requires SOLRAC_INTEGRATIONS_ENABLED=true; " +
+        "set SOLRAC_INTEGRATIONS_ENABLED=true to load tools, or " +
+        "OLLAMA_TOOLS_ENABLED=false to keep the single-shot Ollama path",
+    );
+  }
 
   const webEnabled = parseBoolean("SOLRAC_WEB_ENABLED", env.SOLRAC_WEB_ENABLED, false);
   const webPort = parsePositiveInt("SOLRAC_WEB_PORT", env.SOLRAC_WEB_PORT, 8080);
@@ -287,16 +334,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ollamaModel,
     ollamaTimeoutMs,
     ollamaHistoryLimit,
+    ollamaToolsEnabled,
+    ollamaMaxToolIterations,
     skillsEnabled: parseBoolean("SOLRAC_SKILLS_ENABLED", env.SOLRAC_SKILLS_ENABLED, false),
     skillsDir:
       env.SOLRAC_SKILLS_DIR && env.SOLRAC_SKILLS_DIR.trim() !== ""
         ? env.SOLRAC_SKILLS_DIR.trim()
         : "./skills",
-    integrationsEnabled: parseBoolean(
-      "SOLRAC_INTEGRATIONS_ENABLED",
-      env.SOLRAC_INTEGRATIONS_ENABLED,
-      false,
-    ),
+    integrationsEnabled,
     integrationsDir:
       env.SOLRAC_INTEGRATIONS_DIR && env.SOLRAC_INTEGRATIONS_DIR.trim() !== ""
         ? env.SOLRAC_INTEGRATIONS_DIR.trim()

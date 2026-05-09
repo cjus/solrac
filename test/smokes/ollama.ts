@@ -5,12 +5,22 @@
 //   2. Audit row finalizes correctly (model='ollama:<name>', cost_usd=0, tokens).
 //   3. History reconstruction (turn 2 sees turn 1's prompt+response in messages).
 //   4. Telegram render path (stub-then-edit) produces sensible final text.
+//   5. (PR-A) Tools-on path: a time_now tool call round-trips via runToolLoop,
+//      audit row has tool_calls populated. Skipped unless
+//      `OLLAMA_TOOLS_ENABLED=true` in env.
 //
 // Runs against http://localhost:11434 by default. Override via env:
 //   OLLAMA_URL=http://localhost:11434 OLLAMA_MODEL=gemma4:e4b npm run smoke:ollama
+//
+// To exercise the tools-on path:
+//   OLLAMA_TOOLS_ENABLED=true npm run smoke:ollama
 
 import type { Message } from "@grammyjs/types";
 import { runOllamaTurn } from "../../src/ollama.ts";
+import type { ConfirmationBroker } from "../../src/policy.ts";
+import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
+import timeIntegration from "../../src/integrations-builtin/time/index.ts";
+import { createIntegrationContext } from "../../src/integrations.ts";
 import type { TelegramClient } from "../../src/telegram.ts";
 import { openTestDb, reportAndExit, type Phase } from "./harness.ts";
 
@@ -241,6 +251,94 @@ async function main(): Promise<void> {
     actual: `last edit: ${truncate(lastEdit3, 120)}`,
     pass: lastEdit3.includes("❌") && lastEdit3.includes("ollama pull"),
   });
+
+  // ── Tools-on path (PR-A). Skipped unless `OLLAMA_TOOLS_ENABLED=true`. ──
+  if (process.env.OLLAMA_TOOLS_ENABLED === "true") {
+    // Load the built-in `time` integration the same way main.ts would.
+    const ctx = createIntegrationContext();
+    const timeMod = await timeIntegration(ctx);
+    const tools: ReadonlyArray<SdkMcpToolDefinition<any>> = timeMod.tools;
+    const toolTiers = new Map(
+      tools.map((t) => [t.name, timeMod.meta?.tier ?? "confirm"] as const),
+    );
+    // Stub broker — `time_now` is `auto` tier so this is never consulted; we
+    // wire one in to satisfy the OllamaRunDeps shape and to make the path
+    // work on the off chance the integration's tier changes.
+    const broker: Pick<ConfirmationBroker, "request"> = {
+      request: async () => "allow",
+    };
+
+    const tg4 = makeCapturedTg();
+    await runOllamaTurn(
+      {
+        ...deps,
+        tg: tg4,
+        toolEnabled: true,
+        tools,
+        toolTiers,
+        broker,
+        maxToolIterations: 4,
+      },
+      {
+        chatId: CHAT,
+        fromId: FROM,
+        updateId: 1004,
+        prompt:
+          "What is the current time in Tokyo? Use the time_now tool to get an accurate answer.",
+      },
+    );
+    const row4 = db.raw
+      .query(
+        "SELECT status, response, tool_calls, error_message, model FROM audit WHERE id = 4",
+      )
+      .get() as {
+      status: string;
+      response: string | null;
+      tool_calls: string | null;
+      error_message: string | null;
+      model: string;
+    };
+    phases.push({
+      name: "tools-on: audit row finalized status=ok",
+      expected: "status=ok",
+      actual: `status=${row4.status} error_message=${row4.error_message ?? ""}`,
+      pass: row4.status === "ok",
+    });
+    phases.push({
+      name: "tools-on: model column tagged ollama:<name>",
+      expected: `model=ollama:${MODEL}`,
+      actual: `model=${row4.model}`,
+      pass: row4.model === `ollama:${MODEL}`,
+    });
+    phases.push({
+      name: "tools-on: audit tool_calls JSON references time_now",
+      expected: "tool_calls JSON contains 'time_now'",
+      actual: `tool_calls=${truncate(row4.tool_calls ?? "null", 120)}`,
+      pass:
+        typeof row4.tool_calls === "string" &&
+        row4.tool_calls.includes("time_now"),
+    });
+    const lastEdit4 = tg4.edits[tg4.edits.length - 1]?.text ?? "";
+    phases.push({
+      name: "tools-on: final edit shows tools-aware footer",
+      expected: "footer matches /\\d+ tools · \\d+\\.\\ds/",
+      actual: `last edit ends with: …${lastEdit4.slice(-80)}`,
+      pass: /\d+ tools · \d+\.\ds/.test(lastEdit4),
+    });
+    phases.push({
+      name: "tools-on: assistant response references time/Tokyo",
+      expected: "response mentions time-of-day terms",
+      actual: `response.length=${row4.response?.length ?? 0}`,
+      pass:
+        typeof row4.response === "string" &&
+        /\d|time|tokyo|jst|jp/i.test(row4.response),
+    });
+  } else {
+    // eslint-disable-next-line no-console
+    console.log(
+      "tools-on smoke: skipped (OLLAMA_TOOLS_ENABLED!=true). Set the env to exercise.",
+    );
+  }
 
   // ── Print response samples for human eyeball ──────────────────────────────
   // eslint-disable-next-line no-console

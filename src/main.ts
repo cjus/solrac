@@ -68,6 +68,7 @@ import {
   createSdkMcpServer,
   type CanUseTool,
   type McpSdkServerConfigWithInstance,
+  type SdkMcpToolDefinition,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Update } from "@grammyjs/types";
 import { join } from "node:path";
@@ -520,6 +521,11 @@ async function main(): Promise<void> {
     // (`>` prefix) does NOT see integrations — see ollama.ts.
     let integrationsMcpServer: McpSdkServerConfigWithInstance | null = null;
     let integrationToolTiers: ReadonlyMap<string, "auto" | "confirm"> = new Map();
+    // PR-A — capture the tools array so the Ollama tools-on path can reuse
+    // the same in-process integration handlers. Stays empty (and the array
+    // reference is shared as `EMPTY_INTEGRATIONS_TOOLS`) when integrations
+    // are off so downstream `Array.isArray + length>0` checks work uniformly.
+    let integrationTools: ReadonlyArray<SdkMcpToolDefinition<any>> = [];
     if (config.integrationsEnabled) {
       const builtinDir = join(import.meta.dir, "integrations-builtin");
       const result = await loadIntegrations(
@@ -528,6 +534,7 @@ async function main(): Promise<void> {
       );
       logIntegrationLoadResult([builtinDir, config.integrationsDir], result);
       integrationToolTiers = result.toolTiers;
+      integrationTools = result.tools;
       if (result.tools.length > 0) {
         integrationsMcpServer = createSdkMcpServer({
           name: "solrac",
@@ -535,6 +542,16 @@ async function main(): Promise<void> {
           tools: [...result.tools],
         });
       }
+    }
+    // PR-A — boot warning: tools enabled but no integrations actually loaded.
+    // Operator probably forgot to drop something into `integrationsDir`, or
+    // a typo broke every module. Fail-soft (start anyway) but make the
+    // misconfiguration loud in the boot log.
+    if (config.ollamaToolsEnabled && integrationTools.length === 0) {
+      log.warn("ollama.tools_enabled_but_zero_loaded", {
+        integrationsDir: config.integrationsDir,
+        hint: "set SOLRAC_INTEGRATIONS_DIR or add modules under integrations-builtin/",
+      });
     }
     const createCanUseTool = ({ chatId, auditId }: { chatId: number; auditId: number }) => {
       const b = webBroker && chatId === config.webChatId ? webBroker : broker;
@@ -548,6 +565,15 @@ async function main(): Promise<void> {
     };
     // PLAN Step 11: Ollama deps are constructed once iff the feature is on.
     // When off, dispatch in makeRunTurn falls through to a "disabled" reply.
+    //
+    // PR-A — tool-loop wiring. When BOTH `ollamaToolsEnabled=true` AND we
+    // actually loaded integration tools, surface the tools surface + tier
+    // map + broker into the deps so `runOllamaTurn` dispatches through the
+    // tool-loop driver. When tools are off (or zero loaded), the same deps
+    // shape carries `toolEnabled: false` and the single-shot path runs as
+    // before.
+    const ollamaToolsActive =
+      config.ollamaToolsEnabled && integrationTools.length > 0;
     const ollamaDeps: OllamaRunDeps | null =
       config.ollamaEnabled && config.ollamaModel
         ? {
@@ -559,8 +585,25 @@ async function main(): Promise<void> {
             historyLimit: config.ollamaHistoryLimit,
             soul,
             instanceMdPath: solracMdPath,
+            toolEnabled: ollamaToolsActive,
+            tools: ollamaToolsActive ? integrationTools : undefined,
+            toolTiers: ollamaToolsActive ? integrationToolTiers : undefined,
+            broker: ollamaToolsActive ? broker : undefined,
+            maxToolIterations: config.ollamaMaxToolIterations,
           }
         : null;
+    if (ollamaDeps) {
+      log.info("ollama.boot", {
+        url: config.ollamaUrl,
+        model: config.ollamaModel,
+        toolsEnabled: ollamaToolsActive,
+        toolCount: ollamaToolsActive ? integrationTools.length : 0,
+        maxToolIterations: ollamaToolsActive
+          ? config.ollamaMaxToolIterations
+          : null,
+        timeoutMs: config.ollamaTimeoutMs,
+      });
+    }
     // PNX-167 — boot-time bot identity for `/cmd@<bot>` group-chat targeting.
     // Failure is non-fatal: we proceed with `botUsername=null`, which causes
     // `parseCommand` to accept plain commands and reject any `@bot` suffix
@@ -633,7 +676,17 @@ async function main(): Promise<void> {
         ...commandDeps,
         tg: webClient,
       };
-      webOllamaDeps = ollamaDeps ? { ...ollamaDeps, tg: webClient } : null;
+      // Ollama-on-web path needs the web broker (not the Telegram broker)
+      // so confirm prompts ride the SSE bus to the operator's browser
+      // session, not their Telegram chat. `tg` swap alone wasn't enough
+      // once the tools-on path started consulting `broker` for confirm UX.
+      webOllamaDeps = ollamaDeps
+        ? {
+            ...ollamaDeps,
+            tg: webClient,
+            broker: ollamaDeps.broker !== undefined ? webBroker! : undefined,
+          }
+        : null;
     }
 
     const tgRunTurn = makeRunTurn({

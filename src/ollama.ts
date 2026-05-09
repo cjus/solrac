@@ -93,11 +93,23 @@
  *   - main.ts::makeRunTurn — dispatcher between runAgent and runOllamaTurn
  */
 
+import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { SolracDb } from "./db.ts";
 import { readInstanceMd, wrapInstanceMd } from "./instance.ts";
+import type { IntegrationTier } from "./integrations.ts";
 import { log } from "./log.ts";
-import { truncateAuditPrompt } from "./policy.ts";
+import {
+  createLoopDetector,
+  truncateAuditPrompt,
+  type ConfirmationBroker,
+} from "./policy.ts";
 import { mdToTelegramHtml } from "./markdown.ts";
+import {
+  mcpToOllamaTools,
+  runToolLoop,
+  type OllamaMessage as ToolOllamaMessage,
+  type RunToolLoopRenderer,
+} from "./ollama-tools.ts";
 import { htmlEscapeText, type TelegramClient } from "./telegram.ts";
 
 const TELEGRAM_TEXT_MAX = 3800;
@@ -118,6 +130,26 @@ const THINKING_STUB = "🦙 thinking…";
 export const OLLAMA_CAPABILITY_NOTE =
   "You do not have tools; answer from what you know. If the user asks for something that needs tools (file edits, API calls, web fetches), tell them to re-send the message with `@` (default tier) or `!` (heavyweight tier) instead of `>`.";
 
+/**
+ * Build the system-prompt capability statement when the tools-on path is
+ * active. The §3c matrix's full four-cell logic lands in PR-B alongside the
+ * default-engine inversion; PR-A only needs the binary tools-on/tools-off
+ * split: tools-off keeps the existing redirect-to-`@`/`!` note, tools-on
+ * lists the available tools and tells the model when to escalate.
+ */
+function buildToolCapabilityNote(toolNames: ReadonlyArray<string>): string {
+  const list = toolNames.join(", ");
+  return (
+    `You have these tools available: ${list}. ` +
+    "Call them when the user's request needs information or actions you " +
+    "can't deliver from your training alone (current data, external APIs, " +
+    "operator-authored integrations). Tool results return into your " +
+    "context — never tell the user 'I cannot do that' if a listed tool can. " +
+    "If a request is too complex for these tools, suggest the user re-send " +
+    "with `@` (Sonnet) or `!` (Opus) for heavier reasoning."
+  );
+}
+
 export interface OllamaRunDeps {
   tg: TelegramClient;
   db: SolracDb;
@@ -134,6 +166,18 @@ export interface OllamaRunDeps {
   instanceMdPath: string;
   // Injectable for tests. Production passes the global fetch.
   fetch?: typeof fetch;
+  // Tools surface (PR-A). When `toolEnabled === true && tools.length > 0`,
+  // `runOllamaTurn` dispatches the turn through `runToolLoop` (Phase 3) so
+  // the local model can call the same `mcp__solrac__*` integrations Claude
+  // tiers see. All four fields below are required together for the tools-on
+  // path; absent (or `toolEnabled === false`) → existing single-shot path.
+  toolEnabled?: boolean;
+  tools?: ReadonlyArray<SdkMcpToolDefinition<any>>;
+  toolTiers?: ReadonlyMap<string, IntegrationTier>;
+  broker?: Pick<ConfirmationBroker, "request">;
+  // `OLLAMA_MAX_TOOL_ITERATIONS`. Defaults to 8; only consulted when tools
+  // are enabled.
+  maxToolIterations?: number;
 }
 
 export interface OllamaRunInput {
@@ -174,6 +218,20 @@ export async function runOllamaTurn(
     return null;
   });
   const stubId = stub && typeof stub === "object" ? stub.message_id : null;
+
+  // Tools-on path (PR-A): dispatch through the loop driver. Requires all four
+  // tools-related fields on `OllamaRunDeps`; if `tools` is empty, fall through
+  // to single-shot — there is nothing for the model to call, and the loop
+  // driver would just add overhead for the same outcome.
+  if (
+    deps.toolEnabled === true &&
+    deps.tools !== undefined &&
+    deps.tools.length > 0 &&
+    deps.toolTiers !== undefined &&
+    deps.broker !== undefined
+  ) {
+    return runOllamaTurnWithTools(deps, input, auditId, stubId);
+  }
 
   const messages: OllamaMessage[] = [
     { role: "system", content: `${deps.soul}\n\n${OLLAMA_CAPABILITY_NOTE}` },
@@ -422,4 +480,217 @@ async function tryEdit(
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
+
+// ---------------------------------------------------------------------------
+// Tools-on path (PR-A) — dispatches through `runToolLoop`
+// ---------------------------------------------------------------------------
+
+const DEFAULT_MAX_TOOL_ITERATIONS = 8;
+
+async function runOllamaTurnWithTools(
+  deps: OllamaRunDeps,
+  input: OllamaRunInput,
+  auditId: number,
+  stubId: number | null,
+): Promise<void> {
+  const tools = deps.tools ?? [];
+  const toolTiers = deps.toolTiers ?? new Map<string, IntegrationTier>();
+  const broker = deps.broker!;
+  const maxIterations =
+    deps.maxToolIterations ?? DEFAULT_MAX_TOOL_ITERATIONS;
+
+  const toolNames = tools.map((t) => t.name);
+  const capabilityNote = buildToolCapabilityNote(toolNames);
+  const toolDefs = mcpToOllamaTools(tools);
+  const toolMap = new Map(tools.map((t) => [t.name, t]));
+
+  // Build initial messages — same shape as the single-shot path, only the
+  // capability note differs. Inlined rather than factored to keep the
+  // single-shot path's diff for PR-A at zero.
+  const initialMessages: ToolOllamaMessage[] = [
+    { role: "system", content: `${deps.soul}\n\n${capabilityNote}` },
+  ];
+  const instanceMd = readInstanceMd(deps.instanceMdPath);
+  if (instanceMd !== null) {
+    initialMessages.push({ role: "system", content: wrapInstanceMd(instanceMd) });
+  }
+  const history = deps.db.recentChatTurns(input.chatId, deps.historyLimit);
+  for (const h of history) {
+    initialMessages.push({ role: "user", content: h.prompt });
+    initialMessages.push({ role: "assistant", content: h.response });
+  }
+  initialMessages.push({ role: "user", content: input.prompt });
+
+  // Single shared `AbortController` covers every fetch this turn.
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), deps.timeoutMs);
+  const startedAt = Date.now();
+
+  // Throttle-edit renderer for the live UX. Errors caught upstream by
+  // `runToolLoop`; we still wrap `editMessageText` defensively so a
+  // transient Telegram failure doesn't pollute the loop's progress events.
+  let lastEditedKey = "";
+  const renderer: RunToolLoopRenderer = {
+    async onProgress(text, toolNames) {
+      if (stubId === null) return;
+      const next = renderToolLoopStub(text, toolNames);
+      if (next.key === lastEditedKey) return;
+      lastEditedKey = next.key;
+      await tryEdit(
+        deps.tg,
+        input.chatId,
+        stubId,
+        next.html,
+        next.markdown,
+      );
+    },
+  };
+
+  // Per-turn loop detector — same shape used by the SDK path
+  // (`createLoopDetector` is shared between Claude and Ollama).
+  const loopDetector = createLoopDetector();
+
+  let result;
+  try {
+    result = await runToolLoop(
+      {
+        fetch: deps.fetch,
+        url: deps.url,
+        model: deps.model,
+        signal: ac.signal,
+        tools: toolMap,
+        toolTiers,
+        toolDefs,
+        broker,
+        loopDetector,
+        maxIterations,
+        auditId,
+        chatId: input.chatId,
+        renderer,
+      },
+      { initialMessages },
+    );
+  } finally {
+    clearTimeout(timer);
+    // Idempotent — releases any held connection if the loop exited early.
+    ac.abort();
+  }
+
+  const elapsedSec = (Date.now() - startedAt) / 1000;
+  const isError = result.errorMessage !== null && !result.iterationCapHit;
+  const finalRender: Rendered = isError
+    ? renderError(result.errorMessage ?? "unknown")
+    : renderToolLoopFinal(
+        result.assistantText,
+        deps.model,
+        elapsedSec,
+        result.toolsFired,
+        result.iterationCapHit,
+      );
+
+  if (stubId !== null) {
+    if (finalRender.html !== lastEditedKey) {
+      await tryEdit(
+        deps.tg,
+        input.chatId,
+        stubId,
+        finalRender.html,
+        finalRender.markdown,
+        "ollama.edit_final_failed",
+      );
+    }
+  } else if (!isError && result.assistantText.trim()) {
+    await deps.tg
+      .sendMessage(input.chatId, finalRender.html, {
+        parse_mode: "HTML",
+        markdownSource: finalRender.markdown,
+      })
+      .catch((err) =>
+        log.warn("ollama.final_send_failed", {
+          error: (err as Error).message,
+        }),
+      );
+  }
+
+  deps.db.updateAuditEnd({
+    id: auditId,
+    response: result.assistantText || null,
+    toolCalls:
+      result.toolCallSummaries.length > 0
+        ? JSON.stringify(result.toolCallSummaries)
+        : null,
+    inputTokens: result.inputTokens,
+    outputTokens: result.outputTokens,
+    cacheCreationInputTokens: null,
+    cacheReadInputTokens: null,
+    costUsd: 0,
+    agentSessionId: null,
+    status: isError ? "error" : "ok",
+    errorMessage: result.errorMessage,
+    endedAt: Date.now(),
+  });
+
+  log.info("ollama.done", {
+    auditId,
+    chatId: input.chatId,
+    model: deps.model,
+    elapsedSec,
+    inputTokens: result.inputTokens,
+    outputTokens: result.outputTokens,
+    toolsFired: result.toolsFired,
+    iterationCapHit: result.iterationCapHit,
+    isError,
+  });
+}
+
+// Render variants for the tools-on path. Mirror the single-shot
+// `renderStreamingStub` / `renderFinal` but include the `⚙️ <names>` chip
+// and the `K tools` footer segment. Inlined here (rather than factored into
+// a shared helper) because the single-shot variants are ~5 lines each — a
+// shared helper would cost more in conditional branches than it saves.
+
+function renderToolLoopStub(
+  text: string,
+  toolNames: ReadonlyArray<string>,
+): Rendered & { key: string } {
+  const htmlParts: string[] = [];
+  const mdParts: string[] = [];
+  if (toolNames.length > 0) {
+    const names = [...new Set(toolNames)].join(", ");
+    htmlParts.push(`⚙️ <i>${htmlEscapeText(names)}</i>`);
+    mdParts.push(`*⚙️ ${names}*`);
+  }
+  if (text.trim()) {
+    htmlParts.push(mdToTelegramHtml(text));
+    mdParts.push(text);
+  } else {
+    htmlParts.push(THINKING_STUB);
+    mdParts.push(THINKING_STUB);
+  }
+  const html = truncate(htmlParts.join("\n\n"), TELEGRAM_TEXT_MAX);
+  const markdown = mdParts.join("\n\n");
+  return { html, markdown, key: html };
+}
+
+function renderToolLoopFinal(
+  text: string,
+  model: string,
+  elapsedSec: number,
+  toolsFired: number,
+  iterationCapHit: boolean,
+): Rendered {
+  const hasText = text.trim().length > 0;
+  const htmlBody = hasText ? mdToTelegramHtml(text) : "(empty response)";
+  const mdBody = hasText ? text : "(empty response)";
+  const capChip = iterationCapHit
+    ? `⚠️ stopped after ${toolsFired} tool iterations · `
+    : "";
+  const toolsChip = toolsFired > 0 ? `${toolsFired} tools · ` : "";
+  const htmlFooter = `<i>✅ ollama:${htmlEscapeText(model)} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s</i>`;
+  const mdFooter = `*✅ ollama:${model} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s*`;
+  return {
+    html: truncate(`${htmlBody}\n\n${htmlFooter}`, TELEGRAM_TEXT_MAX),
+    markdown: `${mdBody}\n\n${mdFooter}`,
+  };
 }
