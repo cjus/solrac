@@ -58,7 +58,9 @@
  *   We coalesce all `text`-typed `CallToolResult.content[]` blocks, JSON-
  *   stringify other block types as a fallback, and truncate to
  *   `TOOL_RESULT_MAX_LEN` so a runaway 10 MB Read result can't blow the
- *   model's context budget. Truncation is marked with a trailing `…`.
+ *   model's context budget. Truncation is marked with a trailing
+ *   `…[truncated: <shown>/<total> bytes shown]` so the model can paginate
+ *   or narrow the query rather than guessing.
  *
  * Scope (Phases 1–3, this file):
  *   - `mcpToOllamaTools(tools)` — pure converter, no IO.
@@ -147,14 +149,19 @@ const SOLRAC_MCP_PREFIX = "mcp__solrac__";
 
 /**
  * Cap on the string length of the tool result fed back to the model as
- * `role:"tool"` content. 8 KB ≈ 2k tokens — enough for any reasonable
- * structured response (HTTP body, formatted listing) while keeping the
- * round-trip token budget bounded across multi-iteration loops.
+ * `role:"tool"` content. 16 KB ≈ 4k tokens — enough for a mid-size Notion
+ * `query_database` response with full per-property serialization while
+ * keeping the round-trip token budget bounded across multi-iteration loops.
  *
- * If a single tool result exceeds this, we keep the head and append a `…`
- * marker so the model knows it was truncated.
+ * If a single tool result exceeds this, we keep the head and append a
+ * length-aware marker (`…[truncated: <shown>/<total> bytes shown]`) so the
+ * model can paginate or narrow the query rather than guessing.
+ *
+ * Bumped from 8192 after live `notion_query_database` calls returning ~25
+ * project rows truncated mid-JSON-object; see CHANGELOG `Unreleased — Notion
+ * query truncation defenses`.
  */
-export const TOOL_RESULT_MAX_LEN = 8192;
+export const TOOL_RESULT_MAX_LEN = 16384;
 
 /**
  * One tool call as parsed from Ollama's response. `arguments` is `unknown`
@@ -497,8 +504,12 @@ function finalize(s: string): CoalescedContent {
   if (s.length <= TOOL_RESULT_MAX_LEN) {
     return { content: s, truncated: false };
   }
+  // Length-aware marker: model sees `shown/total` and can decide to paginate
+  // or narrow. Final string is sized to TOOL_RESULT_MAX_LEN exactly so the
+  // length invariant downstream callers rely on still holds.
+  const marker = ` …[truncated: ${TOOL_RESULT_MAX_LEN}/${s.length} bytes shown]`;
   return {
-    content: s.slice(0, TOOL_RESULT_MAX_LEN - 1) + "…",
+    content: s.slice(0, TOOL_RESULT_MAX_LEN - marker.length) + marker,
     truncated: true,
   };
 }
