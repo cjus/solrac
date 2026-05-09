@@ -585,10 +585,12 @@ The destructive ops (`delete`, `send`) carry **two** safeguards: solrac's Telegr
 ##### Setup (~5 min one-time + ~1 min per account)
 
 ```bash
-# 1. From the solrac repo root, install Gmail's optional runtime deps.
-#    They are NOT in solrac's `dependencies` (only `devDependencies`),
-#    so production deploys via `npm ci --production` skip them. To
-#    enable Gmail in production, install with --save (no --save-dev):
+# 1. Install Gmail's optional runtime deps. Run this in the same directory
+#    as solrac's `package.json` (the cloned repo root, e.g. `~/code/solrac`).
+#    These deps are NOT in solrac's `dependencies` (only `devDependencies`),
+#    so production deploys via `npm ci --production` skip them. To enable
+#    Gmail in production, install with --save (no --save-dev):
+cd /path/to/solrac        # the directory with package.json
 npm install --save googleapis google-auth-library
 
 # 2. Get an OAuth client credentials.json from Google Cloud Console:
@@ -632,6 +634,88 @@ The third one will require approving the send via inline-keyboard. The agent mus
 - **OAuth refresh** is automatic. The integration writes refreshed tokens back to `~/.solrac/gmail/<alias>.json` whenever Google rotates them.
 - **Scope is fixed** at read + modify + send + userinfo (for email-address discovery). To narrow scope, edit `scripts/gmail-auth.ts` SCOPES and re-auth per account.
 - **The `googleapis` package is ~30MB.** That's why it's an optional dep, not a runtime requirement. If you don't want Gmail, skip step 1 and Gmail self-gates on `deps_missing`.
+
+#### `notion` — single-token Notion workspace
+
+10 tools spanning workspace search + database discovery, database queries, page reads, and page/property/block writes. Single `NOTION_API_KEY` env var (Notion's static integration tokens — no OAuth dance). Self-gates if `@notionhq/client` cannot be loaded OR the env var is unset OR the boot probe fails.
+
+| Tool | Tier | Description |
+|---|---|---|
+| `notion_search` | auto | Workspace-wide search; filter by `page` or `database`. Honors the integration's shared-resource set. |
+| `notion_list_databases` | auto | List databases visible to the integration. **Use this when you don't already know a database id** (cleaner than `notion_search` for the "find my Projects DB" workflow). Optional title-substring filter. |
+| `notion_get_page` | auto | Page properties + nested block tree (up to depth 3). |
+| `notion_query_database` | auto | Filters + sorts. Required for project-database workflows ("tickets in progress"). |
+| `notion_get_database_schema` | auto | Property names + types + select/status options. **Call this before writing.** Cached in-process. |
+| `notion_list_users` | auto | Workspace members visible to the integration. Required to set `Assignee` properties (pass IDs). |
+| `notion_create_page` | confirm | New row in a database. `properties` (DSL), optional initial `content` (typed blocks). |
+| `notion_update_page_properties` | confirm | Patch properties on an existing database page. |
+| `notion_append_blocks` | confirm | Add typed blocks to a page. Auto-chunks at 100 blocks per call. |
+| `notion_archive_page` | confirm | Soft-delete (reversible). Requires `confirm: true` body field too. |
+
+`notion_archive_page` carries **two** safeguards: solrac's Telegram-confirm prompt AND a `confirm: true` field the model must include explicitly. The archive is reversible — call `notion_update_page_properties` with `archived: false` to restore.
+
+##### Setup (~3 min one-time, no per-account flow)
+
+`@notionhq/client` is a runtime dependency in solrac's `package.json` — `npm ci` (or `npm install`) populates it like any other dep. No separate install step.
+
+```bash
+# 1. Create an internal integration at:
+#    https://www.notion.so/my-integrations → "+ New integration".
+#    Workspace: pick the workspace you want solrac to reach.
+#    Type: "Internal".
+#    Capabilities: Read content / Update content / Insert content (and
+#    "Read user information without email" if you'll set Assignee fields).
+#    Copy the "Internal Integration Secret" — that's your token.
+
+# 2. Set the token in solrac's environment.
+echo 'NOTION_API_KEY=secret_…' >> .env
+
+# 3. Share each target page or database with the integration:
+#    Open the page/database in Notion → "..." menu → "Add connections" →
+#    pick your integration. The integration cannot see anything you
+#    haven't shared with it. (Database-shared pages are reachable via the
+#    database; you don't need to re-share each row.)
+
+# 4. Restart solrac. Boot log should show:
+#    integrations.notion.loaded user:"<bot name>" toolCount:10
+```
+
+If Notion is unconfigured, the boot log distinguishes which precondition failed:
+
+| Log event | Meaning |
+|---|---|
+| `integrations.notion.deps_missing` | `@notionhq/client` could not be loaded from `node_modules`. Run `npm ci` (or `npm install`) in the solrac repo root. |
+| `integrations.notion.disabled` | `NOTION_API_KEY` not set. Set it in solrac's environment. |
+| `integrations.notion.token_invalid` | Token rejected by `/v1/users/me` (3s probe). Check the secret + that the integration still exists. |
+| `integrations.notion.loaded` | All set. Bot name + tool count reported. |
+
+##### Use cases
+
+```
+@ list my Solrac tickets that are still in progress
+@ create a new Solrac ticket "fix WAL drain timeout" with Status: Todo, Priority: High
+@ in ticket PNX-047, set Status to Done and append a "summary" heading + paragraph
+@ search Notion for pages mentioning "rate limit" from the last week
+```
+
+The middle two require approving via inline-keyboard. `notion_get_database_schema` is called once per database the agent works against and the result is cached, so subsequent reads/writes against the same DB don't re-fetch.
+
+##### Limits to know
+
+- **`@notionhq/client` is a hard runtime dep.** Unlike Gmail's optional `googleapis`, this one ships in solrac's `dependencies` and is always installed. The `deps_missing` boot gate is a defensive remnant — it'd only fire if `node_modules` is broken or `npm install` hasn't been run yet.
+- **Single workspace.** One `NOTION_API_KEY` = one workspace. Multi-workspace isn't supported in v1; run a second solrac if you need it.
+- **Visibility = sharing.** The integration only sees pages and databases you've explicitly shared with it. If `notion_search` returns empty, you forgot step 4 above. 403 errors include a hint pointing back to "Settings → Connections."
+- **Block depth cap is 3.** `notion_get_page` walks up to 3 levels of nested blocks (top-level + 2 children). Deeper blocks are flagged `truncated: true` so the model knows to drill down with another `notion_get_page` call passing the parent block's id. Renders stay bounded; deep tables and toggles still work.
+- **Property DSL needs the schema.** Writes pass shorthand (`{Status: "Done"}`) which the integration translates to Notion's typed shape using the cached database schema. The `notion_get_database_schema` tool surfaces the property types + select/status options. If the schema changes mid-session (e.g., you rename a select option), the next write returns a `validation_error` envelope; the integration auto-invalidates the cache and retries once before surfacing the failure to the model.
+- **Block input is typed-only in v1.** No markdown→blocks conversion. The model passes `[{type:"paragraph", text:"hi"}, {type:"heading_2", text:"…"}, …]`; supported types are `paragraph`, `heading_1`/`2`/`3`, `bulleted_list_item`, `numbered_list_item`, `to_do` (with `checked`), `quote`, `code` (with `language`), `divider`, `callout` (with `emoji`).
+- **`files` property is unsupported.** Writes to file-typed properties return an error envelope. Notion's file upload API requires multipart endpoints out of scope for v1. Reads return `[{name}, …]` with no URLs.
+- **Formula and rollup render as plain strings on read.** Fine for the model; if you need typed envelopes for downstream tooling, raise an issue.
+- **Rate limit is ~3 req/s per integration.** Solrac's per-chat KeyedMutex serializes within a chat; multi-chat parallelism could hit the cap. 429 → `retryAfter: 60` envelope; no client-side throttling.
+- **Append is auto-chunked at 100 blocks.** Larger payloads split into sequential `blocks.children.append` calls. On partial failure the envelope reports `{blocksAppended, chunks, lastError}`; the model decides whether to retry remaining chunks.
+
+##### Token security
+
+`NOTION_API_KEY` is scrubbed from the SDK-spawned `claude` subprocess env (`agent.ts::sanitizedSubprocessEnv`). The integration handler runs in solrac's main process — the subprocess never needs the token. Without the scrub, an auto-allowed `Bash(echo $NOTION_API_KEY)` could exfiltrate the secret. If you add a future integration with its own token, mirror this pattern.
 
 ### Limits to know
 
