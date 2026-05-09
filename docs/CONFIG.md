@@ -9,23 +9,23 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `ANTHROPIC_API_KEY` | yes | — | string | Direct Anthropic auth. **No Bedrock/Vertex in v1.** |
 | `TELEGRAM_BOT_TOKEN` | yes | — | string | From [BotFather](https://t.me/BotFather). One bot per environment (dev/prod). |
 | `ALLOWLIST_BOOTSTRAP` | yes | — | comma-sep ints | Telegram `from.id` values to seed the allowlist on every boot. |
-| `SOLRAC_DEFAULT_ENGINE` | no | `ollama` | `ollama` \| `primary` \| `secondary` | **PR-B inversion.** Engine for messages with no `@`/`!` prefix. `ollama` (default) requires `OLLAMA_ENABLED=true`. `primary`/`secondary` is the Claude-only-deploy fallback. With `>` removed in PR-B, the only way to reach Ollama is to make it the default. Boot rejects mismatches (e.g. `default=ollama && !ollamaEnabled`, or `default!=ollama && ollamaToolsEnabled`). |
+| `SOLRAC_DEFAULT_ENGINE` | no | `ollama` | `ollama` \| `primary` \| `secondary` | Engine for messages with no `@`/`!` prefix. `ollama` (the default) requires `OLLAMA_ENABLED=true`. `primary`/`secondary` is the Claude-only-deploy fallback. Ollama is reachable only as the default engine — there is no `>`-style escape prefix. Boot rejects mismatches (e.g. `default=ollama && !ollamaEnabled`, or `default!=ollama && ollamaToolsEnabled`). |
 | `SOLRAC_TRANSPORT` | no | `poll` | `poll` \| `webhook` | `webhook` requires `TG_WEBHOOK_SECRET ≥32 chars`; v1 ships poll only. |
 | `PORT` | no | `8443` | positive int | `Bun.serve` port (`/health`, `/stats`). Webhook would also bind here. |
 | `DATA_DIR` | no | `./data` | path | sqlite db, WAL, PID file, workspaces. Must be writable. |
 | `HOURLY_COST_CAP_USD` | no | `1.00` | positive float | **Per-chat** sliding-hour spend ceiling (fairness — every chat gets its own budget). |
 | `GLOBAL_HOURLY_COST_CAP_USD` | no | `HOURLY_COST_CAP_USD × MAX_CONCURRENT_TURNS` (computed) | positive float | **Cross-chat** sliding-hour spend ceiling (absolute safety — total Anthropic burn across ALL chats). Default scales with the per-chat cap and concurrency; override to anything stricter or laxer. See [ARCHITECTURE.md#cost-caps](./ARCHITECTURE.md#cost-caps). |
 | `MAX_CONCURRENT_TURNS` | no | `4` | positive int | Global Semaphore limit. |
-| `SOLRAC_PRIMARY_MODEL` | no | `claude-sonnet-4-6` | model id | Claude **primary** tier (`@` prefix). Reachable post-PR-B only via explicit `@` (or by setting `SOLRAC_DEFAULT_ENGINE=primary` for Claude-only deploys). Passed straight to the SDK. |
+| `SOLRAC_PRIMARY_MODEL` | no | `claude-sonnet-4-6` | model id | Claude **primary** tier (`@` prefix). Reachable via explicit `@`, or by setting `SOLRAC_DEFAULT_ENGINE=primary` for Claude-only deploys. Passed straight to the SDK. |
 | `SOLRAC_SECONDARY_MODEL` | no | `claude-opus-4-7` | model id | Claude **secondary** tier (`!` prefix — "escalate"). The heavyweight tier — Opus when extra horsepower is needed. Passed straight to the SDK. |
 | `STATS_BEARER_TOKEN` | no | — | string | Required only when `/stats` is hit; absent → `/stats` returns 503. |
 | `TG_WEBHOOK_SECRET` | webhook only | — | string ≥32 chars | Set as Telegram's `secret_token` and verified via `X-Telegram-Bot-Api-Secret-Token`. |
-| `OLLAMA_ENABLED` | no | `false` | boolean | Master switch for the local Ollama path. When `true`, `OLLAMA_MODEL` MUST be set. **Required `true` when `SOLRAC_DEFAULT_ENGINE=ollama` (the new default).** PR-B removed the `>` prefix; Ollama is reached via the default-engine setting. |
+| `OLLAMA_ENABLED` | no | `false` | boolean | Master switch for the local Ollama path. When `true`, `OLLAMA_MODEL` MUST be set. **Required `true` when `SOLRAC_DEFAULT_ENGINE=ollama` (the default).** Ollama is reached via the default-engine setting; there is no `>`-style escape prefix. |
 | `OLLAMA_URL` | no | `http://localhost:11434` | url | Ollama base URL. Trailing slash stripped at boot. Boot probes `GET /api/tags` once when Ollama is the default engine — non-fatal warn if unreachable or model missing. |
 | `OLLAMA_MODEL` | when `OLLAMA_ENABLED=true` | — | string | No default — explicit choice forced at boot. **Recommended: `gemma4:e4b`** (native function-calling, ~9.6GB, 128K context). Alternatives: `gemma4`, `qwen2.5`, `llama3.2`. Pull on the host first: `ollama pull <model>`. |
 | `OLLAMA_TIMEOUT_MS` | no | `60000` (or `120000` when `OLLAMA_TOOLS_ENABLED=true`) | positive int | Total turn timeout (model + tool execution loop). Default bumps to 120s when tools are on, since one mid-loop confirm prompt can consume 60s alone. Explicit value always wins. Aborted turns surface as `❌ ollama timed out`. |
 | `OLLAMA_HISTORY_LIMIT` | no | `6` | positive int | Last N successful turns reconstructed as conversation context per chat (cross-engine: includes Claude turns). At 256-char prompts × 6 turns ≈ ~3k tokens worst case. **History-pollution mitigation:** if you flip `OLLAMA_TOOLS_ENABLED` off→on on an existing chat, prior "I do not have tools" turns get replayed and the model learns to refuse — set this to `1` for one turn or clear chat history. |
-| `OLLAMA_TOOLS_ENABLED` | no | `false` | boolean | Local model can call the same `mcp__solrac__*` integration tools the Claude tiers see. Requires `SOLRAC_INTEGRATIONS_ENABLED=true` AND `SOLRAC_DEFAULT_ENGINE=ollama` (boot rejects the unreachable `default!=ollama && tools=on` combo). Recommended `true` for the inversion default deploy. |
+| `OLLAMA_TOOLS_ENABLED` | no | `false` | boolean | Local model can call the same `mcp__solrac__*` integration tools the Claude tiers see. Requires `SOLRAC_INTEGRATIONS_ENABLED=true` AND `SOLRAC_DEFAULT_ENGINE=ollama` (boot rejects the unreachable `default!=ollama && tools=on` combo). Recommended `true` for Ollama-default deploys. |
 | `OLLAMA_MAX_TOOL_ITERATIONS` | no | `8` | positive int | Hard ceiling on tool-loop rounds per turn. Loop detector fires earlier on duplicate calls; this is the runaway-loop backstop. Iteration cap surfaces as `⚠️ stopped after N tool iterations`. |
 | `SOLRAC_SKILLS_ENABLED` | no | `false` | boolean | Master switch for operator-defined skills. When `true`, Solrac discovers `SKILL.md` files under `SOLRAC_SKILLS_DIR` at boot and exposes each as a `/<name>` slash command. |
 | `SOLRAC_SKILLS_DIR` | no | `./skills` | path | Directory scanned for `<name>/SKILL.md` files. Resolved relative to launch cwd. Loaded ONCE at boot — edit files and restart. See [USAGE.md#skills-operator-defined-commands](./USAGE.md#skills-operator-defined-commands). |
@@ -47,10 +47,10 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 - **`PORT`**, **`MAX_CONCURRENT_TURNS`** must parse as positive integers. Non-integer floats throw.
 - **`HOURLY_COST_CAP_USD`** and **`GLOBAL_HOURLY_COST_CAP_USD`** must parse as positive numbers (float allowed). The global cap defaults to `HOURLY_COST_CAP_USD × MAX_CONCURRENT_TURNS` if unset, so bumping `MAX_CONCURRENT_TURNS` auto-tracks unless you've explicitly overridden the global. Set both explicitly for production if you want the cap independent from concurrency.
 - **Webhook constraint:** when `SOLRAC_TRANSPORT=webhook`, `TG_WEBHOOK_SECRET` must be set and ≥32 characters.
-- **Default-engine constraints (PR-B):**
+- **Default-engine constraints:**
   - `SOLRAC_DEFAULT_ENGINE=ollama` requires `OLLAMA_ENABLED=true`. Boot throws with the actionable hint to either enable Ollama or pick a different default.
-  - `SOLRAC_DEFAULT_ENGINE=primary|secondary` with `OLLAMA_TOOLS_ENABLED=true` is **unreachable** (the `>` prefix is gone, so Ollama only runs as the default). Boot throws.
-  - When the operator hasn't set `SOLRAC_DEFAULT_ENGINE` explicitly, a `solrac.default_engine_implicit` warn is emitted on every boot for one minor release cycle so the inversion never lands silently.
+  - `SOLRAC_DEFAULT_ENGINE=primary|secondary` with `OLLAMA_TOOLS_ENABLED=true` is **unreachable** — Ollama only runs as the default engine, so this combination would load tools no engine can call. Boot throws.
+  - When `SOLRAC_DEFAULT_ENGINE` is unset, a `solrac.default_engine_implicit` warn fires at boot so deployments never run on an implicit default. Set the variable explicitly (even to `ollama`) to silence the warning.
 - **Ollama constraint:** when `OLLAMA_ENABLED=true`, `OLLAMA_MODEL` must be set and non-blank. `OLLAMA_TIMEOUT_MS`, `OLLAMA_HISTORY_LIMIT`, and `OLLAMA_MAX_TOOL_ITERATIONS` must parse as positive integers if provided. `OLLAMA_URL` has its trailing slash stripped at boot.
 - **Ollama tools constraint:** `OLLAMA_TOOLS_ENABLED=true` requires `SOLRAC_INTEGRATIONS_ENABLED=true` (else there are no tools to expose; boot throws).
 - **Web UI constraint:** when `SOLRAC_WEB_ENABLED=true`, `SOLRAC_WEB_TOKEN` must be set (any value; ≥32 chars recommended). `SOLRAC_WEB_PORT` must differ from `PORT`. `SOLRAC_WEB_CHAT_ID` must be a negative integer.
@@ -87,7 +87,7 @@ ANTHROPIC_API_KEY=sk-ant-…
 TELEGRAM_BOT_TOKEN=8123456789:AA…
 ALLOWLIST_BOOTSTRAP=123456789
 
-# Engine routing (PR-B inversion: default is now ollama)
+# Engine routing — default is ollama; `@` → primary Claude, `!` → secondary Claude
 SOLRAC_DEFAULT_ENGINE=ollama          # `ollama` | `primary` | `secondary`
 SOLRAC_PRIMARY_MODEL=claude-sonnet-4-6   # `@` prefix
 SOLRAC_SECONDARY_MODEL=claude-opus-4-7   # `!` prefix (escalate)

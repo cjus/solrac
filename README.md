@@ -9,7 +9,7 @@
 Solrac fits if **all** of the following are true:
 
 - You want a chat-driven agent that can read your code, run shell, and edit files — but you want to own every piece of the stack.
-- You're willing to trade convenience (no plug-and-play hosting, no UI) for transparency (~2K lines of TypeScript, four moving parts, full audit trail).
+- You're willing to trade convenience (no plug-and-play hosting, no UI) for transparency (a small, focused TypeScript codebase, four moving parts, full audit trail).
 - You're operating at one-user-or-few scale. If you need multi-tenancy or a UI, look elsewhere.
 
 If you'd rather use Claude Code's official Telegram plugin, that's a perfectly good choice — it's actively maintained and zero-setup. Solrac exists because we wanted custom permission rules, per-chat budget caps, an audit log we control, and a foundation extensible to email/Slack/scheduled jobs.
@@ -19,7 +19,7 @@ If you'd rather use Claude Code's official Telegram plugin, that's a perfectly g
 - Bun ≥1.3.0 (runtime).
 - A Telegram bot token + your `from.id`.
 - An Anthropic API key (`@`/`!` paths).
-- A local **Ollama daemon + tools-capable model** for the recommended PR-B default config (no-prefix routes to local). For Claude-only deploys, set `SOLRAC_DEFAULT_ENGINE=primary` instead.
+- A local **Ollama daemon + tools-capable model** for the recommended Ollama-default config (no-prefix routes to local). For Claude-only deploys, set `SOLRAC_DEFAULT_ENGINE=primary` instead.
 
 ## Features
 
@@ -31,7 +31,7 @@ If you'd rather use Claude Code's official Telegram plugin, that's a perfectly g
 - **Per-chat hourly cost cap** — sliding 60-minute window over the audit log. Default $1.00/chat/hour.
 - **Loop detector** — denies the third call to the same `(toolName, input)` within a turn. Order-insensitive over JSON keys.
 - **Persistent audit trail** — every turn (allowed, denied, queue-full) writes a SQLite row with prompt, response, tool calls, cost, tokens, session id, status, **and engine** (`claude:primary:<modelId>` / `claude:secondary:<modelId>` / `ollama:<name>`).
-- **PR-B inverted default** — *Claude only when explicitly requested.* No-prefix routes to local Ollama (free) by default; `@` escalates to Sonnet, `!` escalates to Opus. Pinable via `SOLRAC_DEFAULT_ENGINE` for Claude-only deploys. Boot validation rejects unreachable combinations.
+- **Local-first engine routing** — *Claude only when explicitly requested.* No-prefix messages route to local Ollama (free) by default; `@` escalates to Sonnet, `!` escalates to Opus. Pinable via `SOLRAC_DEFAULT_ENGINE` (`ollama` | `primary` | `secondary`) for Claude-only deploys. Boot validation rejects unreachable combinations.
 - **Local Ollama with tool support** — when `OLLAMA_TOOLS_ENABLED=true`, the local model (e.g. `gemma4:e4b`) calls the same `mcp__solrac__*` integrations the Claude tiers see. Multi-round tool loop with shared loop detector, broker UX, and iteration cap (`OLLAMA_MAX_TOOL_ITERATIONS=8`). Cross-engine context bridge means switching between local and Claude preserves the conversation thread.
 - **Dual-Claude tier routing** — `@` → primary tier (Sonnet by default), `!` → secondary tier (Opus by default). Each tier keeps its own SDK session id so prompt caching survives same-tier turns. Per-tier thinking-stub emoji (🙂 primary / 🤔 secondary) makes the routing visible in chat.
 - **Optional browser web UI** — a second `Bun.serve` instance on a configurable port serves a minimal vanilla-JS chat interface with the same agent loop, slash commands, engine routing, and tool-confirm UX as Telegram. Full markdown rendering (headers, lists, tables, fenced code) on both transports — Claude/Ollama responses get a server-side markdown→HTML pass for Telegram and the raw markdown to the browser. Off by default; enable with `SOLRAC_WEB_ENABLED=true` plus a token. See [docs/USAGE.md#web-ui-browser-interface](./docs/USAGE.md#web-ui-browser-interface).
@@ -44,7 +44,7 @@ If you'd rather use Claude Code's official Telegram plugin, that's a perfectly g
 - **DB-pollution defenses** — denial throttle (1 row per `from.id` per minute under flood), per-chat queue depth cap, prompt truncation with surrogate-pair safety.
 - **Sub-agent default-deny** — `Agent`/`Task` tools disabled at SDK + policy layers.
 - **Concurrency primitives** — per-chat `KeyedMutex`, global `Semaphore`, drain-aware `TurnTracker`.
-- **No HTTP framework, no Telegram framework runtime, no queue server, no Docker** — ~2K lines of focused TypeScript.
+- **No HTTP framework, no Telegram framework runtime, no queue server, no Docker** — focused TypeScript, no hidden middleware.
 
 ## Quick start
 
@@ -62,7 +62,7 @@ Then DM your bot. You should see a 🤔 stub within a second.
 
 If you don't have Bun, a Telegram bot, or an Anthropic API key — see [docs/SETUP.md](./docs/SETUP.md). Total walkthrough: ~20 minutes.
 
-**Engine routing — at a glance** (with the PR-B default `SOLRAC_DEFAULT_ENGINE=ollama`):
+**Engine routing — at a glance** (with the recommended `SOLRAC_DEFAULT_ENGINE=ollama`):
 
 | Prefix | Engine | Model env | Default |
 |--------|--------|-----------|---------|
@@ -70,7 +70,7 @@ If you don't have Bun, a Telegram bot, or an Anthropic API key — see [docs/SET
 | `@` | Primary Claude — escalate | `SOLRAC_PRIMARY_MODEL` | `claude-sonnet-4-6` |
 | `!` | Secondary Claude — heaviest | `SOLRAC_SECONDARY_MODEL` | `claude-opus-4-7` |
 
-The `>` prefix was removed in PR-B; a leading `>` is now literal user text routed via the default engine. For Claude-only deploys, set `SOLRAC_DEFAULT_ENGINE=primary` (no-prefix → Sonnet) and `OLLAMA_ENABLED=false`. See [docs/USAGE.md#engine-routing-prefix-table](./docs/USAGE.md#engine-routing-prefix-table) and [docs/ARCHITECTURE.md#engine-routing](./docs/ARCHITECTURE.md#engine-routing).
+There is no `>`-style escape prefix; a leading `>` is literal user text routed via the default engine. For Claude-only deploys, set `SOLRAC_DEFAULT_ENGINE=primary` (no-prefix → Sonnet) and `OLLAMA_ENABLED=false`. See [docs/USAGE.md#engine-routing-prefix-table](./docs/USAGE.md#engine-routing-prefix-table) and [docs/ARCHITECTURE.md#engine-routing](./docs/ARCHITECTURE.md#engine-routing).
 
 **Optional — browser web UI.** Set `SOLRAC_WEB_ENABLED=true` and `SOLRAC_WEB_TOKEN=$(openssl rand -hex 32)` in `.env`; browse to `http://127.0.0.1:8080` for a chat interface with full markdown rendering. Bind `SOLRAC_WEB_HOST=0.0.0.0` to expose it on a LAN/Tailnet (token gates access). See [docs/USAGE.md#web-ui-browser-interface](./docs/USAGE.md#web-ui-browser-interface) and [docs/ARCHITECTURE.md#web-ui-transport-optional](./docs/ARCHITECTURE.md#web-ui-transport-optional).
 
@@ -83,6 +83,7 @@ The `>` prefix was removed in PR-B; a leading `>` is now literal user text route
 | [docs/CONFIG.md](./docs/CONFIG.md) | Operators | Full env-var reference: defaults, ranges, validation, secret-scrub rules |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Developers | Module map, data flow, SDK integration, concurrency, SQLite schema, three-tier policy, threat model, tricky seams |
 | [docs/OPERATIONS.md](./docs/OPERATIONS.md) | Operators | systemd deploy, `/health` and `/stats`, daily report, log events, audit queries, backups |
+| [docs/SCHEMA.md](./docs/SCHEMA.md) | Operators / debuggers | SQLite schema reference + query cookbook for debugging, forensics, performance, cross-engine analysis |
 | [docs/RUNBOOK.md](./docs/RUNBOOK.md) | On-call | Incident recovery: 409 conflict, drain timeout, runaway cost, OOM, db corruption, zombie poller, network drops |
 | [docs/GLOSSARY.md](./docs/GLOSSARY.md) | Everyone | Alphabetical reference for Solrac-specific terms |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | Maintainers | Step 9 webhook spec, 13 open questions, deferred enhancements |
@@ -90,7 +91,6 @@ The `>` prefix was removed in PR-B; a leading `>` is now literal user text route
 Auxiliary references in the source tree:
 
 - `docs/SDK_NOTES.md` — verified Claude Agent SDK surface, pinned to `0.2.119`
-- `docs/SLASH_COMMANDS_DESIGN.md` — design notes for the `/help`, `/status`, `/context`, `/clear`, `/compact` surface
 - `deploy/systemd/README.md` — install commands for the three systemd units
 
 Web UI deep-dives are split across the existing docs:
@@ -128,7 +128,7 @@ solrac/
 │   ├── policy.ts                    classifier, cost cap, broker, loop, hooks, engine-prefix parser
 │   ├── instance.ts                  SOUL.md / SOLRAC.md bootstrap + load
 │   ├── agent.ts                     Claude Agent SDK wiring (per-tier) + cross-engine bridge
-│   ├── ollama.ts                    local Ollama runner (`>` prefix path)
+│   ├── ollama.ts                    local Ollama runner (default engine)
 │   ├── commands.ts                  slash command parser, dispatcher, handlers
 │   ├── skills.ts                    operator-defined SKILL.md discovery
 │   ├── server.ts                    /health + /stats
@@ -158,8 +158,7 @@ solrac/
 │   ├── RUNBOOK.md
 │   ├── GLOSSARY.md
 │   ├── ROADMAP.md
-│   ├── SDK_NOTES.md
-│   └── SLASH_COMMANDS_DESIGN.md
+│   └── SDK_NOTES.md
 │
 └── data/                            gitignored
     ├── solrac.sqlite                + WAL + SHM
@@ -212,7 +211,7 @@ For live smokes against a dev bot, see [docs/RUNBOOK.md](./docs/RUNBOOK.md).
 
 ## Origin
 
-Solrac was built as part of the [PNXStudios.com](https://pnxstudios.com) project to manage work on a complex monorepo from anywhere — Telegram in, code edits and shell out, with full audit and per-chat budget control. It's open-sourced as a complete, hackable foundation: the same ~2K lines of TypeScript that drive a real production workflow, with the building blocks — auditable agent loop, dual-Claude tier routing, local-Ollama escape hatch, per-chat cost caps, three-tier permission policy, operator-defined skills — laid bare for anyone to read, run, fork, or extend to a different transport (email, Slack, scheduled jobs, in-house dashboards).
+Solrac was built as part of the [PNXStudios.com](https://pnxstudios.com) project to manage work on a complex monorepo from anywhere — Telegram in, code edits and shell out, with full audit and per-chat budget control. It's open-sourced as a complete, hackable foundation: the same TypeScript codebase that drives a real production workflow, with the building blocks — auditable agent loop, local-Ollama default with optional tool-calling, dual-Claude tier escalation, per-chat cost caps, three-tier permission policy, operator-defined skills — laid bare for anyone to read, run, fork, or extend to a different transport (email, Slack, scheduled jobs, in-house dashboards).
 
 ## Contact
 

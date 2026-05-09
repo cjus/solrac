@@ -21,7 +21,7 @@ For day-to-day operations, see [OPERATIONS.md](./OPERATIONS.md).
 - [Network drops during long-poll](#network-drops)
 - [Cost report never arrives](#cost-report-missing)
 - [Bot replies stale / out of date](#stale-replies)
-- [Ollama errors (default engine path post PR-B)](#ollama-errors)
+- [Ollama errors (default engine path)](#ollama-errors)
 - [Web UI not reachable / login won't take](#web-ui-issues)
 - [Web UI streaming silent / messages don't appear](#web-ui-stream-silent)
 
@@ -701,11 +701,11 @@ Send the next message. It'll start a fresh SDK session.
 
 <a id="ollama-errors"></a>
 
-## Ollama errors (default engine path post PR-B)
+## Ollama errors (default engine path)
 
 ### Symptoms
 
-User sends a no-prefix message (which routes to Ollama under the PR-B default `SOLRAC_DEFAULT_ENGINE=ollama`) and gets one of:
+User sends a no-prefix message (which routes to Ollama under `SOLRAC_DEFAULT_ENGINE=ollama`) and gets one of:
 
 - `❌ ollama unreachable: http://localhost:11434`
 - `❌ ollama model not found: <model> — pull with \`ollama pull <model>\` on the host`

@@ -348,12 +348,17 @@ Tools surface to the model as `mcp__solrac__<name>`. The full picture:
 - **Loader.** `src/integrations.ts` — fail-soft per-integration error handling, first-dir-wins on tool-name collisions (so a stale operator copy can't shadow a blessed integration), boot-only (no hot-reload, matches skills loader semantics).
 - **Context.** `IntegrationContext` carries `{ z, tool, fetch, log, env }`. Integrations don't import zod or the SDK directly; they receive solrac's instances. Each integration directory IS its own dependency root — Bun's dynamic `import()` resolves bare specifiers from the integration's location upward, so `npm install @linear/sdk` next to `index.ts` works without polluting solrac's `node_modules`.
 - **Policy gating.** Integration tools default to `"confirm"` (Telegram inline-keyboard) via `policy.ts::classifyTool`'s catch-all. An integration may declare `meta.tier: "auto"` or `meta.toolTiers: { tool_name: "auto" }` to bypass the prompt for safe operations. `classifyToolWithIntegrations(toolName, input, toolTiers)` is the integration-aware shim — `classifyTool` itself stays pure.
-- **Cost cap + loop detector** apply identically to integration tools — verified via live `policy.cost_cap_exceeded` event firing for `mcp__solrac__echo_say` when the cap was tripped (`carlos/solrac-integrations` Phase 3 verification).
+- **Cost cap + loop detector** apply identically to integration tools — every `mcp__solrac__*` call passes through the same `PreToolUse` hook that gates Claude's preset tools, so `policy.cost_cap_exceeded` fires the same way regardless of source.
 - **Heavy deps optional.** Blessed integrations (e.g. `gmail`) may dynamic-import packages like `googleapis` and gracefully no-op when absent. Solrac's direct dependencies remain SDK + `marked` + `zod`. Operators who want Gmail run `npm install googleapis google-auth-library` from the solrac root once.
 
-### Ollama scope (no integrations)
+### Ollama scope
 
-`runOllamaTurn` in `ollama.ts` does NOT consume `deps.mcpServer`. The local-model path is intentionally tool-less — `OLLAMA_CAPABILITY_NOTE` (`ollama.ts:112`) tells the local model "you do not have tools" and `audit.tool_calls` is hardcoded to `null` (`ollama.ts:348`). The capability note nudges users toward `@`/`!` prefixes when they ask for tool work. Tool-call support on Ollama is tracked as [`ROADMAP.md` OQ#16](./ROADMAP.md#oq16--integrations-on-ollama) — deferred because Ollama tool-call reliability varies sharply by model.
+`runOllamaTurn` in `ollama.ts` branches on `OLLAMA_TOOLS_ENABLED`:
+
+- **Tools off (default for Claude-only deploys):** single-shot streaming via `/api/chat`. No tools exposed; `audit.tool_calls` is `null`. The capability note (`ollama.ts::buildOllamaCapabilityNote`) tells the model it has no tools and nudges users toward `@`/`!` for tool-shaped requests.
+- **Tools on (recommended for the Ollama-default deploy; precondition: `SOLRAC_INTEGRATIONS_ENABLED=true`):** multi-round tool loop in `src/ollama-tools.ts::runToolLoop`. The local model receives the same `mcp__solrac__*` integration tools the Claude tiers see, with per-call gating reused from `policy.ts` (`classifyToolWithIntegrations`, the `LoopDetector`, the `ConfirmationBroker`). `OLLAMA_MAX_TOOL_ITERATIONS` (default 8) backstops a single shared `AbortSignal` covering every fetch in the turn. `audit.tool_calls` records the executed calls. The capability note advertises the loaded tool names so the model knows what it can call.
+
+Both paths share the audit row format, the streaming stub UX, the cost-cap-doesn't-apply rule (`cost_usd = 0`), the cross-engine context bridge, and the `disallowedTools` belt-and-suspenders (`OLLAMA_DENY_TOOLS` mirrors `agent.ts`'s SDK-level `disallowedTools: ["Agent","Task"]`). Reliability of Ollama tool-calling varies sharply by model — `gemma4:e4b` is the recommended baseline.
 
 ---
 
@@ -427,7 +432,7 @@ Multiple things can run concurrently inside one process:
 
 ## SQLite schema
 
-`db.ts` defines five tables. WAL mode, `busy_timeout = 5000`, `foreign_keys = ON`.
+`db.ts` defines five tables. WAL mode, `busy_timeout = 5000`, `foreign_keys = ON`. For a column-by-column reference, the index list, and a task-oriented query cookbook (forensics, performance, cross-engine, migration sanity), see [SCHEMA.md](./SCHEMA.md).
 
 ### `meta`
 
@@ -612,7 +617,7 @@ Global is checked first because if the host is over its absolute budget, every c
 - For production: set both explicitly so a future concurrency bump can't quietly raise the spend ceiling. `HOURLY_COST_CAP_USD=1.00 GLOBAL_HOURLY_COST_CAP_USD=4.00`.
 - For dev: the defaults are fine; the audit log will show `error_message='policy_deny: ...cap reached: ...'` when either fires.
 
-**v1 limitation:** both caps measure Anthropic API spend only. Tools that call paid third-party APIs (e.g. a `replicate` CLI) aren't measured; auto-deny rules in the classifier are the v1 mitigation. See [Open Question #5 in PLAN.md](../changelog/pnx-155-solrac-open-claude-agent/PLAN.md).
+**v1 limitation:** both caps measure Anthropic API spend only. Tools that call paid third-party APIs (e.g. a `replicate` CLI) aren't measured; auto-deny rules in the classifier are the v1 mitigation. See [`ROADMAP.md` OQ#5 — cost surprises beyond Anthropic](./ROADMAP.md#oq5-cost-surprises-beyond-anthropic).
 
 **Ollama tool calls are NOT gated by either cost cap.** Ollama is free; the cap exists to bound Anthropic spend. The `OLLAMA_MAX_TOOL_ITERATIONS` ceiling and the per-turn loop detector are the runaway-loop defenses for the local path. Confirm-tier tools still go through the same `ConfirmationBroker` regardless of engine.
 
@@ -622,7 +627,7 @@ Global is checked first because if the host is over its absolute budget, every c
 
 ## Engine routing (prefix table)
 
-**PR-B inverted the default.** The first non-whitespace character of `msg.text` picks the engine; with no prefix, `SOLRAC_DEFAULT_ENGINE` (default `ollama`) decides.
+The first non-whitespace character of `msg.text` picks the engine; with no prefix, `SOLRAC_DEFAULT_ENGINE` (default `ollama`) decides. The default routes no-prefix messages to the local Ollama path, so Anthropic burn happens only on a deliberate `@` (Sonnet) or `!` (Opus).
 
 | Prefix | Engine label | Model | Tools | Audit `model` value |
 |--------|--------------|-------|-------|---------------------|
@@ -630,16 +635,16 @@ Global is checked first because if the host is over its absolute budget, every c
 | `@` | `primary` (Claude) — escalation | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | `claude_code` preset + integrations | `claude:primary:<modelId>` |
 | `!` | `secondary` (Claude) — heaviest | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | `claude_code` preset + integrations | `claude:secondary:<modelId>` |
 
-The `>` prefix was **removed in PR-B**. A leading `>` is now literal user text routed via no-prefix → `defaultEngine`.
+There is no `>`-style escape prefix. A leading `>` is literal user text routed via no-prefix → `defaultEngine`. The local Ollama path is reached only when it is the default engine.
 
 `policy.ts::parseEnginePrefix(text, defaultEngine)` returns `{ engine, explicit, prompt }`. `explicit` is true only when an actual prefix character (`@` or `!`) was consumed; `main.ts` uses it to render usage hints on empty explicit-prefix payloads.
 
-**Why invert.** *Claude only when explicitly requested.* Anthropic burn happens on a deliberate `@` (Sonnet) or `!` (Opus); everything else stays local and free. The integration surface (operator-authored + blessed `mcp__solrac__*` tools) becomes the workhorse for tool-driven chats on the local path.
+**Design rationale.** *Claude only when explicitly requested.* Anthropic burn happens on a deliberate `@` or `!`; everything else stays local and free. The integration surface (operator-authored + blessed `mcp__solrac__*` tools) is shared across all three engines — Ollama gets it via `OLLAMA_TOOLS_ENABLED=true`, both Claude tiers get it via the `claude_code` preset.
 
 **Boot validation enforces reachability:**
 
 - `defaultEngine === "ollama" && !ollamaEnabled` → throw (the default would error every turn).
-- `defaultEngine !== "ollama" && ollamaToolsEnabled` → throw (with `>` removed, Ollama is unreachable when not the default).
+- `defaultEngine !== "ollama" && ollamaToolsEnabled` → throw (Ollama runs only as the default; tools-on without it being the default would load tool schemas no engine can call).
 
 When `defaultEngine === "ollama"`, boot fires a one-shot `GET /api/tags` health probe; failures are logged (`ollama.boot_health_failed`) but non-fatal — daemon may come up after Solrac under systemd, and we don't want to crash the unit on a transient.
 
@@ -710,7 +715,7 @@ The retag migration is an idempotent `UPDATE audit SET model = 'claude:secondary
 
 ## Ollama local-model routing
 
-**PR-B promoted Ollama to the default engine.** `SOLRAC_DEFAULT_ENGINE=ollama` (the new default) routes no-prefix messages here. Claude tiers are reached only via explicit `@` / `!`. The `>` prefix was removed; with Ollama as the default, it was redundant.
+Ollama is the default engine in the recommended config (`SOLRAC_DEFAULT_ENGINE=ollama`). No-prefix messages route here; Claude tiers are reached via explicit `@` / `!`. There is no `>`-style escape prefix — Ollama runs only as the default, so an extra prefix character would be redundant.
 
 Motivation: (1) most casual chat doesn't need Claude's reasoning, so the free local path becomes the workhorse; (2) when `OLLAMA_TOOLS_ENABLED=true`, the local model can call the same `mcp__solrac__*` integrations Claude does — the operator's tool surface is what makes default-Ollama useful for tool-driven work.
 
@@ -718,14 +723,14 @@ Motivation: (1) most casual chat doesn't need Claude's reasoning, so the free lo
 
 - **Allowlist + denial throttle**: gate happens before queue, every engine falls through the same gate.
 - **Audit row**: same `audit` table; the `model` column distinguishes engines (`ollama:llama3.2` vs `claude:primary:claude-sonnet-4-6` vs `claude:secondary:claude-opus-4-7` etc — see [engine routing](#engine-routing) for the full format).
-- **Per-chat workspace**: not used — Ollama is pure inference, no tool execution.
+- **Per-chat workspace**: not used — the Ollama path has no shell/filesystem tools (no `claude_code` preset). With `OLLAMA_TOOLS_ENABLED=true`, integration tools execute as in-process TS handlers and don't need a working directory.
 - **Streaming UX**: 🦙 stub → throttled `editMessageText` (same `EDIT_THROTTLE_MS = 1500` constant) → final edit with footer. The no-op-edit guard applies; the footer (`<i>✅ ollama:<model> · Ns</i>`) is load-bearing for the same reason.
 
 ### What's different
 
-- **No `canUseTool`, no `PreToolUse` hook, no `disallowedTools`**: pure inference path, no tools exposed.
+- **No `canUseTool` / `PreToolUse` SDK hooks**: the SDK isn't in the loop. With `OLLAMA_TOOLS_ENABLED=true`, the same gates run inside `runToolLoop` (cost cap doesn't apply since cost is zero, but `LoopDetector` and `ConfirmationBroker` do). With tools off, no gates run at all — there are no tool calls to gate.
 - **No `SessionStore` resume**: Ollama's `/api/chat` is stateless per call. Conversation continuity comes from history reconstruction, not session IDs.
-- **No `claude_code` system-prompt preset**: Ollama doesn't know it. The first `system` message is `${soul}\n\n${OLLAMA_CAPABILITY_NOTE}` — the operator-editable `SOUL.md` text plus a one-line engine-specific clause that says "you have no tools." When `SOLRAC.md` is present and activated, its content ships as a second `system` message wrapped in `<solrac-md>` (a separate turn rather than concatenated, since local models lack RLHF on instruction hierarchy).
+- **No `claude_code` system-prompt preset**: Ollama doesn't know it. The first `system` message is `${soul}\n\n${capabilityNote}` — the operator-editable `SOUL.md` text plus a one-line engine-specific clause built by `ollama.ts::buildOllamaCapabilityNote` (which adapts based on whether tools are on, and whether Ollama is the default engine vs. an explicit escalation target). When `SOLRAC.md` is present and activated, its content ships as a second `system` message wrapped in `<solrac-md>` (a separate turn rather than concatenated, since local models lack RLHF on instruction hierarchy).
 - **`cost_usd = 0`** in audit rows. Cost-cap queries sum over all rows so Ollama doesn't pollute the cap window — the per-chat and global cost caps are unaffected.
 - **`agent_session_id = null`** and **`tool_calls = null`** in audit rows.
 
@@ -748,10 +753,10 @@ Default `OLLAMA_HISTORY_LIMIT=6` = 3 round-trips. At 256-char truncated prompts 
 | Stream timeout (`OLLAMA_TIMEOUT_MS`) | `❌ ollama timed out after Ns` | `status='error'` |
 | Other HTTP failure | `❌ ollama error: <status> <body-slice>` | `status='error'` |
 
-### Empty-prompt + disabled-feature paths
+### Empty-prompt + misconfiguration paths
 
-- `>` alone (or `> ` whitespace) → renders a one-line usage hint (`usage: > <prompt> — sends to local Ollama (model: <model>)`); no audit row, no enqueue.
-- `OLLAMA_ENABLED=false` and user sends `> ...` → renders `ollama disabled in this deployment`; no audit row, no enqueue.
+- `@` or `!` alone (or with only whitespace after) → renders a one-line usage hint naming the target tier; no audit row, no enqueue.
+- `SOLRAC_DEFAULT_ENGINE=ollama` with `OLLAMA_ENABLED=false` is rejected at **boot** (`config.ts` throws), not per-turn — the daemon-down case lands as `❌ ollama unreachable: <url>` per the [Error handling](#error-handling) table when `OLLAMA_ENABLED=true` but the daemon is down.
 
 ### Limitations / open questions
 
@@ -781,7 +786,7 @@ The threat surface for v1:
 | Two pollers race | PID file + 409-on-conflict fast exit | `poll.ts::acquirePidFile` + `TelegramConflictError` |
 | `/stats` leaks ops data | Bearer auth + constant-time compare | `server.ts::authorizeBearer` |
 
-Each defense has unit tests; live smokes are in [PLAN.md](../changelog/pnx-155-solrac-open-claude-agent/PLAN.md).
+Each defense has unit tests; live smokes live under `test/smokes/` (`npm run smoke:flood`, `npm run smoke:ollama`, `npm run smoke:integrations`).
 
 ### Allowlist gates on `from.id`, not `chat.id`
 
@@ -1081,14 +1086,14 @@ The existing `policy.ts::createConfirmationBroker` is transport-agnostic — `re
 
 ### Anti-goal preservation
 
-The transport adds two new files (`web.ts`, `web-client.ts`) and a sanitizer + markdown converter, totaling ~700 lines of TypeScript. No HTTP framework, no WebSocket framework, no extra runtime dependencies beyond `marked` (used on both transports). The "no HTTP framework" anti-goal is honored — `Bun.serve` `routes` and `fetch` only, same shape as `server.ts`.
+The transport adds `web.ts`, `web-client.ts`, `web-sanitize.ts`, and `markdown.ts`. No HTTP framework, no WebSocket framework, no extra runtime dependencies beyond `marked` (used on both transports). The "no HTTP framework" anti-goal is honored — `Bun.serve` `routes` and `fetch` only, same shape as `server.ts`.
 
 ## Anti-goals
 
 Decisions deliberately not made. Don't relitigate without strong justification.
 
 - **No HTTP framework.** `Bun.serve` `routes` only. No Hono, Express, Elysia. The HTTP surface is two routes (`/health`, `/stats`) — a framework is overkill.
-- **No Telegram framework runtime.** Raw `fetch` + `tgCall`. `@grammyjs/types` is types-only — the framework's runtime is not used. We're maintaining 130 lines of telegram.ts; a framework would be a black box of equivalent size.
+- **No Telegram framework runtime.** Raw `fetch` + `tgCall`. `@grammyjs/types` is types-only — the framework's runtime is not used. We maintain a small `telegram.ts` deliberately; a framework would be a black box of equivalent size.
 - **No queue server.** In-process `KeyedMutex` + `Semaphore`. No BullMQ, Redis. The queue's role is per-chat ordering, not durability — no need for an external store.
 - **No Docker for v1.** `bun run` under systemd, period. Docker buys isolation we don't need (single-tenant) and slows iteration. The systemd hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`) covers most container-shaped concerns.
 - **No MarkdownV2 outbound.** HTML parse mode for outbound messages — three escape characters (`< > &`) instead of MarkdownV2's twenty-some.
@@ -1110,4 +1115,3 @@ If you find yourself wanting to add one of these, write the case in the PR descr
 - [ROADMAP.md](./ROADMAP.md) — open questions and deferred work
 - [GLOSSARY.md](./GLOSSARY.md) — terminology
 - [SDK_NOTES.md](./SDK_NOTES.md) — verified SDK surface
-- [SLASH_COMMANDS_DESIGN.md](./SLASH_COMMANDS_DESIGN.md) — design notes for slash commands

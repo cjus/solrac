@@ -349,7 +349,7 @@ Canonical event names:
 - `agent.oob_ollama_injected` — cross-engine bridge injected N Ollama turns into the user prompt (only fires when there are out-of-band Ollama exchanges since the last successful Claude turn)
 - `agent.done` — per-turn summary (cost, turns, isError)
 
-### Ollama (default engine path post PR-B)
+### Ollama (default engine path)
 - `ollama.stub_send_failed` — couldn't send the 🦙 stub
 - `ollama.bad_frame` — NDJSON parse failure on a stream chunk (logged, line skipped, stream continues)
 - `ollama.fetch_failed` — fetch to `OLLAMA_URL` threw (unreachable, abort/timeout, etc.)
@@ -414,7 +414,9 @@ journalctl -u solrac.service --since today -o cat \
 
 ## Audit queries
 
-`audit` is the source of truth for "what did the bot do?" Useful queries:
+`audit` is the source of truth for "what did the bot do?" The cost-focused queries below are operator dailies. For schema reference and a wider task-oriented cookbook (forensics, performance, cache effectiveness, cross-engine analysis, migration sanity checks), see [SCHEMA.md](./SCHEMA.md).
+
+Useful cost queries:
 
 ### Today's spend per chat
 

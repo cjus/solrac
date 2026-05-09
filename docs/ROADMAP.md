@@ -386,28 +386,11 @@ Defer the column add until the operator reports degraded summary quality.
 
 ### OQ#16 — Integrations on Ollama
 
-**Status:** open, deferred. Filed alongside the v1 integrations PR (`carlos/solrac-integrations`).
-**Effort:** medium (`ollama.ts` is ~420 lines today; tools-aware rewrite likely +100–150 lines).
+**Status:** Shipped. Operator-authored integrations are reachable from the local Ollama path when `OLLAMA_TOOLS_ENABLED=true` (precondition: `SOLRAC_INTEGRATIONS_ENABLED=true`).
 
-v1 integrations (operator-authored TS modules registered as `mcp__solrac__<tool>`) are reachable from the Claude tiers (`@`, `!`) only. The Ollama path (`>`) is intentionally tool-less today: `OLLAMA_CAPABILITY_NOTE` (`ollama.ts:112`) tells the local model "you do not have tools" and `audit.tool_calls` is hardcoded to `null` (`ollama.ts:348`). The `OLLAMA_CAPABILITY_NOTE` was extended in the integrations PR to nudge users toward `@`/`!` when they ask for tool work, but that's a workaround — operators may want their integrations reachable from the local-model tier too (zero Anthropic spend, lower latency, on-device).
+`runOllamaTurn` branches on the env flag; with tools on, it delegates to `src/ollama-tools.ts::runToolLoop` — a multi-round driver that calls `/api/chat` with a `tools: [...]` array (built via `mcpToOllamaTools` from each `mcp__solrac__*` tool's Zod raw shape), executes each tool call through `policy.ts::classifyToolWithIntegrations` + `LoopDetector` + `ConfirmationBroker`, and feeds results back as `role: "tool"` messages until the model emits a clean final assistant turn. `OLLAMA_MAX_TOOL_ITERATIONS` (default 8) backstops a single shared `AbortSignal`. `audit.tool_calls` records the executed calls; cost cap remains $0 (local inference). Reliability still varies by model — `gemma4:e4b` is the recommended baseline.
 
-**Why deferred:** Ollama's tool-call protocol is supported by some models (Llama 3.1+, Qwen, Mistral) but reliability varies sharply by model and version. A Solrac that "supports tools on Ollama" only when the operator picks the right model is worse than no support — the failure mode is silent hallucinated tool args rather than a clean refusal.
-
-**To re-enable:**
-
-1. **`runOllamaTurn` becomes tool-aware.** Add `tools: [...]` to the `/api/chat` request body (Ollama's tool-call extension). Loop on streaming response: if a `tool_calls` field arrives, dispatch through the same `IntegrationModule.tools` registry, append a `tool` role message with the result, and re-call `/api/chat`. Continue until the model emits a final assistant message without `tool_calls`.
-2. **Reuse `policy.ts` gates.** `classifyToolWithIntegrations` is engine-agnostic — call it from inside `runOllamaTurn`'s tool loop. Cost cap doesn't apply (local model, no Anthropic spend), but loop detector and Telegram-confirm flow still do.
-3. **Per-model reliability gate.** New env var `SOLRAC_OLLAMA_TOOLS_REQUIRED=true` (default `false`). When `false`, integrations stay invisible to Ollama (today's behavior). When `true`, the operator has explicitly asserted "this Ollama model does tools well; trust it" and `runOllamaTurn` enables the tool-aware path. Boot fails loud if `OLLAMA_TOOLS_REQUIRED=true` and the configured `OLLAMA_MODEL` isn't on a small known-good list.
-4. **Audit `tool_calls` column** stops being hardcoded null on the Ollama path. Same shape as Claude — JSON array of `{name, input}`.
-5. **Streaming UX.** Ollama's tool-call streaming is less mature than Claude's; expect to coalesce chunks and only commit a tool-call decision once the streamed JSON is well-formed. The `editMessageText` 1.5s throttle remains.
-
-**Cross-references:**
-
-- `docs/USAGE.md#integrations` — the v1 limitation callout.
-- `src/ollama.ts:112` — `OLLAMA_CAPABILITY_NOTE`.
-- `src/integrations.ts` — engine-agnostic registry; reused as-is.
-
-Until this lands, integrations are Claude-only. Operators wanting an integration reachable on the local tier should consider re-prefixing their requests with `@` or `!`.
+**Open follow-ups:** none beyond per-model reliability tuning, which is a deployment concern rather than a code change.
 
 ---
 
@@ -455,4 +438,3 @@ If you want to add one of these, write the case in the PR description and treat 
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — the architecture these items diverge from
 - [SDK_NOTES.md](./SDK_NOTES.md) — verified SDK surface
-- [SLASH_COMMANDS_DESIGN.md](./SLASH_COMMANDS_DESIGN.md) — slash command design notes
