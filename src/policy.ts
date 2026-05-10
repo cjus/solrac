@@ -110,8 +110,10 @@ import { randomUUID } from "node:crypto";
 import type { Update } from "@grammyjs/types";
 import { MAX_AUDIT_PROMPT_LEN } from "./config.ts";
 import type { SolracDb } from "./db.ts";
+import type { ConfirmFormatter } from "./integrations.ts";
 import { log } from "./log.ts";
-import { htmlEscapeText, type TelegramClient } from "./telegram.ts";
+import { mdToTelegramHtml } from "./markdown.ts";
+import { type TelegramClient } from "./telegram.ts";
 
 // Allowlist gates on the user (from.id), not the chat — group chats and
 // forwarded messages have a different chat.id than the user who actually typed.
@@ -461,6 +463,7 @@ export type ConfirmDecision = "allow" | "deny" | "timeout";
 
 const CALLBACK_PREFIX = "cb";
 const CALLBACK_RE = /^cb:([0-9a-f-]{36}):(a|d)$/;
+const MCP_TOOL_PREFIX = "mcp__solrac__";
 
 export interface ConfirmRequest {
   chatId: number;
@@ -468,17 +471,42 @@ export interface ConfirmRequest {
   toolInput: unknown;
 }
 
+/**
+ * Outcome of the underlying tool execution, surfaced into the confirm
+ * message's appended footer. `message` is HTML — callers must escape any
+ * user-controlled fields before passing.
+ */
+export interface ConfirmOutcome {
+  ok: boolean;
+  message?: string;
+}
+
+/**
+ * Returned by `broker.request`. The caller awaits a verdict, runs the tool
+ * if allowed, then calls `finalize(outcome)` to surface success/failure into
+ * the confirm prompt's appended footer. `finalize` is idempotent and is a
+ * no-op when the prompt was never sent (e.g., send failure → upfront deny).
+ */
+export interface ConfirmHandle {
+  decision: ConfirmDecision;
+  finalize: (outcome: ConfirmOutcome) => Promise<void>;
+}
+
 export interface ConfirmationBroker {
-  request: (req: ConfirmRequest) => Promise<ConfirmDecision>;
+  request: (req: ConfirmRequest) => Promise<ConfirmHandle>;
   resolve: (id: string, decision: "allow" | "deny") => boolean;
   size: () => number;
 }
 
 export interface ConfirmationBrokerOpts {
-  tg: Pick<TelegramClient, "sendMessage" | "call">;
+  tg: Pick<TelegramClient, "sendMessage" | "editMessageText">;
   timeoutMs?: number;
   // Override id source for deterministic tests.
   idGen?: () => string;
+  // Per-(short)-tool-name confirm-prompt formatters. Captured from the
+  // integrations loader at boot. Lookup strips the `mcp__solrac__` prefix
+  // first; absent entries fall back to the generic JSON dump.
+  confirmFormatters?: ReadonlyMap<string, ConfirmFormatter>;
 }
 
 interface PendingEntry {
@@ -491,32 +519,101 @@ export function createConfirmationBroker(opts: ConfirmationBrokerOpts): Confirma
   const idGen = opts.idGen ?? randomUUID;
   const pending = new Map<string, PendingEntry>();
 
+  // Markdown is the authoritative format for confirm-prompt content. The
+  // web UI renders `markdown_source` via marked.js, producing proper
+  // `<ul><li>` lists; the Telegram path converts to its limited HTML subset
+  // via `mdToTelegramHtml`. Without this split, the web's innerHTML render
+  // collapses `\n` whitespace into a single line.
+  async function safeSendMarkdown(
+    chatId: number,
+    markdown: string,
+    replyMarkup: unknown | null,
+  ): Promise<number | null> {
+    try {
+      const sent = await opts.tg.sendMessage(chatId, mdToTelegramHtml(markdown), {
+        parse_mode: "HTML",
+        markdownSource: markdown,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      });
+      if (sent && typeof sent === "object" && "message_id" in sent) {
+        return sent.message_id;
+      }
+      return null;
+    } catch (err) {
+      log.warn("policy.confirm_send_failed", {
+        chatId,
+        error: (err as Error).message,
+      });
+      return null;
+    }
+  }
+
+  async function safeEditMarkdown(
+    chatId: number,
+    messageId: number,
+    markdown: string,
+    stripKeyboard: boolean,
+  ): Promise<void> {
+    try {
+      await opts.tg.editMessageText(chatId, messageId, mdToTelegramHtml(markdown), {
+        parse_mode: "HTML",
+        markdownSource: markdown,
+        ...(stripKeyboard ? { reply_markup: { inline_keyboard: [] } } : {}),
+      });
+    } catch (err) {
+      log.warn("policy.confirm_edit_failed", {
+        chatId,
+        messageId,
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  function verdictLine(decision: ConfirmDecision): string {
+    if (decision === "allow") return "— Allowed";
+    if (decision === "deny") return "— Denied";
+    return "— Timed out";
+  }
+
+  function outcomeLine(outcome: ConfirmOutcome): string {
+    if (outcome.ok) {
+      return outcome.message
+        ? `— Tool succeeded · ${outcome.message}`
+        : "— Tool succeeded";
+    }
+    return outcome.message
+      ? `— Tool failed: ${outcome.message}`
+      : "— Tool failed";
+  }
+
+  const noopFinalize: ConfirmHandle["finalize"] = async () => {
+    // No prompt was successfully sent — nothing to update.
+  };
+
   return {
     async request({ chatId, toolName, toolInput }) {
       const id = idGen();
-      const text = renderConfirmPrompt(toolName, toolInput);
-      try {
-        await opts.tg.sendMessage(chatId, text, {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: "✅ Allow", callback_data: `${CALLBACK_PREFIX}:${id}:a` },
-                { text: "❌ Deny", callback_data: `${CALLBACK_PREFIX}:${id}:d` },
-              ],
-            ],
-          },
-        });
-      } catch (err) {
-        log.warn("policy.confirm_send_failed", {
-          chatId,
-          toolName,
-          error: (err as Error).message,
-        });
-        // Fail closed: if we can't reach Telegram to ask, we deny.
-        return "deny";
+      const markdown = await renderConfirmPrompt(
+        toolName,
+        toolInput,
+        opts.confirmFormatters,
+      );
+      const replyMarkup = {
+        inline_keyboard: [
+          [
+            { text: "Allow", callback_data: `${CALLBACK_PREFIX}:${id}:a` },
+            { text: "Deny", callback_data: `${CALLBACK_PREFIX}:${id}:d` },
+          ],
+        ],
+      };
+      const messageId = await safeSendMarkdown(chatId, markdown, replyMarkup);
+      if (messageId === null) {
+        // Send failed (logged inside safeSendMarkdown). Fail closed: the
+        // caller can't know whether the operator saw the prompt, so deny.
+        log.warn("policy.confirm_send_failed_resolved_deny", { chatId, toolName });
+        return { decision: "deny", finalize: noopFinalize };
       }
-      return new Promise<ConfirmDecision>((resolve) => {
+      const decision = await new Promise<ConfirmDecision>((resolve) => {
         const timer = setTimeout(() => {
           if (pending.delete(id)) {
             log.warn("policy.confirm_timeout", { chatId, toolName, id });
@@ -525,12 +622,27 @@ export function createConfirmationBroker(opts: ConfirmationBrokerOpts): Confirma
         }, timeoutMs);
         pending.set(id, {
           timer,
-          resolve: (decision) => {
+          resolve: (d) => {
             clearTimeout(timer);
-            resolve(decision);
+            resolve(d);
           },
         });
       });
+      // First edit: append verdict line, strip keyboard so the prompt can't
+      // be re-tapped. The broker owns the full message lifecycle so verdict
+      // + outcome edits stay consistent.
+      const verdictMd = `${markdown}\n\n${verdictLine(decision)}`;
+      await safeEditMarkdown(chatId, messageId, verdictMd, true);
+      // Second edit (optional): caller invokes after running the tool.
+      // Idempotent — only the first call edits.
+      let finalized = false;
+      const finalize: ConfirmHandle["finalize"] = async (outcome) => {
+        if (finalized) return;
+        finalized = true;
+        const fullMd = `${verdictMd}\n${outcomeLine(outcome)}`;
+        await safeEditMarkdown(chatId, messageId, fullMd, false);
+      };
+      return { decision, finalize };
     },
     resolve(id, decision) {
       const entry = pending.get(id);
@@ -545,13 +657,40 @@ export function createConfirmationBroker(opts: ConfirmationBrokerOpts): Confirma
   };
 }
 
-function renderConfirmPrompt(toolName: string, toolInput: unknown): string {
-  const json = JSON.stringify(toolInput, null, 2) ?? "";
-  const truncated = json.length > 1500 ? `${json.slice(0, 1500)}…` : json;
-  return [
-    `🔐 <b>Confirm tool:</b> <code>${htmlEscapeText(toolName)}</code>`,
-    `<pre>${htmlEscapeText(truncated)}</pre>`,
-  ].join("\n");
+async function renderConfirmPrompt(
+  toolName: string,
+  toolInput: unknown,
+  formatters: ReadonlyMap<string, ConfirmFormatter> | undefined,
+): Promise<string> {
+  const shortName = toolName.startsWith(MCP_TOOL_PREFIX)
+    ? toolName.slice(MCP_TOOL_PREFIX.length)
+    : toolName;
+  let body: string | null = null;
+  const formatter = formatters?.get(shortName);
+  if (formatter) {
+    try {
+      const out = await formatter(toolInput);
+      if (typeof out === "string" && out.trim() !== "") {
+        body = out;
+      }
+    } catch (err) {
+      log.warn("policy.confirm_formatter_failed", {
+        toolName: shortName,
+        error: (err as Error).message,
+      });
+    }
+  }
+  if (body === null) {
+    const json = JSON.stringify(toolInput, null, 2) ?? "";
+    const truncated = json.length > 1500 ? `${json.slice(0, 1500)}…` : json;
+    // Markdown fenced code block — both marked (web) and `mdToTelegramHtml`
+    // (Telegram) render this as a `<pre>` block with whitespace preserved.
+    body = `\`\`\`\n${truncated}\n\`\`\``;
+  }
+  // Title line uses backticks (markdown inline code) for the tool name; the
+  // marked + mdToTelegramHtml renderers both pass the literal name through.
+  // No leading emoji — operator UX preference (see PR carlos/gmail-confirm-ux).
+  return [`**Confirm tool:** \`${toolName}\``, "", body].join("\n");
 }
 
 // Used by the transport's update dispatcher. Returns true if the update was a
@@ -660,6 +799,29 @@ export interface PolicyHookDeps {
   // confirm tier — the safe default. Captured at boot from the integrations
   // loader and reused across all turns. Tests pass an explicit map.
   integrationToolTiers?: ReadonlyMap<string, "auto" | "confirm">;
+  // When set, ConfirmHandle objects from broker.request are stashed here
+  // keyed by `toolName + JSON.stringify(input)` so a sibling PostToolUse
+  // hook can correlate by `tool_use_id` after the SDK runs the tool. The
+  // SDK does not pass `tool_use_id` to canUseTool, so we key by content
+  // instead. Race-free for non-parallel calls; for parallel identical
+  // calls the per-round single-confirm cap (Ollama) or model behavior
+  // (Claude) keeps the queue from stacking.
+  pendingHandles?: Map<string, ConfirmHandle>;
+}
+
+// Stable key used to bridge canUseTool → PostToolUse via the per-turn
+// `pendingHandles` map. Stringification is non-canonical (key order isn't
+// guaranteed by the spec), but PreToolUse + PostToolUse SDK events both
+// stringify the same `tool_input` reference path, so the hash is stable in
+// practice.
+export function pendingHandleKey(toolName: string, input: unknown): string {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(input);
+  } catch {
+    serialized = "";
+  }
+  return `${toolName}::${serialized}`;
 }
 
 // Build the per-turn `canUseTool` hook. The SDK may call this concurrently
@@ -707,15 +869,28 @@ export function createPolicyHook(deps: PolicyHookDeps): CanUseTool {
       return { behavior: "deny", message: decision.message };
     }
     log.info("policy.confirm_request", { auditId: deps.auditId, toolName });
-    const verdict = await deps.broker.request({
+    const handle = await deps.broker.request({
       chatId: deps.chatId,
       toolName,
       toolInput: input,
     });
-    log.info("policy.confirm_resolved", { auditId: deps.auditId, toolName, verdict });
-    if (verdict === "allow") return { behavior: "allow" };
+    log.info("policy.confirm_resolved", {
+      auditId: deps.auditId,
+      toolName,
+      verdict: handle.decision,
+    });
+    if (handle.decision === "allow") {
+      // Stash the handle so PostToolUse can finalize the confirm message
+      // with the actual tool outcome. If pendingHandles is absent (tests,
+      // legacy callers), the verdict-line edit still happened — just no
+      // outcome line will appear.
+      if (deps.pendingHandles) {
+        deps.pendingHandles.set(pendingHandleKey(toolName, input), handle);
+      }
+      return { behavior: "allow" };
+    }
     const reason =
-      verdict === "timeout"
+      handle.decision === "timeout"
         ? "user did not respond to confirmation within timeout"
         : "user denied tool call";
     return { behavior: "deny", message: reason };
@@ -819,6 +994,100 @@ export function createPreToolUseHook(deps: PreToolUseHookDeps): HookCallback {
       };
     }
 
+    return { continue: true };
+  };
+}
+
+// ---------------------------------------------------------------------------
+// PostToolUse hook — finalizes the confirm prompt with tool outcome
+// ---------------------------------------------------------------------------
+
+export interface PostToolUseHookDeps {
+  // Same map populated by `createPolicyHook` when a confirm-tier verdict
+  // was "allow". Lookup by `pendingHandleKey(tool_name, tool_input)`.
+  pendingHandles: Map<string, ConfirmHandle>;
+  // Optional cap on how much of `tool_response` to surface in the outcome
+  // footer. Defaults to 200 chars. The model sees the full result; the
+  // confirm-message footer is just operator UX.
+  outcomePreviewLen?: number;
+}
+
+// Best-effort summary of the SDK's `tool_response` for the confirm footer.
+// MCP tool handlers conventionally return `{ content: [{type:"text", text}] }`;
+// we extract the first text block. Anything else falls back to "" (the broker
+// renders just "Tool succeeded" without a tail).
+function extractResponsePreview(response: unknown, maxLen: number): string {
+  if (response === null || typeof response !== "object") return "";
+  const r = response as Record<string, unknown>;
+  const content = r.content;
+  if (!Array.isArray(content) || content.length === 0) return "";
+  const first = content[0] as Record<string, unknown> | undefined;
+  if (!first || typeof first !== "object") return "";
+  const text = first.text;
+  if (typeof text !== "string") return "";
+  // Try to surface a "success: true/false" hint if the integration returned
+  // JSON inside the text block (Gmail does). Failing that, just truncate.
+  const trimmed = text.trim();
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object") {
+      const obj = parsed as Record<string, unknown>;
+      if (obj.success === false) {
+        const err = typeof obj.error === "string" ? obj.error : "(no error message)";
+        return `failed: ${err}`.slice(0, maxLen);
+      }
+      // success path — pick a concise field if present.
+      const hints = ["modified", "trashed", "archived", "deleted", "messageId", "count"];
+      for (const k of hints) {
+        if (k in obj) {
+          return `${k}: ${String(obj[k])}`.slice(0, maxLen);
+        }
+      }
+    }
+  } catch {
+    // Not JSON — fall through to plain truncation.
+  }
+  return trimmed.slice(0, maxLen);
+}
+
+export function createPostToolUseHook(deps: PostToolUseHookDeps): HookCallback {
+  const previewLen = deps.outcomePreviewLen ?? 200;
+  return async (input): Promise<HookJSONOutput> => {
+    if (
+      input.hook_event_name !== "PostToolUse" &&
+      input.hook_event_name !== "PostToolUseFailure"
+    ) {
+      return { continue: true };
+    }
+    // Both event variants share `tool_name` + `tool_input`. PostToolUse also
+    // has `tool_response`; PostToolUseFailure does not (tool didn't run to
+    // completion). The SDK's HookInput union is wide; cast through unknown
+    // for the response field.
+    const event = input as unknown as {
+      tool_name: string;
+      tool_input: unknown;
+      tool_response?: unknown;
+    };
+    const key = pendingHandleKey(event.tool_name, event.tool_input);
+    const handle = deps.pendingHandles.get(key);
+    if (!handle) return { continue: true };
+    deps.pendingHandles.delete(key);
+    const ok = input.hook_event_name === "PostToolUse";
+    let message: string | undefined;
+    if (ok) {
+      const preview = extractResponsePreview(event.tool_response, previewLen);
+      // If the integration returned a structured `success: false`, treat the
+      // outcome as a failure for footer-rendering purposes even though the
+      // SDK considers it a successful tool call (the handler didn't throw).
+      if (preview.startsWith("failed:")) {
+        await handle.finalize({ ok: false, message: preview.slice("failed: ".length) });
+        return { continue: true };
+      }
+      message = preview === "" ? undefined : preview;
+    } else {
+      message = "tool execution failed";
+    }
+    await handle.finalize({ ok, message });
     return { continue: true };
   };
 }

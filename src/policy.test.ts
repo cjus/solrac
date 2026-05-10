@@ -643,7 +643,30 @@ describe("createConfirmationBroker", () => {
     callback_data: string[];
   }
 
-  function fakeTg(captured: FakeSend[] = []) {
+  interface FakeEdit {
+    chat_id: number;
+    message_id: number;
+    text: string;
+    reply_markup_stripped: boolean;
+  }
+
+  // The broker awaits `renderConfirmPrompt` AND `sendMessage` before adding
+  // to its `pending` map, so a single `await Promise.resolve()` isn't enough
+  // to guarantee `broker.resolve(...)` will find the entry. Poll until it
+  // does (or fail loudly).
+  async function waitForPending(
+    broker: ConfirmationBroker,
+    n: number = 1,
+    maxTicks: number = 20,
+  ): Promise<void> {
+    for (let i = 0; i < maxTicks; i++) {
+      if (broker.size() >= n) return;
+      await new Promise<void>((r) => setImmediate(r));
+    }
+    throw new Error(`broker.size() never reached ${n} within ${maxTicks} ticks`);
+  }
+
+  function fakeTg(captured: FakeSend[] = [], edits: FakeEdit[] = []) {
     return {
       sendMessage: async (chatId: number, text: string, opts?: { reply_markup?: unknown }) => {
         const buttons =
@@ -656,25 +679,140 @@ describe("createConfirmationBroker", () => {
         });
         return { message_id: 1 } as unknown as Awaited<ReturnType<typeof Promise.resolve>>;
       },
-      call: async () => true as never,
+      editMessageText: async (
+        chatId: number,
+        messageId: number,
+        text: string,
+        opts?: { reply_markup?: unknown },
+      ) => {
+        const rm = opts?.reply_markup as { inline_keyboard?: unknown[][] } | undefined;
+        edits.push({
+          chat_id: chatId,
+          message_id: messageId,
+          text,
+          reply_markup_stripped: Array.isArray(rm?.inline_keyboard) && rm!.inline_keyboard.length === 0,
+        });
+        return true as const;
+      },
     };
   }
 
-  test("resolves with 'allow' when allow id is dispatched", async () => {
+  test("resolves with 'allow' when allow id is dispatched + appends verdict line", async () => {
     const sent: FakeSend[] = [];
+    const edits: FakeEdit[] = [];
     const broker = createConfirmationBroker({
-      tg: fakeTg(sent) as Parameters<typeof createConfirmationBroker>[0]["tg"],
+      tg: fakeTg(sent, edits) as Parameters<typeof createConfirmationBroker>[0]["tg"],
       timeoutMs: 5_000,
       idGen: () => "00000000-0000-0000-0000-000000000001",
     });
     const promise = broker.request({ chatId: 99, toolName: "Bash", toolInput: { command: "git push" } });
-    // Allow the inline-keyboard sendMessage to flush.
-    await Promise.resolve();
+    await waitForPending(broker);
     expect(sent[0]?.callback_data).toContain("cb:00000000-0000-0000-0000-000000000001:a");
     const resolved = broker.resolve("00000000-0000-0000-0000-000000000001", "allow");
     expect(resolved).toBe(true);
-    await expect(promise).resolves.toBe("allow");
+    const handle = await promise;
+    expect(handle.decision).toBe("allow");
+    // Verdict-line edit fired and stripped the keyboard. The verdict line is
+    // plain text in markdown; mdToTelegramHtml passes it through verbatim.
+    expect(edits.length).toBe(1);
+    expect(edits[0]?.text).toContain("— Allowed");
+    expect(edits[0]?.reply_markup_stripped).toBe(true);
     expect(broker.size()).toBe(0);
+  });
+
+  test("finalize appends an outcome line on top of the verdict line", async () => {
+    const sent: FakeSend[] = [];
+    const edits: FakeEdit[] = [];
+    const broker = createConfirmationBroker({
+      tg: fakeTg(sent, edits) as Parameters<typeof createConfirmationBroker>[0]["tg"],
+      timeoutMs: 5_000,
+      idGen: () => "00000000-0000-0000-0000-000000000010",
+    });
+    const promise = broker.request({ chatId: 1, toolName: "Bash", toolInput: { command: "x" } });
+    await waitForPending(broker);
+    broker.resolve("00000000-0000-0000-0000-000000000010", "allow");
+    const handle = await promise;
+    await handle.finalize({ ok: true, message: "deleted: 7" });
+    expect(edits.length).toBe(2);
+    expect(edits[1]?.text).toContain("— Allowed");
+    expect(edits[1]?.text).toContain("— Tool succeeded · deleted: 7");
+    // Second call is a no-op (idempotent).
+    await handle.finalize({ ok: false, message: "should be ignored" });
+    expect(edits.length).toBe(2);
+  });
+
+  test("finalize renders a failure footer with the error message", async () => {
+    const sent: FakeSend[] = [];
+    const edits: FakeEdit[] = [];
+    const broker = createConfirmationBroker({
+      tg: fakeTg(sent, edits) as Parameters<typeof createConfirmationBroker>[0]["tg"],
+      timeoutMs: 5_000,
+      idGen: () => "00000000-0000-0000-0000-000000000011",
+    });
+    const promise = broker.request({ chatId: 1, toolName: "Bash", toolInput: { command: "x" } });
+    await waitForPending(broker);
+    broker.resolve("00000000-0000-0000-0000-000000000011", "allow");
+    const handle = await promise;
+    await handle.finalize({ ok: false, message: "rate limit exceeded" });
+    expect(edits[1]?.text).toContain("— Tool failed: rate limit exceeded");
+  });
+
+  test("custom formatter renders instead of the JSON dump", async () => {
+    const sent: FakeSend[] = [];
+    const edits: FakeEdit[] = [];
+    // Formatters return markdown; broker converts to Telegram HTML and
+    // forwards the raw markdown via `markdownSource` for the web UI.
+    const formatters = new Map<string, (input: unknown) => string>([
+      ["my_tool", () => `**rendered** body`],
+    ]);
+    const broker = createConfirmationBroker({
+      tg: fakeTg(sent, edits) as Parameters<typeof createConfirmationBroker>[0]["tg"],
+      timeoutMs: 5_000,
+      idGen: () => "00000000-0000-0000-0000-000000000020",
+      confirmFormatters: formatters,
+    });
+    const promise = broker.request({
+      chatId: 1,
+      toolName: "mcp__solrac__my_tool",
+      toolInput: { x: 1 },
+    });
+    await waitForPending(broker);
+    broker.resolve("00000000-0000-0000-0000-000000000020", "deny");
+    await promise;
+    // Telegram HTML form: `**rendered**` → `<b>rendered</b>`.
+    expect(sent[0]?.text).toContain("<b>rendered</b>");
+    // No JSON-fallback <pre> block when a formatter rendered.
+    expect(sent[0]?.text).not.toContain('"x":');
+  });
+
+  test("formatter that throws falls back to the JSON dump", async () => {
+    const sent: FakeSend[] = [];
+    const edits: FakeEdit[] = [];
+    const formatters = new Map<string, (input: unknown) => string>([
+      [
+        "broken_tool",
+        () => {
+          throw new Error("boom");
+        },
+      ],
+    ]);
+    const broker = createConfirmationBroker({
+      tg: fakeTg(sent, edits) as Parameters<typeof createConfirmationBroker>[0]["tg"],
+      timeoutMs: 5_000,
+      idGen: () => "00000000-0000-0000-0000-000000000021",
+      confirmFormatters: formatters,
+    });
+    const promise = broker.request({
+      chatId: 1,
+      toolName: "mcp__solrac__broken_tool",
+      toolInput: { foo: "bar" },
+    });
+    await waitForPending(broker);
+    broker.resolve("00000000-0000-0000-0000-000000000021", "deny");
+    await promise;
+    // Falls back to JSON in <pre>.
+    expect(sent[0]?.text).toContain("<pre>");
+    expect(sent[0]?.text).toContain("\"foo\"");
   });
 
   test("resolve on unknown id returns false", () => {
@@ -690,8 +828,8 @@ describe("createConfirmationBroker", () => {
       timeoutMs: 25,
       idGen: () => "00000000-0000-0000-0000-000000000002",
     });
-    const result = await broker.request({ chatId: 1, toolName: "Bash", toolInput: { command: "rm" } });
-    expect(result).toBe("timeout");
+    const handle = await broker.request({ chatId: 1, toolName: "Bash", toolInput: { command: "rm" } });
+    expect(handle.decision).toBe("timeout");
     expect(broker.size()).toBe(0);
   });
 
@@ -700,15 +838,20 @@ describe("createConfirmationBroker", () => {
       sendMessage: async () => {
         throw new Error("network down");
       },
-      call: async () => true as never,
+      editMessageText: async () => true as const,
     };
     const broker = createConfirmationBroker({
       tg: failingTg as Parameters<typeof createConfirmationBroker>[0]["tg"],
       timeoutMs: 1_000,
     });
-    await expect(
-      broker.request({ chatId: 1, toolName: "Write", toolInput: { file_path: "/x" } }),
-    ).resolves.toBe("deny");
+    const handle = await broker.request({
+      chatId: 1,
+      toolName: "Write",
+      toolInput: { file_path: "/x" },
+    });
+    expect(handle.decision).toBe("deny");
+    // finalize is still callable (no-op when no message was sent).
+    await handle.finalize({ ok: false });
   });
 });
 
@@ -777,7 +920,10 @@ describe("dispatchCallbackQuery", () => {
 describe("createPolicyHook", () => {
   function makeBroker(verdict: "allow" | "deny" | "timeout" = "allow"): ConfirmationBroker {
     return {
-      request: async () => verdict,
+      request: async () => ({
+        decision: verdict,
+        finalize: async () => {},
+      }),
       resolve: () => true,
       size: () => 0,
     };

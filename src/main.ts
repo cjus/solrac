@@ -107,6 +107,7 @@ import {
   parseEnginePrefix,
   truncateAuditPrompt,
   type ConfirmationBroker,
+  type ConfirmHandle,
   type CostCapGuard,
   type DenialThrottle,
   type GlobalCostCapGuard,
@@ -115,6 +116,7 @@ import { createTurnQueue } from "./queue.ts";
 import { startServer } from "./server.ts";
 import { createSessionStore, type SessionStore } from "./session.ts";
 import {
+  type ConfirmFormatter,
   createIntegrationContext,
   loadIntegrations,
   logIntegrationLoadResult,
@@ -148,7 +150,11 @@ interface RunTurnDeps {
   secondaryModel: string;
   costGuard: CostCapGuard;
   globalCostGuard: GlobalCostCapGuard;
-  createCanUseTool: (args: { chatId: number; auditId: number }) => CanUseTool;
+  createCanUseTool: (args: {
+    chatId: number;
+    auditId: number;
+    pendingHandles: Map<string, ConfirmHandle>;
+  }) => CanUseTool;
   // PLAN Step 11: present iff `OLLAMA_ENABLED=true`. When set, `>`-prefixed
   // messages route to runOllamaTurn instead of runAgent. Both paths share the
   // queue, mutex, semaphore, and tracker drain — dispatch happens inside the
@@ -315,26 +321,15 @@ async function handleCallbackQuery(
   const text = result.expired
     ? "Confirmation expired — send the request again."
     : result.decision === "allow"
-      ? "✅ Allowed"
-      : "❌ Denied";
+      ? "Allowed"
+      : "Denied";
+  // The toast shown on the user's tap. Confirm-message text edits (verdict
+  // line + outcome line) are owned by the broker — see policy.ts so the
+  // verdict + tool-outcome footers stay consistent. We keep `answerCallbackQuery`
+  // here because it requires the `callback_query_id` from the update event.
   await tg
     .call("answerCallbackQuery", { callback_query_id: result.callbackQueryId, text })
     .catch((err) => log.warn("callback.ack_failed", { error: (err as Error).message }));
-  // Strip the inline keyboard so the prompt can't be re-tapped. Append the
-  // verdict to the message text so chat history shows what was decided after
-  // the toast disappears.
-  const cqMsg = update.callback_query?.message;
-  if (cqMsg && "message_id" in cqMsg && "chat" in cqMsg) {
-    const original = "text" in cqMsg && typeof cqMsg.text === "string" ? cqMsg.text : "";
-    await tg
-      .call("editMessageText", {
-        chat_id: cqMsg.chat.id,
-        message_id: cqMsg.message_id,
-        text: `${original}\n\n— ${text}`,
-        reply_markup: { inline_keyboard: [] },
-      })
-      .catch((err) => log.warn("callback.strip_keyboard_failed", { error: (err as Error).message }));
-  }
 }
 
 function gateAndAuditDenied(
@@ -561,25 +556,21 @@ async function main(): Promise<void> {
   if (config.transport === "poll") {
     const tg = createTelegramClient(config.telegramBotToken);
     const tracker = new TurnTracker();
-    const broker = createConfirmationBroker({ tg });
-    // Separate broker for the web transport so confirmation prompts go to
-    // the WebClient bus (and on into the SSE stream) instead of Telegram.
-    // The web's `/api/confirm` endpoint calls `webBroker.resolve(...)`.
     const tgWebClient = config.webEnabled ? createWebClient() : null;
-    const webBroker = tgWebClient ? createConfirmationBroker({ tg: tgWebClient }) : null;
     const costGuard = createCostCapGuard(db, config.hourlyCostCapUsd);
     const globalCostGuard = createGlobalCostCapGuard(db, config.globalHourlyCostCapUsd);
     const denialThrottle = createDenialThrottle();
-    // Phase 2 — load integrations BEFORE `createCanUseTool` so the per-turn
-    // policy hook closes over the per-tool tier map captured here. Off by
-    // default; when enabled, both `src/integrations-builtin/` (always tried,
-    // shipped with solrac) and `$SOLRAC_INTEGRATIONS_DIR` (operator-owned)
-    // are scanned. First-dir-wins on tool-name collisions so a stale
-    // operator copy can't shadow a blessed integration. Tools registered
-    // here surface to Claude tiers as `mcp__solrac__<name>`. Ollama
-    // path does NOT see integrations on the tools-off branch — see ollama.ts.
+    // Load integrations BEFORE the brokers so the per-tool confirm-prompt
+    // formatter map can be captured into both. Off by default; when enabled,
+    // both `src/integrations-builtin/` (always tried, shipped with solrac)
+    // and `$SOLRAC_INTEGRATIONS_DIR` (operator-owned) are scanned. First-dir-
+    // wins on tool-name collisions so a stale operator copy can't shadow a
+    // blessed integration. Tools registered here surface to Claude tiers as
+    // `mcp__solrac__<name>`. Ollama path does NOT see integrations on the
+    // tools-off branch — see ollama.ts.
     let integrationsMcpServer: McpSdkServerConfigWithInstance | null = null;
     let integrationToolTiers: ReadonlyMap<string, "auto" | "confirm"> = new Map();
+    let integrationConfirmFormatters: ReadonlyMap<string, ConfirmFormatter> = new Map();
     // PR-A — capture the tools array so the Ollama tools-on path can reuse
     // the same in-process integration handlers. Stays empty (and the array
     // reference is shared as `EMPTY_INTEGRATIONS_TOOLS`) when integrations
@@ -593,6 +584,7 @@ async function main(): Promise<void> {
       );
       logIntegrationLoadResult([builtinDir, config.integrationsDir], result);
       integrationToolTiers = result.toolTiers;
+      integrationConfirmFormatters = result.confirmFormatters;
       integrationTools = result.tools;
       if (result.tools.length > 0) {
         integrationsMcpServer = createSdkMcpServer({
@@ -612,7 +604,28 @@ async function main(): Promise<void> {
         hint: "set SOLRAC_INTEGRATIONS_DIR or add modules under integrations-builtin/",
       });
     }
-    const createCanUseTool = ({ chatId, auditId }: { chatId: number; auditId: number }) => {
+    const broker = createConfirmationBroker({
+      tg,
+      confirmFormatters: integrationConfirmFormatters,
+    });
+    // Separate broker for the web transport so confirmation prompts go to
+    // the WebClient bus (and on into the SSE stream) instead of Telegram.
+    // The web's `/api/confirm` endpoint calls `webBroker.resolve(...)`.
+    const webBroker = tgWebClient
+      ? createConfirmationBroker({
+          tg: tgWebClient,
+          confirmFormatters: integrationConfirmFormatters,
+        })
+      : null;
+    const createCanUseTool = ({
+      chatId,
+      auditId,
+      pendingHandles,
+    }: {
+      chatId: number;
+      auditId: number;
+      pendingHandles: Map<string, ConfirmHandle>;
+    }) => {
       const b = webBroker && chatId === config.webChatId ? webBroker : broker;
       return createPolicyHook({
         chatId,
@@ -620,6 +633,7 @@ async function main(): Promise<void> {
         costGuard,
         broker: b,
         integrationToolTiers,
+        pendingHandles,
       });
     };
     // PLAN Step 11: Ollama deps are constructed once iff the feature is on.

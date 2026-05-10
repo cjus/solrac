@@ -89,6 +89,7 @@ import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import {
   classifyToolWithIntegrations,
   type ConfirmationBroker,
+  type ConfirmHandle,
   type LoopDetector,
 } from "./policy.ts";
 import type { IntegrationTier } from "./integrations.ts";
@@ -260,6 +261,12 @@ export async function executeToolCall(
   const fullName = SOLRAC_MCP_PREFIX + shortName;
   const args = normalizeToolArgs(call.arguments);
 
+  // Per-call ConfirmHandle (null for auto-tier paths). Set inside the
+  // confirm branch below; consumed at the end of the handler-execution
+  // path so the confirm message gets a final outcome footer. Local — never
+  // shared across concurrent executeToolCall invocations.
+  let confirmHandle: ConfirmHandle | null = null;
+
   // Step 1: loop detector (matches PreToolUse ordering — runs before classify
   // so a model spamming the same call is cut off before broker dispatch,
   // including a runaway on a fabricated name).
@@ -354,9 +361,9 @@ export async function executeToolCall(
       chatId: deps.chatId,
       tool: shortName,
     });
-    let verdict;
+    let handle: ConfirmHandle;
     try {
-      verdict = await deps.broker.request({
+      handle = await deps.broker.request({
         chatId: deps.chatId,
         toolName: fullName,
         toolInput: args,
@@ -382,23 +389,25 @@ export async function executeToolCall(
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
-      verdict,
+      verdict: handle.decision,
     });
-    if (verdict === "deny") {
+    if (handle.decision === "deny") {
       return {
         content: "denied: user declined the confirmation",
         disposition: "denied_user",
         reason: "user declined",
       };
     }
-    if (verdict === "timeout") {
+    if (handle.decision === "timeout") {
       return {
         content: "denied: confirmation timed out",
         disposition: "denied_timeout",
         reason: "broker timeout",
       };
     }
-    // verdict === "allow" — fall through to invoke.
+    // verdict === "allow" — fall through to invoke. Stash the handle so we
+    // can finalize the confirm message with the tool outcome below.
+    confirmHandle = handle;
   }
 
   // Step 5: validate against the tool's own zod schema before invoking — the model
@@ -415,6 +424,7 @@ export async function executeToolCall(
       tool: shortName,
       issues,
     });
+    await confirmHandle?.finalize({ ok: false, message: `invalid args: ${issues}` });
     return {
       content: `error: invalid arguments — ${issues}`,
       disposition: "error_invalid_args",
@@ -433,6 +443,7 @@ export async function executeToolCall(
       tool: shortName,
       error: msg,
     });
+    await confirmHandle?.finalize({ ok: false, message: msg });
     return {
       content: `error: handler threw — ${msg}`,
       disposition: "error_handler_threw",
@@ -448,7 +459,69 @@ export async function executeToolCall(
     contentLen: content.length,
     truncated,
   });
+  // Inspect the handler's structured payload for an explicit `success: false`
+  // (Gmail and other integrations conventionally return this shape inside
+  // their text block) so the confirm footer reflects logical failure even
+  // when the handler didn't throw.
+  const outcome = inferConfirmOutcome(result, content);
+  await confirmHandle?.finalize(outcome);
   return { content, disposition: "ok", truncated };
+}
+
+// Walks a coalesced MCP result for a structured `success` field so callers
+// can surface "tool ran, but logically failed" as a confirm-footer failure,
+// and pick a concise field (`trashed: 10`, `deleted: 3`) for the success
+// footer instead of dumping the whole JSON. Mirrors `policy.ts::extractResponsePreview`
+// for the Claude SDK path; both should evolve together.
+const OUTCOME_HINT_KEYS = [
+  "modified",
+  "trashed",
+  "archived",
+  "deleted",
+  "labelsApplied",
+  "labelsRemoved",
+  "messageId",
+  "count",
+];
+
+function inferConfirmOutcome(
+  result: unknown,
+  textContent: string,
+): { ok: boolean; message?: string } {
+  if (result && typeof result === "object") {
+    const r = result as { content?: unknown };
+    if (Array.isArray(r.content) && r.content.length > 0) {
+      const first = r.content[0] as Record<string, unknown> | undefined;
+      if (first && typeof first === "object" && typeof first.text === "string") {
+        try {
+          const parsed = JSON.parse(first.text);
+          if (parsed && typeof parsed === "object") {
+            const obj = parsed as Record<string, unknown>;
+            if (obj.success === false) {
+              const msg = typeof obj.error === "string" ? obj.error : undefined;
+              return { ok: false, message: msg };
+            }
+            // Success path — pick a concise hint field if present so the
+            // confirm-message footer shows "trashed: 10" instead of dumping
+            // the whole JSON envelope.
+            for (const k of OUTCOME_HINT_KEYS) {
+              if (k in obj) {
+                return { ok: true, message: `${k}: ${String(obj[k])}` };
+              }
+            }
+            return { ok: true };
+          }
+        } catch {
+          // Not JSON — fall through to plain-text preview below.
+        }
+      }
+    }
+  }
+  // Last resort for non-JSON tool results: short trim only. The model's
+  // final narration is in the chat stream regardless.
+  const trimmed = textContent.trim();
+  if (trimmed === "" || trimmed.length > 120) return { ok: true };
+  return { ok: true, message: trimmed };
 }
 
 // Some Ollama-tools-supported models emit `arguments` as a JSON-encoded string

@@ -94,6 +94,18 @@ export const INTEGRATION_API_VERSION = 1 as const;
 
 export type IntegrationTier = "auto" | "confirm";
 
+/**
+ * Per-tool renderer for the confirm-prompt body. Returns **markdown**: the
+ * broker converts it to Telegram's HTML subset for the chat client and
+ * passes the raw markdown through `markdownSource` so the web UI can render
+ * it via `marked.parse` (proper `<ul><li>` list rendering). Integrations
+ * are responsible for escaping any user-controlled fields that contain
+ * markdown-special characters (backticks, asterisks, brackets) before
+ * interpolating. Throwing or returning an empty string falls back to a
+ * JSON code block so a formatter bug never blocks the confirm UX.
+ */
+export type ConfirmFormatter = (input: unknown) => string | Promise<string>;
+
 export interface IntegrationContext {
   /** Zod instance solrac was built against. Use to declare tool input schemas. */
   readonly z: typeof z;
@@ -120,6 +132,13 @@ export interface IntegrationModule {
     readonly tier?: IntegrationTier;
     /** Per-tool tier override. Wins over `meta.tier`. */
     readonly toolTiers?: Readonly<Record<string, IntegrationTier>>;
+    /**
+     * Per-tool confirm-prompt formatters. Keys are the short tool name (the
+     * same name passed to `ctx.tool()`); the broker strips the
+     * `mcp__solrac__` prefix before lookup. When absent for a given tool, the
+     * broker falls back to a generic JSON dump of `toolInput`.
+     */
+    readonly confirmFormatters?: Readonly<Record<string, ConfirmFormatter>>;
   };
 }
 
@@ -145,6 +164,8 @@ export interface IntegrationLoadResult {
   readonly tools: ReadonlyArray<SdkMcpToolDefinition<any>>;
   /** Map of tool name → effective tier (used by `policy.ts`). */
   readonly toolTiers: ReadonlyMap<string, IntegrationTier>;
+  /** Map of short tool name → confirm-prompt formatter (used by the broker). */
+  readonly confirmFormatters: ReadonlyMap<string, ConfirmFormatter>;
   readonly errors: ReadonlyArray<IntegrationLoadError>;
   readonly sources: ReadonlyArray<IntegrationSource>;
   readonly loadedCount: number;
@@ -153,6 +174,7 @@ export interface IntegrationLoadResult {
 export const EMPTY_INTEGRATION_RESULT: IntegrationLoadResult = Object.freeze({
   tools: Object.freeze([] as ReadonlyArray<SdkMcpToolDefinition<any>>),
   toolTiers: new Map<string, IntegrationTier>(),
+  confirmFormatters: new Map<string, ConfirmFormatter>(),
   errors: Object.freeze([] as ReadonlyArray<IntegrationLoadError>),
   sources: Object.freeze([] as ReadonlyArray<IntegrationSource>),
   loadedCount: 0,
@@ -244,6 +266,19 @@ function validateModule(raw: unknown): ValidationResult {
         }
       }
     }
+    if (meta.confirmFormatters !== undefined) {
+      if (typeof meta.confirmFormatters !== "object" || meta.confirmFormatters === null) {
+        return { module: null, error: "meta.confirmFormatters must be an object" };
+      }
+      for (const [k, v] of Object.entries(meta.confirmFormatters)) {
+        if (typeof v !== "function") {
+          return {
+            module: null,
+            error: `meta.confirmFormatters["${k}"] must be a function`,
+          };
+        }
+      }
+    }
   }
   return { module: raw as IntegrationModule, error: null };
 }
@@ -312,6 +347,7 @@ export async function loadIntegrations(
 ): Promise<IntegrationLoadResult> {
   const tools: SdkMcpToolDefinition<any>[] = [];
   const toolTiers = new Map<string, IntegrationTier>();
+  const confirmFormatters = new Map<string, ConfirmFormatter>();
   const errors: IntegrationLoadError[] = [];
   const sources: IntegrationSource[] = [];
   // Tracks which integration registered each tool name, for collision logging.
@@ -357,6 +393,7 @@ export async function loadIntegrations(
 
       const defaultTier: IntegrationTier = module.meta?.tier ?? "confirm";
       const overrides = module.meta?.toolTiers ?? {};
+      const formatterOverrides = module.meta?.confirmFormatters ?? {};
       let added = 0;
       for (const t of module.tools) {
         const existingOwner = toolOwners.get(t.name);
@@ -373,6 +410,10 @@ export async function loadIntegrations(
         tools.push(t);
         const tier = overrides[t.name] ?? defaultTier;
         toolTiers.set(t.name, tier);
+        const formatter = formatterOverrides[t.name];
+        if (formatter !== undefined) {
+          confirmFormatters.set(t.name, formatter);
+        }
         added++;
       }
       sources.push({
@@ -387,6 +428,7 @@ export async function loadIntegrations(
   return {
     tools: Object.freeze(tools),
     toolTiers,
+    confirmFormatters,
     errors: Object.freeze(errors),
     sources: Object.freeze(sources),
     loadedCount,

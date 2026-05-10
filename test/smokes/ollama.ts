@@ -265,7 +265,7 @@ async function main(): Promise<void> {
     // wire one in to satisfy the OllamaRunDeps shape and to make the path
     // work on the off chance the integration's tier changes.
     const broker: Pick<ConfirmationBroker, "request"> = {
-      request: async () => "allow",
+      request: async () => ({ decision: "allow", finalize: async () => {} }),
     };
 
     const tg4 = makeCapturedTg();
