@@ -25,7 +25,8 @@ If you'd rather use Claude Code's official Telegram plugin, that's a perfectly g
 
 - **Customizable persona via `SOUL.md` + `SOLRAC.md`** — two operator-editable markdown files at the launch directory. `SOUL.md` (voice, stance, safety) ships with the package and is read once at boot. `SOLRAC.md` (operator overlay: who runs it, channel posture, project context) is re-read every turn so live edits land on the next message without a restart. See [docs/USAGE.md#customizing-solrac-soulmd-and-solracmd](./docs/USAGE.md#customizing-solrac-soulmd-and-solracmd).
 - **Slash commands** — `/help`, `/status`, `/context`, `/clear`, `/compact` give the operator visibility and control over conversation context, spend, and session state without leaving Telegram. Both `/cmd` and `:cmd` invoke the same handler (`:` avoids Telegram's auto-link on bold text).
-- **Operator-defined skills** — drop a `SKILL.md` into `$SOLRAC_SKILLS_DIR/<name>/` and that filename becomes a slash command on the next boot. Tool-less single-turn prompts with `{{args}}` templating; cost-capped under the existing per-chat hourly budget. Off by default; enable with `SOLRAC_SKILLS_ENABLED=true`.
+- **Operator-defined skills** — drop a `SKILL.md` into `$SOLRAC_SKILLS_DIR/<name>/` and that filename becomes a slash command on the next boot. Tool-less single-turn prompts with `{{args}}` templating; tier defaults to `SOLRAC_DEFAULT_ENGINE` (free on Ollama deploys); cost-capped under the existing per-chat hourly budget. Optional `tool: true` frontmatter exposes the skill as a callable MCP tool to the local Ollama agent (Phase 1: `tier: ollama` only) so natural-language requests can route through your prompts. Off by default; enable with `SOLRAC_SKILLS_ENABLED=true`.
+- **Scheduled tasks** — drop a `TASK.md` into `$SOLRAC_TASKS_DIR/<name>/` and the prompt fires on its configured schedule (`every 1h`, `daily_at 09:00`, `at 2026-05-15T13:00:00Z`) into a configured chat. Engine inheritance (defaults to `config.defaultEngine`), per-task `max_cost_usd`, boot catch-up jitter; fires synthesize updates through the same turn queue so all existing safety machinery applies. `/tasks` lists loaded tasks with last + next fire; `/tasks run <name>` triggers on demand. Off by default; enable with `SOLRAC_TASKS_ENABLED=true`. See [docs/USAGE.md#scheduled-tasks](./docs/USAGE.md#scheduled-tasks).
 - **Multi-user, multi-chat** — gated by per-`from.id` allowlist.
 - **Three-tier permission policy** — auto-allow / auto-deny / Telegram-inline-keyboard-confirm. Configurable rule tables.
 - **Per-chat hourly cost cap** — sliding 60-minute window over the audit log. Default $1.00/chat/hour.
@@ -131,6 +132,8 @@ solrac/
 │   ├── ollama.ts                    local Ollama runner (default engine)
 │   ├── commands.ts                  slash command parser, dispatcher, handlers
 │   ├── skills.ts                    operator-defined SKILL.md discovery
+│   ├── skill-tools.ts               expose tool:true skills to Ollama (ALS-propagated context)
+│   ├── scheduler.ts                 TASK.md discovery + tick loop
 │   ├── server.ts                    /health + /stats
 │   ├── lifecycle.ts                 graceful shutdown
 │   ├── daily-report.ts              cost report cron

@@ -388,6 +388,25 @@ Canonical event names:
 - `cost_report.send_failed` — telegram error; meta key unchanged
 - `cost_report.error` — uncaught throw (rare)
 
+### Skills
+- `skills.loaded` — boot summary `{ dir, count, errors }`. `count` is the registry size.
+- `skills.load_error` — one entry per malformed `SKILL.md` (parser rejection or name collision); fail-soft, boot continues.
+- `skills.tools_loaded` — `{ count }` of `tool: true && tier: ollama` skills exposed to the Ollama tool catalog. Absent line = 0 tool-eligible skills.
+- `skill.done` — per slash-command invocation summary `{ skill, tier, costUsd, replyLength, ... }`.
+- `skill.error` / `skill.ollama_error` — slash-command path failure (Claude SDK error, Ollama unreachable, timeout, etc.).
+- `skill_tools.done` — agent-driven (tool call) skill invocation completed `{ skill, tier, parentAuditId, replyLength }`.
+- `skill_tools.error` — tool-call path failure; the audit row is written and a structured error envelope returns to the agent.
+- `skill_tools.no_context` — the handler ran outside `skillToolCtx.run(...)`; means a future refactor broke the loop driver wrap. Investigate.
+- `skill_tools.ollama_unconfigured` — boot warn: tool-eligible skills exist but Ollama isn't configured; tools weren't registered.
+
+### Scheduler
+- `scheduler.tasks_loaded` — `{ dir, count, errors }` at boot, mirrors skills.
+- `scheduler.task_load_error` — one per malformed `TASK.md`.
+- `scheduler.started` — tick loop active, `{ taskCount }`.
+- `scheduler.task_fired` — `{ name, chatId, engine, kind }` whenever the tick driver dispatches a fire (also catch-up on boot).
+- `scheduler.task_skipped_cap` — pre-flight `max_cost_usd` check tripped; the fire is skipped and a denial audit row is written.
+- `shutdown.scheduler_stopped` — tick loop cleared during graceful shutdown.
+
 ### Tracing examples
 
 A single turn end-to-end:
@@ -535,6 +554,89 @@ SELECT chat_id,
        datetime(updated_at/1000, 'unixepoch') AS last_used
 FROM sessions
 ORDER BY updated_at DESC;
+```
+
+### Scheduled task activity
+
+Every scheduler fire writes an audit row tagged `origin='scheduled'` with `task_name=<name>`.
+
+```sql
+SELECT datetime(started_at/1000, 'unixepoch') AS fired_at,
+       task_name,
+       status,
+       ROUND(cost_usd, 4) AS cost,
+       error_message
+FROM audit
+WHERE origin = 'scheduled'
+ORDER BY started_at DESC
+LIMIT 20;
+```
+
+Per-task summary over the last 7 days:
+
+```sql
+SELECT task_name,
+       COUNT(*) AS fires,
+       SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok,
+       SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS err,
+       ROUND(SUM(cost_usd), 4) AS total_cost
+FROM audit
+WHERE origin = 'scheduled'
+  AND started_at >= (strftime('%s','now','-7 days') * 1000)
+GROUP BY task_name
+ORDER BY fires DESC;
+```
+
+`scheduled_tasks` table tracks per-task state independent of the audit log:
+
+```sql
+SELECT name,
+       datetime(last_run_at/1000, 'unixepoch') AS last_run,
+       last_status,
+       one_off_consumed
+FROM scheduled_tasks
+ORDER BY last_run_at DESC;
+```
+
+### Skill invocations (slash + agent-driven)
+
+Operator-typed `/<skill>` and Ollama-agent tool calls share the same `model` tag (`<engine>:<model>:skill:<name>`); the `origin` column distinguishes them.
+
+```sql
+-- All skill activity in the last 24h, both surfaces
+SELECT datetime(started_at/1000, 'unixepoch') AS at,
+       origin,
+       model,
+       status,
+       ROUND(cost_usd, 4) AS cost
+FROM audit
+WHERE model LIKE '%:skill:%'
+  AND started_at >= (strftime('%s','now','-1 day') * 1000)
+ORDER BY started_at DESC;
+```
+
+```sql
+-- Just agent-driven calls (Phase 1 skills-as-tools)
+SELECT datetime(started_at/1000, 'unixepoch') AS at,
+       model,
+       SUBSTR(prompt, 1, 60) AS args_preview,
+       status
+FROM audit
+WHERE origin = 'tool_call'
+ORDER BY started_at DESC
+LIMIT 20;
+```
+
+```sql
+-- Per-skill split: how often each skill fires + via which surface
+SELECT
+  SUBSTR(model, INSTR(model, ':skill:') + 7) AS skill_name,
+  origin,
+  COUNT(*) AS n
+FROM audit
+WHERE model LIKE '%:skill:%'
+GROUP BY skill_name, origin
+ORDER BY n DESC;
 ```
 
 ---

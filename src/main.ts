@@ -78,6 +78,7 @@ import {
   BOT_COMMAND_REGISTRY,
   parseCommand,
   runCommand,
+  type OllamaSkillDeps,
   type RunCommandDeps,
 } from "./commands.ts";
 import { loadConfig, type Config } from "./config.ts";
@@ -113,6 +114,15 @@ import {
   type GlobalCostCapGuard,
 } from "./policy.ts";
 import { createTurnQueue } from "./queue.ts";
+import {
+  EMPTY_TASK_REGISTRY,
+  getScheduledContext,
+  loadTasksSync,
+  logTaskLoadResult,
+  startScheduler,
+  type SchedulerHandle,
+  type TaskRegistry,
+} from "./scheduler.ts";
 import { startServer } from "./server.ts";
 import { createSessionStore, type SessionStore } from "./session.ts";
 import {
@@ -121,6 +131,7 @@ import {
   loadIntegrations,
   logIntegrationLoadResult,
 } from "./integrations.ts";
+import { buildSkillTools } from "./skill-tools.ts";
 import {
   EMPTY_SKILL_REGISTRY,
   loadSkillsSync,
@@ -186,11 +197,17 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
       log.debug("turn.ignored", { update_id: update.update_id, kind: "non-text-or-no-from" });
       return;
     }
+    // Scheduler — when this update was synthesized by the tick driver, the
+    // message carries a `__solrac_scheduled` field. Skips the slash-command
+    // parser (scheduled tasks never invoke `/cmd`) and propagates the task
+    // identity into the runner so the audit row carries origin='scheduled'.
+    const scheduledCtx = getScheduledContext(msg);
     log.info("turn.start", {
       update_id: update.update_id,
       chat_id: msg.chat.id,
       from_id: msg.from.id,
       text: msg.text.slice(0, 80),
+      ...(scheduledCtx && { scheduled_task: scheduledCtx.name }),
     });
 
     // PNX-167 — slash commands intercept before engine-prefix routing. Three
@@ -199,6 +216,13 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
     //   - ignore     → starts with `/` but `@bot` targets another bot in a
     //                  group chat; drop the update silently
     //   - passthrough → not a command; existing engine routing handles it
+    //
+    // Skip command parsing for scheduled fires — the scheduler rejects empty
+    // bodies at parse, and a TASK.md whose body happens to start with `/`
+    // would otherwise be hijacked by a bot command.
+    if (scheduledCtx) {
+      // Fall through to engine-prefix routing below.
+    } else {
     const parsedCmd = parseCommand(msg.text, {
       botUsername: deps.botUsername,
       skillRegistry: deps.skillRegistry,
@@ -219,6 +243,7 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
       });
       return;
     }
+    } // end !scheduledCtx command-parsing branch
 
     const parsed = parseEnginePrefix(msg.text, deps.config.defaultEngine);
 
@@ -240,8 +265,9 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
       await runOllamaTurn(deps.ollamaDeps, {
         chatId: msg.chat.id,
         fromId: msg.from.id,
-        updateId: update.update_id,
+        updateId: scheduledCtx ? null : update.update_id,
         prompt: parsed.prompt,
+        scheduledTaskName: scheduledCtx?.name ?? null,
       });
       log.info("turn.done", { update_id: update.update_id, chat_id: msg.chat.id, route: "ollama" });
       return;
@@ -298,9 +324,10 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
       {
         chatId: msg.chat.id,
         fromId: msg.from.id,
-        updateId: update.update_id,
+        updateId: scheduledCtx ? null : update.update_id,
         prompt: promptForAgent,
         engine: parsed.engine,
+        scheduledTaskName: scheduledCtx?.name ?? null,
       },
     );
     log.info("turn.done", {
@@ -594,6 +621,51 @@ async function main(): Promise<void> {
         });
       }
     }
+
+    // Skill-side Ollama deps (one-shot, no tool loop, no streaming). Built
+    // from config directly (not derived from `ollamaDeps` below) so it's
+    // available for `buildSkillTools` before the main `ollamaDeps` is
+    // assembled. Both consumers see the same connection params.
+    const ollamaSkillDeps: OllamaSkillDeps | null =
+      config.ollamaEnabled && config.ollamaModel
+        ? {
+            url: config.ollamaUrl,
+            model: config.ollamaModel,
+            timeoutMs: config.ollamaTimeoutMs,
+            soul,
+          }
+        : null;
+
+    // Skill registry — load before assembling the Ollama tool surface so
+    // tool-eligible skills (`tool: true && tier: ollama`) can be merged into
+    // `integrationTools` and surface to the local model alongside built-in
+    // integrations. Disabled by default (`SOLRAC_SKILLS_ENABLED=false`);
+    // fail-soft: a malformed SKILL.md degrades that single skill, not boot.
+    const skillRegistry: SkillRegistry = config.skillsEnabled
+      ? (() => {
+          const reserved = new Set(BOT_COMMAND_REGISTRY.map((c) => c.command));
+          const result = loadSkillsSync(config.skillsDir, reserved, config.defaultEngine);
+          logSkillLoadResult(config.skillsDir, result);
+          return result.registry;
+        })()
+      : EMPTY_SKILL_REGISTRY;
+
+    // Tool-eligible skills become MCP tools the Ollama agent can call by name.
+    // All skill tools auto-allow (locked decision; cost cap is the backstop —
+    // and Phase 1 ollama-tier skills are free anyway). Names are added to
+    // `integrationToolTiers` so the policy classifier sees the same map.
+    const skillTools = buildSkillTools(skillRegistry, {
+      db,
+      ollamaSkillDeps,
+    });
+    if (skillTools.length > 0) {
+      const merged = new Map(integrationToolTiers);
+      for (const t of skillTools) merged.set(t.name, "auto");
+      integrationToolTiers = merged;
+      integrationTools = [...integrationTools, ...skillTools];
+      log.info("skills.tools_loaded", { count: skillTools.length });
+    }
+
     // PR-A — boot warning: tools enabled but no integrations actually loaded.
     // Operator probably forgot to drop something into `integrationsDir`, or
     // a typo broke every module. Fail-soft (start anyway) but make the
@@ -703,18 +775,17 @@ async function main(): Promise<void> {
       botUsername,
       botId: me?.id ?? null,
     });
-    // PNX-167.1 — load operator-defined skills before registering Telegram
-    // bot commands so autocomplete includes them. Disabled by default
-    // (`SOLRAC_SKILLS_ENABLED=false`) — when enabled, fail-soft: a bad
-    // SKILL.md degrades that single skill, not the whole boot.
-    const skillRegistry: SkillRegistry = config.skillsEnabled
+    // Scheduler — load TASK.md files at boot. Same fail-soft posture as
+    // skills: a malformed TASK.md degrades that single task, not the whole
+    // boot. The scheduler tick loop is started later, after the turn queue
+    // is built (it depends on `queue.enqueue`).
+    const taskRegistry: TaskRegistry = config.tasksEnabled
       ? (() => {
-          const reserved = new Set(BOT_COMMAND_REGISTRY.map((c) => c.command));
-          const result = loadSkillsSync(config.skillsDir, reserved);
-          logSkillLoadResult(config.skillsDir, result);
+          const result = loadTasksSync(config.tasksDir, config.defaultEngine);
+          logTaskLoadResult(config.tasksDir, result);
           return result.registry;
         })()
-      : EMPTY_SKILL_REGISTRY;
+      : EMPTY_TASK_REGISTRY;
 
     // PNX-167 — register slash commands so Telegram clients show them in the
     // bot's autocomplete menu. Non-fatal — autocomplete is a UX nicety.
@@ -732,6 +803,11 @@ async function main(): Promise<void> {
     // depends on `commandDeps`. Break the cycle by constructing `commandDeps`
     // with a closure that captures `queue` after it's built.
     let queueRef: ReturnType<typeof createTurnQueue> | null = null;
+    // Mutable forward reference so `runCommand` can invoke the scheduler's
+    // `triggerNow` from a `/tasks run <name>` reply. The scheduler is
+    // constructed AFTER `commandDeps` (it depends on `queue`); the closure
+    // resolves the latest reference at call time.
+    let schedulerRef: SchedulerHandle | null = null;
     const commandDeps: RunCommandDeps = {
       tg,
       db,
@@ -750,8 +826,14 @@ async function main(): Promise<void> {
       hourlyCostCapUsd: config.hourlyCostCapUsd,
       globalHourlyCostCapUsd: config.globalHourlyCostCapUsd,
       skillRegistry,
+      ollamaSkillDeps,
       defaultEngine: config.defaultEngine,
       ollamaToolsEnabled: config.ollamaToolsEnabled,
+      taskRegistry,
+      triggerScheduledTask: (name) =>
+        schedulerRef
+          ? schedulerRef.triggerNow(name)
+          : { kind: "unknown_task", name },
     };
     // Web UI transport (optional). The `webClient` was built earlier so the
     // `webBroker` could capture it; reuse the same instance here so all bus
@@ -888,7 +970,42 @@ async function main(): Promise<void> {
             .filter((r) => !r.model.startsWith("system")),
       });
     }
-    installShutdown({ tracker, db, pidPath, pollAbort, server, webServer });
+    // Scheduler tick loop — started AFTER queue construction (it depends on
+    // queue.enqueue) and BEFORE installShutdown (so the shutdown handler
+    // gets a stop reference to call before pollAbort.abort).
+    if (
+      config.tasksEnabled &&
+      taskRegistry.size() > 0 &&
+      config.allowlistBootstrap.length > 0
+    ) {
+      const operatorFromId = config.allowlistBootstrap[0]!;
+      schedulerRef = startScheduler({
+        db,
+        registry: taskRegistry,
+        enqueue: (update) => queue.enqueue(update),
+        operatorFromId,
+        defaultEngine: config.defaultEngine,
+        // For DMs (operator chats) `from.id === chat.id`; using operatorFromId
+        // as the default chat falls back to a DM-to-self when a TASK.md
+        // omits chat_id, matching the daily-report convention.
+        defaultChatId: operatorFromId,
+      });
+      log.info("scheduler.started", { taskCount: taskRegistry.size() });
+    } else if (config.tasksEnabled && taskRegistry.size() === 0) {
+      log.warn("scheduler.enabled_but_zero_tasks", {
+        tasksDir: config.tasksDir,
+        hint: "create <tasksDir>/<name>/TASK.md or set SOLRAC_TASKS_ENABLED=false",
+      });
+    }
+    installShutdown({
+      tracker,
+      db,
+      pidPath,
+      pollAbort,
+      server,
+      webServer,
+      scheduler: schedulerRef,
+    });
     if (config.allowlistBootstrap.length > 0) {
       startDailyReportCron({ db, tg, targetChatId: config.allowlistBootstrap[0]! });
     }

@@ -27,6 +27,7 @@ For each item: **status**, **rough effort**, **dependencies**, **rationale**.
 - [OQ#11A–D — Ollama routing follow-ups](#oq11ad-ollama-routing-followups)
 - [OQ#14 — `/compact` cooldown](#oq14-compact-cooldown)
 - [OQ#15 — `/compact` source prompt truncation](#oq15-compact-source-truncation)
+- [OQ#16 — Skills as agent-callable tools](#oq16-skills-as-tools) (Phase 1 shipped)
 
 ### Stretch / pre-merge gates
 - [MTProto real-account flood test](#mtproto-flood)
@@ -288,7 +289,7 @@ Slot: alongside the daily report. Strictly additive feature with no shared safet
 
 ### OQ#11 — Skill router
 
-**Status:** open, no estimated effort yet.
+**Status:** open, no estimated effort yet. (Distinct from operator-defined Solrac skills — see "Skills as tools" below for those.)
 
 The user-level Claude Code config can have many skills in `.claude/skills/` (kb, supabase, gmail, etc.). The SDK preset systemPrompt knows skills exist; routing is the model's call. Solrac doesn't enumerate available skills explicitly — that's a missed lever.
 
@@ -309,20 +310,25 @@ Trade-off: every token in systemPrompt ships on every turn. If the registry is 5
 
 ---
 
+<a id="oq16-skills-as-tools"></a>
+
+### OQ#16 — Operator-defined skills as agent-callable tools (skills-as-tools)
+
+**Status:** Phase 1 shipped (Ollama-only). See `src/skill-tools.ts` and [USAGE.md#skills-as-tools-phase-1-ollama-only](./USAGE.md#skills-as-tools-phase-1-ollama-only).
+
+A `SKILL.md` with `tool: true` frontmatter is exposed to the Ollama agent's tool catalog as `mcp__solrac__skills__<name>`. The model decides when to call from natural language; the description is `skill.description`; the schema is `{ args: string }`. Auto-allow tier; cost cap is the backstop. Phase 1 restricted to `tier: ollama` skills (free) to sidestep the cost-escalation question. Audit row tagged `origin='tool_call'`.
+
+**Phase 2 (deferred).** Expose to Claude tiers via the existing `solrac` MCP server. Lift the `tier: ollama` restriction; add per-skill cost cap; consider `confirm`-tier gating on Claude-backed tool calls so a runaway Ollama agent can't burn $$$ silently.
+
+**Phase 3 (deferred).** Streamed skill output (currently the agent waits for the full skill reply before continuing); per-skill telemetry surface in `/status` or a dedicated `/skills` slash command.
+
+---
+
 ### OQ#12 — Background-worker mode
 
-**Status:** open.
-**Effort:** ~1 day.
+**Status:** Shipped (Phase 1 + Phase 2). See `src/scheduler.ts` and [USAGE.md#scheduled-tasks](./USAGE.md#scheduled-tasks).
 
-The daily cost-report cron is the seed. Generalize to a scheduled-jobs framework:
-
-- Nightly email triage (runs Gmail skill, surfaces important threads).
-- Morning Notion ticket digest.
-- Weekly PR review.
-
-Same agent host, no Telegram I/O on input — just a `query()` call on a timer. Output goes to whatever transport (Telegram DM, email, Notion comment).
-
-The cron primitive is already in `daily-report.ts::startDailyReportCron`. Generalizing: add a `jobs/` directory; each file exports `{ schedule, run }`.
+Operator-authored `TASK.md` files under `$SOLRAC_TASKS_DIR/<name>/` fire on a per-task schedule (`every <dur>`, `daily_at HH:MM`, `at <ISO8601>`). Fires synthesize updates through the existing turn queue, so cost caps + allowlist + policy hooks all apply automatically. `/tasks` lists loaded tasks; `/tasks run <name>` manual-triggers. Cron expressions, timezones, and audit-only (no Telegram output) modes deferred to Phase 3.
 
 ---
 

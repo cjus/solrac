@@ -122,12 +122,29 @@ CREATE TABLE IF NOT EXISTS audit (
 
 CREATE INDEX IF NOT EXISTS idx_audit_tree ON audit(tree_id);
 CREATE INDEX IF NOT EXISTS idx_audit_chat_started ON audit(chat_id, started_at);
+
+-- Scheduler: per-task persistent state. One row per task name; loader upserts
+-- source_path/source_hash on boot. Tick loop reads last_run_at and one_off_consumed
+-- to decide whether a fire is due. last_audit_id + last_status are operator-facing
+-- breadcrumbs surfaced by /tasks.
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+  name TEXT PRIMARY KEY,
+  last_run_at INTEGER,
+  last_audit_id INTEGER,
+  last_status TEXT,
+  one_off_consumed INTEGER NOT NULL DEFAULT 0,
+  source_path TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 `;
 
 export interface AuditInsert {
   chatId: number;
   fromId: number;
-  updateId: number;
+  // Nullable: scheduled fires synthesize negative ids that never reach
+  // handled_updates; passing null avoids any chance of poll-offset collision.
+  updateId: number | null;
   prompt: string;
   startedAt: number;
   // Identifies which engine handled the turn. Used by cross-engine queries
@@ -141,6 +158,13 @@ export interface AuditInsert {
   // 'claude:secondary:claude-opus-4-7' on first boot; agent.ts always passes
   // the full string explicitly.
   model: string;
+  // Scheduler — distinguishes user-typed from scheduler-fired turns.
+  // Defaults to 'user' when omitted (matches legacy rows). 'tool_call' is
+  // written by the skill-tool dispatcher when the Ollama agent calls a
+  // skill via natural language (vs. operator typing `/<skill>`).
+  origin?: "user" | "scheduled" | "system" | "tool_call";
+  // Scheduler — task identifier on origin='scheduled' rows; null otherwise.
+  taskName?: string | null;
 }
 
 export interface AuditEnd {
@@ -281,7 +305,36 @@ export interface SolracDb {
   // tokens) — `prompt` is truncated at MAX_AUDIT_PROMPT_LEN per row, so this
   // undercounts. Useful as a quick "how much chatter has accumulated" gauge.
   sumChatBytesForEngine: (chatId: number, enginePrefix: string) => number;
+  // Scheduler — per-task persistent state.
+  getTaskState: (name: string) => ScheduledTaskRow | null;
+  listTaskStates: () => ScheduledTaskRow[];
+  upsertTaskMetadata: (row: { name: string; sourcePath: string; sourceHash: string }) => void;
+  markTaskFired: (row: {
+    name: string;
+    lastRunAt: number;
+    lastAuditId: number | null;
+    lastStatus: string | null;
+  }) => void;
+  setTaskOneOffConsumed: (row: {
+    name: string;
+    lastRunAt: number;
+    lastAuditId: number | null;
+    lastStatus: string | null;
+  }) => void;
+  setTaskLastRunOnly: (name: string, lastRunAt: number) => void;
+  sumTaskCostSince: (taskName: string, sinceMs: number) => number;
   close: () => void;
+}
+
+export interface ScheduledTaskRow {
+  name: string;
+  lastRunAt: number | null;
+  lastAuditId: number | null;
+  lastStatus: string | null;
+  oneOffConsumed: boolean;
+  sourcePath: string;
+  sourceHash: string;
+  updatedAt: number;
 }
 
 export async function openDb(dataDir: string): Promise<SolracDb> {
@@ -318,6 +371,18 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   if (!auditCols.some((c) => c.name === "cache_read_input_tokens")) {
     db.run("ALTER TABLE audit ADD COLUMN cache_read_input_tokens INTEGER");
     log.info("db.migrated", { migration: "audit.cache_read_input_tokens_added" });
+  }
+  // Scheduler — origin distinguishes user-typed turns from scheduler fires
+  // and from synthetic system rows (denials/queue-full). task_name carries
+  // the task identifier on origin='scheduled' rows. Both additive + nullable
+  // (origin defaults to 'user' for legacy rows).
+  if (!auditCols.some((c) => c.name === "origin")) {
+    db.run("ALTER TABLE audit ADD COLUMN origin TEXT NOT NULL DEFAULT 'user'");
+    log.info("db.migrated", { migration: "audit.origin_added" });
+  }
+  if (!auditCols.some((c) => c.name === "task_name")) {
+    db.run("ALTER TABLE audit ADD COLUMN task_name TEXT");
+    log.info("db.migrated", { migration: "audit.task_name_added" });
   }
   // PLAN Step 12 — additive migration. Pre-Step-12 sessions had a single
   // `agent_session_id` (the SDK session for the then-default SOLRAC_MODEL =
@@ -392,6 +457,9 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
     });
   }
   db.run("CREATE INDEX IF NOT EXISTS idx_audit_chat_model_started ON audit(chat_id, model, started_at)");
+  // Scheduler — supports `/tasks` per-task lookups and the per-task max_cost_usd
+  // pre-flight query. Cheap; one row per scheduled fire only.
+  db.run("CREATE INDEX IF NOT EXISTS idx_audit_task_started ON audit(task_name, started_at)");
   log.info("db.opened", { dbPath });
 
   const stGetMeta = db.prepare("SELECT value FROM meta WHERE key = ?");
@@ -403,8 +471,8 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
     "INSERT OR IGNORE INTO handled_updates (update_id, handled_at) VALUES (?, ?)",
   );
   const stInsertAudit = db.prepare(
-    "INSERT INTO audit (tree_id, chat_id, from_id, update_id, prompt, status, started_at, model) " +
-      "VALUES (0, ?, ?, ?, ?, 'in_progress', ?, ?)",
+    "INSERT INTO audit (tree_id, chat_id, from_id, update_id, prompt, status, started_at, model, origin, task_name) " +
+      "VALUES (0, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)",
   );
   const stSetTreeId = db.prepare("UPDATE audit SET tree_id = ? WHERE id = ?");
   const stUpdateEnd = db.prepare(
@@ -527,6 +595,44 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
       "FROM audit " +
       "WHERE chat_id = ? AND model LIKE ? AND status = 'ok'",
   );
+  // Scheduler — per-task state (boot-loaded; tick reads/writes; /tasks reads).
+  const stGetTaskState = db.prepare(
+    "SELECT name, last_run_at, last_audit_id, last_status, one_off_consumed, source_path, source_hash, updated_at " +
+      "FROM scheduled_tasks WHERE name = ?",
+  );
+  const stListTaskStates = db.prepare(
+    "SELECT name, last_run_at, last_audit_id, last_status, one_off_consumed, source_path, source_hash, updated_at " +
+      "FROM scheduled_tasks ORDER BY name ASC",
+  );
+  const stUpsertTaskMetadata = db.prepare(
+    "INSERT INTO scheduled_tasks (name, source_path, source_hash, updated_at) VALUES (?, ?, ?, ?) " +
+      "ON CONFLICT(name) DO UPDATE SET source_path = excluded.source_path, " +
+      "source_hash = excluded.source_hash, updated_at = excluded.updated_at",
+  );
+  const stMarkTaskFired = db.prepare(
+    "INSERT INTO scheduled_tasks (name, last_run_at, last_audit_id, last_status, source_path, source_hash, updated_at) " +
+      "VALUES (?, ?, ?, ?, '', '', ?) " +
+      "ON CONFLICT(name) DO UPDATE SET last_run_at = excluded.last_run_at, " +
+      "last_audit_id = excluded.last_audit_id, last_status = excluded.last_status, " +
+      "updated_at = excluded.updated_at",
+  );
+  const stSetTaskOneOffConsumed = db.prepare(
+    "UPDATE scheduled_tasks SET one_off_consumed = 1, last_run_at = ?, " +
+      "last_audit_id = ?, last_status = ?, updated_at = ? WHERE name = ?",
+  );
+  const stSetTaskLastRunOnly = db.prepare(
+    "INSERT INTO scheduled_tasks (name, last_run_at, source_path, source_hash, updated_at) " +
+      "VALUES (?, ?, '', '', ?) " +
+      "ON CONFLICT(name) DO UPDATE SET last_run_at = excluded.last_run_at, " +
+      "updated_at = excluded.updated_at",
+  );
+  // Pre-flight cap query: cumulative cost for THIS task in the past window.
+  // Used by the per-task `max_cost_usd` gate; matches the per-chat hourly cap
+  // shape (`sumChatCostSince`) so behavior is consistent.
+  const stSumTaskCostSince = db.prepare(
+    "SELECT COALESCE(SUM(cost_usd), 0) AS spent FROM audit " +
+      "WHERE task_name = ? AND started_at >= ?",
+  );
 
   return {
     raw: db,
@@ -549,6 +655,8 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
         row.prompt,
         row.startedAt,
         row.model,
+        row.origin ?? "user",
+        row.taskName ?? null,
       );
       const id = Number(r.lastInsertRowid);
       stSetTreeId.run(id, id);
@@ -660,6 +768,81 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
     sumChatBytesForEngine(chatId, enginePrefix) {
       const row = stSumChatBytes.get(chatId, enginePrefix) as { bytes: number | null } | null;
       return row?.bytes ?? 0;
+    },
+    getTaskState(name) {
+      const row = stGetTaskState.get(name) as
+        | {
+            name: string;
+            last_run_at: number | null;
+            last_audit_id: number | null;
+            last_status: string | null;
+            one_off_consumed: number;
+            source_path: string;
+            source_hash: string;
+            updated_at: number;
+          }
+        | null;
+      if (!row) return null;
+      return {
+        name: row.name,
+        lastRunAt: row.last_run_at,
+        lastAuditId: row.last_audit_id,
+        lastStatus: row.last_status,
+        oneOffConsumed: row.one_off_consumed === 1,
+        sourcePath: row.source_path,
+        sourceHash: row.source_hash,
+        updatedAt: row.updated_at,
+      };
+    },
+    listTaskStates() {
+      const rows = stListTaskStates.all() as Array<{
+        name: string;
+        last_run_at: number | null;
+        last_audit_id: number | null;
+        last_status: string | null;
+        one_off_consumed: number;
+        source_path: string;
+        source_hash: string;
+        updated_at: number;
+      }>;
+      return rows.map((row) => ({
+        name: row.name,
+        lastRunAt: row.last_run_at,
+        lastAuditId: row.last_audit_id,
+        lastStatus: row.last_status,
+        oneOffConsumed: row.one_off_consumed === 1,
+        sourcePath: row.source_path,
+        sourceHash: row.source_hash,
+        updatedAt: row.updated_at,
+      }));
+    },
+    upsertTaskMetadata(row) {
+      stUpsertTaskMetadata.run(row.name, row.sourcePath, row.sourceHash, Date.now());
+    },
+    markTaskFired(row) {
+      stMarkTaskFired.run(
+        row.name,
+        row.lastRunAt,
+        row.lastAuditId,
+        row.lastStatus,
+        Date.now(),
+      );
+    },
+    setTaskOneOffConsumed(row) {
+      stSetTaskOneOffConsumed.run(
+        row.lastRunAt,
+        row.lastAuditId,
+        row.lastStatus,
+        Date.now(),
+        row.name,
+      );
+    },
+    setTaskLastRunOnly(name, lastRunAt) {
+      stSetTaskLastRunOnly.run(name, lastRunAt, Date.now());
+    },
+    sumTaskCostSince(taskName, sinceMs) {
+      const row = stSumTaskCostSince.get(taskName, sinceMs) as { spent: number | null } | null;
+      return row?.spent ?? 0;
     },
     close() {
       db.close();

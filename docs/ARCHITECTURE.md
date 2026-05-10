@@ -46,6 +46,7 @@ src/
 ├── db.ts             — bun:sqlite (WAL); prepared statements
 ├── allowlist.ts      — isAllowed / bootstrap
 ├── session.ts        — upsert/get session id per chat
+├── instance.ts       — bootstrap + load SOUL.md / SOLRAC.md
 │
 ├── mutex.ts          — KeyedMutex<K> per-key serial chain
 ├── semaphore.ts      — global counting concurrency limit
@@ -60,7 +61,19 @@ src/
 │                       db-pollution defenses
 │
 ├── markdown.ts       — markdown → Telegram-safe HTML (marked + custom renderer)
+├── integrations.ts   — operator-authored TS modules + blessed built-ins;
+│                       returns SDK MCP tool definitions + tier map
 ├── agent.ts          — wires Claude Agent SDK; runs one turn
+├── ollama.ts         — local-model runner; single-shot + tool-loop dispatcher
+├── ollama-tools.ts   — Ollama tool-loop driver (mcpToOllamaTools, runToolLoop,
+│                       executeToolCall — policy + broker per call)
+│
+├── commands.ts       — slash command parser + dispatcher
+│                       (/clear, /compact, /context, /help, /status, /tasks)
+├── skills.ts         — load SKILL.md files; expose as /<name> commands
+├── skill-tools.ts    — bridge tool:true skills to the Ollama tool catalog as
+│                       skills__<name>; AsyncLocalStorage for per-turn context
+├── scheduler.ts      — load TASK.md files; fire on schedule via the queue
 │
 ├── server.ts         — Bun.serve: /health + /stats
 ├── web-client.ts     — TelegramClient sink that publishes to an in-process
@@ -81,14 +94,23 @@ Strict. Each file imports only from files lower in the graph:
 log, config        →  zero internal deps
 db                 →  log
 allowlist, session →  db
+instance           →  log
 mutex, semaphore,
 turn-tracker       →  zero internal deps
 queue              →  mutex + semaphore + turn-tracker + config + log
 telegram           →  config + log
 markdown           →  telegram (htmlEscape only)
 policy             →  db + telegram + log + config
-agent              →  session + policy + telegram + log + markdown
+integrations       →  log
+agent              →  session + policy + telegram + log + markdown + instance
+ollama-tools       →  policy + log + telegram (types) + integrations
+ollama             →  session + policy + telegram + log + markdown +
+                      ollama-tools + skill-tools + integrations + instance
 poll               →  telegram + db + log
+skills             →  log + telegram (types)
+commands           →  agent + policy + db + telegram + skills + scheduler
+skill-tools        →  db + log + skills + commands (runSkillBare) + policy
+scheduler          →  db + queue + telegram + log + config
 server             →  log
 web-sanitize       →  zero internal deps
 web-client         →  telegram (types only)
@@ -225,22 +247,52 @@ For `queue_full`: `INSERT INTO audit … status='error', error_message='queue_fu
 
 **Parser hook.** After the `KNOWN_COMMANDS` check misses, `parseCommand` looks up the name in the registry. A hit returns `{ kind: "skill", skill, args }`. A miss falls through to the existing unknown-vs-passthrough logic (`/` → unknown, `:` → passthrough). Built-ins always win — even if a buggy registry returned a skill named `clear`, the built-in arm fires first.
 
-**Frontmatter schema (3 fields).**
+**Frontmatter schema (4 fields).**
 - `name` — required, matches `[a-z0-9_]{1,32}`, must NOT collide with built-in names (rejected at load time).
-- `description` — required, ≤256 chars (used in `setMyCommands` payload + `/help` rendering).
-- `tier` — optional, `primary` | `secondary`, default `primary`.
+- `description` — required, ≤256 chars (used in `setMyCommands` payload + `/help` rendering, and as the tool description when `tool: true`).
+- `tier` — optional, `primary` | `secondary` | `ollama`. Defaults to `SOLRAC_DEFAULT_ENGINE` so an Ollama-default deploy gets free skills automatically. Explicit `tier: ollama` is rejected when the deploy default isn't ollama (PR-B removed the `>` prefix).
+- `tool` — optional boolean, default false. When true, exposes the skill as a callable MCP tool to the Ollama agent (Phase 1 restriction: `tool: true` requires `tier: ollama`).
 
-The body is a Claude prompt; `{{args}}` is the only placeholder and is replaced literally with the user's text after the command name. The frontmatter parser is a homemade YAML subset (~70 LOC in `skills.ts`) — handles `key: scalar`, `key: [a, b, c]`, quoted strings, integers, booleans. Adding `js-yaml` for a 3-key schema was disproportionate.
+The body is a prompt template; `{{args}}` is the only placeholder and is replaced literally with the user's text after the command name (or with the agent-supplied `args` argument when called as a tool). The frontmatter parser is a homemade YAML subset (~70 LOC in `skills.ts`) — handles `key: scalar`, `key: [a, b, c]`, quoted strings, integers, booleans. Adding `js-yaml` for a 4-key schema was disproportionate.
 
-**Skill execution (`runSkill` in `commands.ts`).** Mirrors `runCompactTurn`'s structural pattern:
-1. Pre-flight cap check (chat + global). Cap-rejected skills cost $0 — the SDK is never touched.
-2. `query()` with `maxTurns: 1`, no `resume`, `disallowedTools` deny-list, `canUseTool: deny-all`. Skills are tool-less in v1.
-3. Audit row tagged `claude:<tier>:<model>:skill:<name>` so cost rolls up under the existing per-chat hourly cap and operators can grep by skill name.
-4. Reply: model output verbatim, HTML-escaped, truncated to ≈3,500 chars (Telegram per-message ceiling minus headroom).
+**Skill execution.** The path forks on `tier`:
 
-**Why no factored-out one-shot helper?** `runSkill` and `runCompactTurn` share ~70% of the SDK-call boilerplate, but the post-processing differs (compact persists summary + drops session id; skills just reply). Duplicating the shape keeps each handler readable; a v1.1 extraction is cheap when a third caller arrives.
+- **Claude tiers (`primary` / `secondary`).** `runSkill` in `commands.ts`. Mirrors `runCompactTurn`'s structural pattern: pre-flight cost cap (chat + global; cap-rejected skills cost $0), `query()` with `maxTurns: 1`, no `resume`, `disallowedTools` deny-list, `canUseTool: deny-all`. Audit row tagged `claude:<tier>:<model>:skill:<name>`.
+- **Ollama tier.** `runOllamaSkill` (and the bare `runSkillBare` helper) in `commands.ts`. One-shot `/api/chat` (`stream: false`), no history, no SOLRAC.md overlay, no tool loop, no streaming stub. Audit row tagged `ollama:<model>:skill:<name>` with `cost_usd: 0`. Pre-flight cap is skipped (a chat throttled by Claude burn shouldn't lose access to free local inference).
 
-**Why no description-based routing?** Claude Code's skills are auto-loaded based on description matching. For Solrac that would mean injecting all skill descriptions into every Claude system prompt (token cost) plus a meta-LLM pre-pass to pick one. Explicit `/<name>` is simpler and matches the existing engine-prefix discipline. v1 ships explicit only.
+Reply for both: model output verbatim, HTML-escaped, truncated to ≈3,500 chars (Telegram per-message ceiling minus headroom). Skills are tool-less across both engines — the Claude path denies every tool call via `canUseTool`; the Ollama path posts to `/api/chat` with no `tools` field (a load-bearing invariant for skills-as-tools recursion safety; see below).
+
+**Skills as tools (Phase 1: Ollama-only).** A skill with `tool: true` is also exposed as a callable MCP tool to the Ollama agent (`skill-tools.ts::buildSkillTools`). The model sees it in its tool catalog as `mcp__solrac__skills__<name>` (wire format on Ollama: `skills__<name>`) with the operator-authored description. Tool dispatch:
+
+1. **Catalog merge.** At boot, eligible skills (`tool: true && tier: ollama`) become `SdkMcpToolDefinition` entries with input schema `{ args: string }`. They're merged into `integrationTools` and `integrationToolTiers` (all `auto`-allow) before `ollamaDeps` is constructed.
+2. **Per-turn context propagation.** `runOllamaTurnWithTools` wraps the loop in `skillToolCtx.run({chatId, fromId, updateId, parentAuditId}, () => runToolLoop(...))`. The skill handler reads the store via `AsyncLocalStorage.getStore()` — needed because the SDK tool-handler signature `(args, extra) => ...` leaves no slot for chat context, and concurrent turns require race-free context (the queue runs N chats in parallel). ALS is the standard Node primitive for this.
+3. **Handler.** Reads ALS context, calls `runSkillBare`, writes a fresh audit row with `origin='tool_call'` so operators can distinguish agent-driven invocations from operator-typed `/<skill>` calls (`origin='user'`). Returns the model's text as the tool result; the parent Ollama turn composes its final user-facing reply on top.
+4. **Permission tier.** Auto-allow. Cost cap is the backstop (Phase 1 ollama skills are free; Phase 2 unlocks Claude-tier skills with a per-skill cost cap).
+
+**Recursion safety (load-bearing).** A skill called as a tool MUST NOT call any tool itself — otherwise an Ollama agent could trigger `skills__foo` which calls `skills__foo` infinitely. `runSkillBare` posts to `/api/chat` with no `tools` field, so the sub-call has no tool surface. `skill-tools.test.ts` asserts the outgoing fetch body has no `tools` key — a regression breaks CI before production.
+
+**Phase 2 deferred.** Cross-engine tool calls (Ollama agent → Sonnet skill) would land via the same SDK MCP server already used for integrations. Phase 1's ollama-tier restriction sidesteps the cost-escalation question (a misbehaving Ollama agent calling a `tier: primary` skill 100× would burn real $$$). When Phase 2 lands, expect a per-skill cost cap and a `confirm`-tier option for Claude-backed tool calls.
+
+### Scheduled tasks — operator-authored cron prompts
+
+`scheduler.ts` generalizes the daily-report cron primitive into a first-class scheduler. Operator-authored `TASK.md` files under `$SOLRAC_TASKS_DIR/<name>/` are loaded ONCE at boot (no hot-reload, matching skills) and fired on a per-task schedule. Disabled by default (`SOLRAC_TASKS_ENABLED=false`).
+
+**Three composed pieces.**
+1. **Loader** — same shape as skills' loader (frontmatter + body, fail-soft, name-collision rules).
+2. **Schedule grammar** — `every <dur>`, `daily_at HH:MM`, `at <ISO8601>`. Pure parser + pure `nextRunAt(spec, lastRunAt, now)`. No cron in v1 (kept the parser ~30 LOC and avoided `cron-parser` as a dep).
+3. **Tick driver** — single shared `setInterval(60_000)` scans the registry, compares `nextRunAt(...)` to now, fires due tasks via the existing `queue.enqueue`. Boot fire runs the first tick immediately so jitter=0 catch-up tasks don't wait 60s.
+
+**Synthetic-update construction.** The driver builds a `Update` with negative `update_id` (avoids any chance of colliding with Telegram's positive offset space — `handled_updates.update_id` IS PRIMARY KEY, so a synthetic id colliding with a future poll offset would silently dedupe a real user message). Scheduler fires NEVER write to `handled_updates`. The synthesized message carries an `__solrac_scheduled` field with `{name, maxCostUsd}` that `main.ts::makeRunTurn` extracts and propagates into the runner's `AgentRunInput.scheduledTaskName` / `OllamaRunInput.scheduledTaskName`. The audit row gets `origin='scheduled'` + `task_name=<name>`; cost cap, allowlist gate, and policy hooks all apply uniformly to user-typed and scheduled paths.
+
+**Engine-prefix mapping.** When a task's `engine` differs from `config.defaultEngine`, the scheduler prepends the matching prefix (`@` for primary, `!` for secondary) onto the message text. The existing `parseEnginePrefix` in `main.ts` then routes to the right runner, so the scheduler reuses one engine-routing path instead of building its own. `engine: ollama` is rejected at parse on Claude-default deploys (PR-B removed the `>` prefix; Ollama is reachable only as the deploy default).
+
+**Catch-up policy.** `every` and `daily_at` default to `catch_up: true`; if the missed window is in the past at boot, the task fires once (NOT N times for N missed windows). `at` defaults to `catch_up: false`; an `at <past>` task is marked `one_off_consumed=1` without firing. `boot_catch_up_jitter_s` smears boot fires across a random window so 12 daily tasks don't all hit the model at once.
+
+**Per-task `max_cost_usd`** (Claude tiers only, silently ignored on Ollama). Pre-flight check: if `SUM(cost_usd)` for THIS task in past 1 hour ≥ cap, the fire is skipped and a denial audit row is written with `error_message = "task_cost_cap: …"`. The cap is **inter-fire**: a single fire's cost is never aborted mid-turn (cost only arrives at end-of-turn from the SDK).
+
+**Shutdown.** `lifecycle.ts::installShutdown` calls `scheduler.stop()` BEFORE `pollAbort.abort()` so no new fires land mid-drain. In-flight task turns ride the existing `TurnTracker` through drain.
+
+**Operator surface (`/tasks`).** `commands.ts` dispatches `/tasks` (list every loaded task with last/next fire) and `/tasks run <name>` (manual trigger via `SchedulerHandle.triggerNow`). Every dispatch writes a system-tagged audit row.
 
 ---
 

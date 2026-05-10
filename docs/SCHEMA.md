@@ -30,7 +30,8 @@ Pragmas Solrac sets at boot:
 | `allowlist` | one row per allowed `from.id` | seeded from `ALLOWLIST_BOOTSTRAP` on every boot |
 | `handled_updates` | one row per Telegram `update_id` we've claimed | grows monotonically; never deleted in v1 |
 | `sessions` | one row per chat | per-tier SDK session ids + pending `/compact` summaries |
-| `audit` | one row per attempted turn (allowed, denied, queue-full) | append-mostly; the source of truth |
+| `audit` | one row per attempted turn (allowed, denied, queue-full, tool-call sub-row) | append-mostly; the source of truth |
+| `scheduled_tasks` | one row per loaded `TASK.md` | upserted at boot; `last_run_at` / `one_off_consumed` updated by the tick loop |
 
 Authoritative source for shapes + migrations: `src/db.ts` (look at the `SCHEMA` constant and the post-`SCHEMA` `ALTER TABLE` block).
 
@@ -97,7 +98,7 @@ audit(
   parent_turn_id                  INTEGER REFERENCES audit(id),  -- v1: always NULL
   chat_id                         INTEGER NOT NULL,
   from_id                         INTEGER NOT NULL,
-  update_id                       INTEGER,
+  update_id                       INTEGER,                 -- nullable: scheduled fires + tool_call sub-rows synthesize ids
   agent_session_id                TEXT,                    -- SDK session id (Claude only)
   prompt                          TEXT,                    -- truncated to 256 chars on insert
   response                        TEXT,
@@ -111,7 +112,9 @@ audit(
   error_message                   TEXT,
   started_at                      INTEGER NOT NULL,
   ended_at                        INTEGER,
-  model                           TEXT NOT NULL DEFAULT 'claude'
+  model                           TEXT NOT NULL DEFAULT 'claude',
+  origin                          TEXT NOT NULL DEFAULT 'user',   -- user | scheduled | tool_call | system
+  task_name                       TEXT                            -- non-null when origin='scheduled'
 )
 ```
 
@@ -133,17 +136,32 @@ Rows that reach the end-of-turn update are the ones that ran an SDK or Ollama ca
 
 #### `model` format (engine identity)
 
-Three-segment shape so tier identity stays stable across model-id bumps:
+Three-segment shape so tier identity stays stable across model-id bumps. Skill invocations append a fourth segment so operator-typed `/<skill>` and agent-driven tool calls are greppable per skill name.
 
-| Format | Engine | Example |
+| Format | Engine / source | Example |
 |---|---|---|
 | `claude:primary:<modelId>` | Claude primary tier (`@` prefix) | `claude:primary:claude-sonnet-4-6` |
 | `claude:secondary:<modelId>` | Claude secondary tier (`!` prefix) | `claude:secondary:claude-opus-4-7` |
-| `ollama:<modelId>` | local Ollama (default engine) | `ollama:gemma4:e4b` |
+| `ollama:<modelId>` | local Ollama (default engine) | `ollama:gpt-oss:20b` |
+| `claude:<tier>:<modelId>:skill:<name>` | Claude-tier skill invocation | `claude:primary:claude-sonnet-4-6:skill:tldr` |
+| `ollama:<modelId>:skill:<name>` | Ollama-tier skill invocation (slash or tool call) | `ollama:gpt-oss:20b:skill:tldr` |
 | `system` | rejection rows that didn't run an engine | `system` |
 | `claude` | legacy pre-tier rows (retagged to `claude:secondary:claude-opus-4-7` on first boot) | rare; should be zero post-migration |
 
-Cross-engine queries use SQL `LIKE` on the prefix: `model LIKE 'claude:primary:%'` survives a future `claude-sonnet-4-6 → 4-8` upgrade.
+Cross-engine queries use SQL `LIKE` on the prefix: `model LIKE 'claude:primary:%'` survives a future `claude-sonnet-4-6 → 4-8` upgrade. Per-skill activity: `model LIKE '%:skill:tldr'`.
+
+#### `origin` values
+
+Distinguishes user-typed turns from scheduler fires and tool-driven sub-calls. All four values share the audit table — the audit log is the single source of truth across surfaces.
+
+| Value | Meaning |
+|---|---|
+| `user` | Operator typed a message (or a slash command) into Telegram or the web UI. The default. |
+| `scheduled` | The scheduler fired a `TASK.md` per its schedule. `task_name` is the matching task name. `update_id` is null. |
+| `tool_call` | The Ollama agent called a `tool: true` skill mid-tool-loop via `skills__<name>`. The parent turn's row stays `origin='user'`; this is a sub-row tracking the skill execution. `update_id` carries the parent turn's id. |
+| `system` | Pre-flight rejection (queue-full, denied, etc.) or other internal write that didn't dispatch a turn. |
+
+Quick filter: `WHERE origin IN ('scheduled','tool_call')` → just the agent / scheduler activity, no human typing.
 
 #### `tool_calls` shape
 
@@ -171,6 +189,23 @@ The Anthropic API returns four token counts per turn. The actual on-the-wire inp
 
 Ollama and `system` rows have all four set to NULL.
 
+### `scheduled_tasks`
+
+```sql
+scheduled_tasks(
+  name              TEXT PRIMARY KEY,    -- matches TASK.md frontmatter `name:`
+  last_run_at       INTEGER,             -- ms epoch; null until first fire
+  last_audit_id     INTEGER,             -- audit.id of most recent fire (operator breadcrumb)
+  last_status       TEXT,                -- 'ok' | 'error' | 'denied' from the last run
+  one_off_consumed  INTEGER NOT NULL DEFAULT 0,   -- 1 once an `at <ISO>` task has fired
+  source_path       TEXT NOT NULL,       -- absolute path to the TASK.md file
+  source_hash       TEXT NOT NULL,       -- content hash; future use (operator-detect drift)
+  updated_at        INTEGER NOT NULL
+)
+```
+
+One row per task loaded at boot. The loader upserts `source_path / source_hash / updated_at`; the tick loop updates `last_*` on each fire (and flips `one_off_consumed = 1` for `at <ISO>` tasks). When a `TASK.md` is removed from disk, the row stays — operators query `scheduled_tasks LEFT JOIN` the registry at runtime. `/tasks` slash command joins this table with the in-memory registry to render last/next fire info.
+
 ## Indexes
 
 | Index | Columns | Used by |
@@ -178,8 +213,9 @@ Ollama and `system` rows have all four set to NULL.
 | `idx_audit_tree` | `(tree_id)` | reserved for sub-agent fan-out queries (v1: unused, every row's tree_id = own id) |
 | `idx_audit_chat_started` | `(chat_id, started_at)` | the cost-cap query path (`db.sumChatCostSince`) — fires before every Claude tool call |
 | `idx_audit_chat_model_started` | `(chat_id, model, started_at)` | engine-scoped queries: `outOfBandForEngine`, `recentChatTurnsForEngine`, `lastSuccessfulTurnAt`, `countChatTurnsForEngine`, etc. |
+| `idx_audit_task_started` | `(task_name, started_at)` | scheduler queries: per-task cost windows (`max_cost_usd` pre-flight) and operator audit dumps |
 
-The first two are declared in the `SCHEMA` constant; the third is created after the migration block so it can reference the `model` column on both fresh installs and upgraded databases.
+The first two are declared in the `SCHEMA` constant; the others are created after the migration block so they can reference columns added incrementally on existing databases.
 
 To check what indexes the query planner actually picks for a query:
 

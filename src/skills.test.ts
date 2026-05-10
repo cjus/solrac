@@ -307,6 +307,173 @@ description: y
 Body.`;
     expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(/malformed frontmatter line/);
   });
+
+  test("tier: ollama rejected when defaultTier is not ollama", () => {
+    const c = `---
+name: x
+description: y
+tier: ollama
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED, "primary")).toThrow(
+      /unreachable when SOLRAC_DEFAULT_ENGINE != ollama/,
+    );
+  });
+
+  test("tool: true rejected when tier is primary (Phase 1 restriction)", () => {
+    const c = `---
+name: x
+description: y
+tier: primary
+tool: true
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED, "primary")).toThrow(
+      /"tool: true" requires "tier: ollama"/,
+    );
+  });
+
+  test("tool: true rejected when tier is secondary", () => {
+    const c = `---
+name: x
+description: y
+tier: secondary
+tool: true
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED, "ollama")).toThrow(
+      /"tool: true" requires "tier: ollama"/,
+    );
+  });
+
+  test("tool: true rejected when default tier is non-ollama and tier omitted", () => {
+    // Skill omits tier; defaultTier is "primary" so resolved tier is primary.
+    // tool: true must then fail.
+    const c = `---
+name: x
+description: y
+tool: true
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED, "primary")).toThrow(
+      /"tool: true" requires "tier: ollama"/,
+    );
+  });
+
+  test("tool: <non-boolean> rejected", () => {
+    const c = `---
+name: x
+description: y
+tool: yes
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED, "ollama")).toThrow(
+      /"tool" must be a boolean/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseSkillFile — `tool` field happy path
+// ---------------------------------------------------------------------------
+
+describe("parseSkillFile — tool field", () => {
+  test("tool field defaults to false when omitted", () => {
+    const c = `---
+name: example
+description: x
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    expect(skill.tool).toBe(false);
+  });
+
+  test("tool: true accepted with tier: ollama", () => {
+    const c = `---
+name: example
+description: x
+tier: ollama
+tool: true
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    expect(skill.tool).toBe(true);
+    expect(skill.tier).toBe("ollama");
+  });
+
+  test("tool: true accepted with omitted tier inheriting ollama default", () => {
+    const c = `---
+name: example
+description: x
+tool: true
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    expect(skill.tool).toBe(true);
+    expect(skill.tier).toBe("ollama");
+  });
+
+  test("tool: false accepted with any tier", () => {
+    const c = `---
+name: example
+description: x
+tier: primary
+tool: false
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    expect(skill.tool).toBe(false);
+    expect(skill.tier).toBe("primary");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseSkillFile — tier inheritance from defaultTier
+// ---------------------------------------------------------------------------
+
+describe("parseSkillFile — tier inheritance", () => {
+  const BARE = `---
+name: example
+description: An example skill
+---
+Body.`;
+
+  test("omitted tier inherits defaultTier=primary", () => {
+    const skill = parseSkillFile(BARE, "/p", RESERVED, "primary");
+    expect(skill.tier).toBe("primary");
+  });
+
+  test("omitted tier inherits defaultTier=secondary", () => {
+    const skill = parseSkillFile(BARE, "/p", RESERVED, "secondary");
+    expect(skill.tier).toBe("secondary");
+  });
+
+  test("omitted tier inherits defaultTier=ollama", () => {
+    const skill = parseSkillFile(BARE, "/p", RESERVED, "ollama");
+    expect(skill.tier).toBe("ollama");
+  });
+
+  test("explicit tier: ollama parses when defaultTier=ollama", () => {
+    const c = `---
+name: example
+description: x
+tier: ollama
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    expect(skill.tier).toBe("ollama");
+  });
+
+  test("explicit tier: primary still works under defaultTier=ollama (escalation override)", () => {
+    const c = `---
+name: example
+description: x
+tier: primary
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    expect(skill.tier).toBe("primary");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -315,7 +482,7 @@ Body.`;
 
 describe("loadSkillsSync", () => {
   test("missing directory → empty registry + one error", () => {
-    const result = loadSkillsSync("/no/such/path", RESERVED);
+    const result = loadSkillsSync("/no/such/path", RESERVED, "primary");
     expect(result.loadedCount).toBe(0);
     expect(result.registry.size()).toBe(0);
     expect(result.errors.length).toBe(1);
@@ -324,7 +491,7 @@ describe("loadSkillsSync", () => {
 
   test("empty directory → empty registry, no errors", () => {
     const root = tempSkillsDir();
-    const result = loadSkillsSync(root, RESERVED);
+    const result = loadSkillsSync(root, RESERVED, "primary");
     expect(result.loadedCount).toBe(0);
     expect(result.errors.length).toBe(0);
   });
@@ -333,7 +500,7 @@ describe("loadSkillsSync", () => {
     const root = tempSkillsDir();
     writeSkill(root, "summarize", MINIMAL.replace("name: example", "name: summarize"));
     writeSkill(root, "translate", MINIMAL.replace("name: example", "name: translate"));
-    const result = loadSkillsSync(root, RESERVED);
+    const result = loadSkillsSync(root, RESERVED, "primary");
     expect(result.loadedCount).toBe(2);
     expect(result.registry.get("summarize")).toBeDefined();
     expect(result.registry.get("translate")).toBeDefined();
@@ -343,7 +510,7 @@ describe("loadSkillsSync", () => {
     const root = tempSkillsDir();
     mkdirSync(join(root, "empty-dir"));
     writeSkill(root, "valid", MINIMAL.replace("name: example", "name: valid"));
-    const result = loadSkillsSync(root, RESERVED);
+    const result = loadSkillsSync(root, RESERVED, "primary");
     expect(result.loadedCount).toBe(1);
     expect(result.errors.length).toBe(0);
   });
@@ -355,7 +522,7 @@ describe("loadSkillsSync", () => {
     const dup = MINIMAL.replace("name: example", "name: dup");
     writeSkill(root, "aaa", dup);
     writeSkill(root, "zzz", dup);
-    const result = loadSkillsSync(root, RESERVED);
+    const result = loadSkillsSync(root, RESERVED, "primary");
     expect(result.loadedCount).toBe(1);
     expect(result.errors.length).toBe(1);
     expect(result.errors[0]!.message).toMatch(/already loaded/);
@@ -367,7 +534,7 @@ describe("loadSkillsSync", () => {
     const root = tempSkillsDir();
     writeSkill(root, "good", MINIMAL.replace("name: example", "name: good"));
     writeSkill(root, "bad", "no frontmatter at all");
-    const result = loadSkillsSync(root, RESERVED);
+    const result = loadSkillsSync(root, RESERVED, "primary");
     expect(result.loadedCount).toBe(1);
     expect(result.errors.length).toBe(1);
     expect(result.registry.get("good")).toBeDefined();
@@ -377,7 +544,7 @@ describe("loadSkillsSync", () => {
     const root = tempSkillsDir();
     writeSkill(root, "shadow", MINIMAL.replace("name: example", "name: clear"));
     writeSkill(root, "fine", MINIMAL.replace("name: example", "name: fine"));
-    const result = loadSkillsSync(root, RESERVED);
+    const result = loadSkillsSync(root, RESERVED, "primary");
     expect(result.loadedCount).toBe(1);
     expect(result.errors.length).toBe(1);
     expect(result.errors[0]!.message).toMatch(/collides with a built-in/);
@@ -427,6 +594,7 @@ describe("skillsToBotCommands", () => {
       tier: "primary" as const,
       body: "x",
       sourcePath: "/p",
+      tool: false,
     });
   }
 

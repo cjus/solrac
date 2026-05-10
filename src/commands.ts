@@ -80,6 +80,13 @@ import {
   type Skill,
   type SkillRegistry,
 } from "./skills.ts";
+import {
+  nextRunAt,
+  type SchedulerHandle,
+  type Task as ScheduledTask,
+  type TaskRegistry,
+  type TriggerNowResult,
+} from "./scheduler.ts";
 import { htmlEscapeText, type BotCommand, type TelegramClient } from "./telegram.ts";
 
 // ---------------------------------------------------------------------------
@@ -100,7 +107,13 @@ export type SolracCommand =
   // PNX-167.1 — operator-defined skill loaded from the filesystem at boot.
   // The dispatcher renders `skill.body` with `args` substituted for `{{args}}`
   // and runs a one-shot Claude turn (no resume, tools disabled).
-  | { kind: "skill"; skill: Skill; args: string };
+  | { kind: "skill"; skill: Skill; args: string }
+  // Scheduled-tasks operator surface (Phase 2).
+  // - `/tasks` lists every loaded task with last/next fire info.
+  // - `/tasks run <name>` fires a task on demand (bypasses the schedule
+  //   clock; honors enabled / one_off_consumed / max_cost_usd / queue-full).
+  | { kind: "tasks_list" }
+  | { kind: "tasks_run"; name: string };
 
 export type ParseCommandResult =
   | { kind: "run"; cmd: SolracCommand }
@@ -123,6 +136,7 @@ export const BOT_COMMAND_REGISTRY: ReadonlyArray<BotCommand> = [
   { command: "compact", description: "Summarize and restart current session" },
   { command: "status", description: "Show session and spend snapshot" },
   { command: "context", description: "Show context window size in bytes + tokens" },
+  { command: "tasks", description: "List scheduled tasks (or run <name>)" },
   { command: "help", description: "Show available commands" },
 ];
 
@@ -145,9 +159,19 @@ export const BOT_COMMAND_REGISTRY: ReadonlyArray<BotCommand> = [
 // we fall through to passthrough rather than returning "unknown" — `:foo` is
 // far more likely natural text than a typo'd command, whereas `/foo` is
 // almost certainly an attempted command.
-const COMMAND_RE = /^\s*([\/:])([A-Za-z0-9_]{0,32})(?:@([A-Za-z0-9_]{1,32}))?(?:\s+(.+?))?\s*$/;
+// `[\s\S]+?` (not `.+?`) so args with embedded newlines match — e.g. a skill
+// invocation pasted with multi-line input (`/tldr <line1>\n<line2>`). Without
+// this, `.` doesn't span `\n` and the whole regex fails, returning kind:unknown.
+const COMMAND_RE = /^\s*([\/:])([A-Za-z0-9_]{0,32})(?:@([A-Za-z0-9_]{1,32}))?(?:\s+([\s\S]+?))?\s*$/;
 
-const KNOWN_COMMANDS = new Set(["clear", "compact", "status", "context", "help"]);
+const KNOWN_COMMANDS = new Set([
+  "clear",
+  "compact",
+  "status",
+  "context",
+  "help",
+  "tasks",
+]);
 
 const TIER_ARG_MAP: Record<string, TierArg> = {
   primary: "primary",
@@ -247,6 +271,13 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
     return { kind: "run", cmd: { kind: "context", tier: tierC } };
   }
 
+  if (name === "tasks") {
+    if (argRaw === "") return { kind: "run", cmd: { kind: "tasks_list" } };
+    const m = /^run\s+([A-Za-z0-9_]{1,32})$/.exec(argRaw);
+    if (m) return { kind: "run", cmd: { kind: "tasks_run", name: m[1]!.toLowerCase() } };
+    return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}tasks ${argRaw}` } };
+  }
+
   // /compact — `all` is invalid (compacting both tiers in one command is two
   // real Claude calls and surprising). PR-B: no-arg → reject for the same
   // reason as /context above (silent `primary` default would summarize an
@@ -271,6 +302,22 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
 // Dispatcher
 // ---------------------------------------------------------------------------
 
+// Subset of OllamaRunDeps the skill path needs. Skills don't reuse runOllamaTurn
+// (no history, no SOLRAC.md overlay, no streaming stub, no tool loop) — they
+// hit `/api/chat` once with stream:false and return the model's text. Only the
+// connection params + soul are required.
+export interface OllamaSkillDeps {
+  url: string;
+  model: string;
+  timeoutMs: number;
+  // SOUL.md text loaded once at boot. Sent as the system message so Ollama
+  // skills inherit the operator's voice the same way Claude skills do via
+  // the SDK's `claude_code` preset append.
+  soul: string;
+  // Injectable for tests; production passes `globalThis.fetch`.
+  fetch?: typeof fetch;
+}
+
 export interface RunCommandDeps {
   tg: TelegramClient;
   db: SolracDb;
@@ -293,11 +340,22 @@ export interface RunCommandDeps {
   // are disabled. `/help` enumerates loaded skills; the parser dispatches to
   // them by name.
   skillRegistry: SkillRegistry;
+  // Ollama-tier skills run a one-shot `/api/chat` against the local daemon
+  // (no SDK, no tool loop, no streaming stub). `null` when Ollama isn't
+  // configured for this deploy — a `tier: ollama` skill in that case fails
+  // loud with a config error rather than silently routing to Claude.
+  ollamaSkillDeps: OllamaSkillDeps | null;
   // PR-B — `/help` renders the engine section dynamically from these two
   // fields so the card matches the deploy. Static text would lie in three
   // of four config combinations (default-Ollama vs default-Claude × tools on/off).
   defaultEngine: "ollama" | "primary" | "secondary";
   ollamaToolsEnabled: boolean;
+  // Phase 2 — scheduled tasks operator surface. Both optional so deploys
+  // with `SOLRAC_TASKS_ENABLED=false` can build the deps object without
+  // dummy values; `/tasks` surfaces a "scheduler disabled" reply when the
+  // registry is empty or absent.
+  taskRegistry?: TaskRegistry;
+  triggerScheduledTask?: (name: string) => TriggerNowResult;
 }
 
 const COMPACT_SOURCE_LIMIT = 50;
@@ -326,6 +384,10 @@ export async function runCommand(
       return runUnknown(deps, msg, updateId, cmd.raw);
     case "skill":
       return runSkill(deps, msg, updateId, cmd.skill, cmd.args);
+    case "tasks_list":
+      return runTasksList(deps, msg, updateId);
+    case "tasks_run":
+      return runTasksRun(deps, msg, updateId, cmd.name);
   }
 }
 
@@ -1139,6 +1201,9 @@ async function runSkill(
   skill: Skill,
   args: string,
 ): Promise<void> {
+  if (skill.tier === "ollama") {
+    return runOllamaSkill(deps, msg, updateId, skill, args);
+  }
   const startedAt = Date.now();
   const modelId = skill.tier === "primary" ? deps.primaryModel : deps.secondaryModel;
   // Engine tag mirrors /compact's shape so `sumChatCostSince` rolls skill
@@ -1336,6 +1401,354 @@ function writeSkillAudit(
     errorMessage,
     endedAt: Date.now(),
   });
+}
+
+// Pure-execution result for an Ollama-tier skill body: just the engine call,
+// no audit, no Telegram side-effects. Both the slash-command path
+// (`runOllamaSkill`) and the tool-call path (`skill-tools.ts::dispatch`) wrap
+// this with their own audit + reply / return-string handling.
+//
+// **RECURSION SAFETY INVARIANT** — this function MUST NOT add a `tools` field
+// to the outgoing `/api/chat` body. Skills are tool-less by design; if a
+// future "smart skills" change exposes tools here, a tool-callable skill
+// would gain the ability to call itself (or another tool-callable skill)
+// → infinite recursion. The recursion-safety test in `skill-tools.test.ts`
+// asserts the request body has no `tools` key — keep both pieces in sync.
+export interface RunSkillBareResult {
+  readonly text: string;
+  readonly errorMessage: string | null;
+  readonly inputTokens: number | null;
+  readonly outputTokens: number | null;
+}
+
+export async function runSkillBare(
+  ollama: OllamaSkillDeps,
+  skill: Skill,
+  args: string,
+): Promise<RunSkillBareResult> {
+  const prompt = renderSkillTemplate(skill.body, args);
+  const messages = [
+    { role: "system", content: ollama.soul },
+    { role: "user", content: prompt },
+  ];
+
+  const fetchImpl = ollama.fetch ?? globalThis.fetch;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ollama.timeoutMs);
+
+  let resultText = "";
+  let inputTokens: number | null = null;
+  let outputTokens: number | null = null;
+  let errorMessage: string | null = null;
+
+  try {
+    const res = await fetchImpl(`${ollama.url}/api/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: ollama.model, messages, stream: false }),
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      // Match runOllamaTurn's 404 vs. generic error shape so operators see the
+      // same "pull this model" hint regardless of which path failed.
+      const bodyText = await res.text().catch(() => "");
+      let parsed: { error?: string } = {};
+      try {
+        parsed = JSON.parse(bodyText) as { error?: string };
+      } catch {
+        // not JSON; fall through with empty parsed
+      }
+      if (res.status === 404) {
+        errorMessage = `ollama model not found: ${ollama.model} — pull with \`ollama pull ${ollama.model}\` on the host`;
+      } else {
+        const detail = parsed.error ?? (bodyText.slice(0, 200) || res.statusText);
+        errorMessage = `ollama error: ${res.status} ${detail}`;
+      }
+    } else {
+      const json = (await res.json()) as {
+        message?: { content?: string };
+        prompt_eval_count?: number;
+        eval_count?: number;
+        error?: string;
+      };
+      if (json.error) {
+        errorMessage = `ollama error: ${json.error}`;
+      } else {
+        resultText = json.message?.content ?? "";
+        inputTokens = json.prompt_eval_count ?? null;
+        outputTokens = json.eval_count ?? null;
+      }
+    }
+  } catch (err) {
+    const e = err as Error;
+    if (e.name === "AbortError") {
+      errorMessage = `ollama timed out after ${(ollama.timeoutMs / 1000).toFixed(0)}s`;
+    } else {
+      errorMessage = `ollama unreachable: ${ollama.url}`;
+    }
+    log.error("skill.ollama_error", {
+      skill: skill.name,
+      url: ollama.url,
+      error: e.message,
+      name: e.name,
+    });
+  } finally {
+    clearTimeout(timer);
+    ac.abort();
+  }
+
+  const trimmed = resultText.trim();
+  if (errorMessage === null && trimmed === "") errorMessage = "empty_response";
+
+  return {
+    text: trimmed,
+    errorMessage,
+    inputTokens,
+    outputTokens,
+  };
+}
+
+// Ollama-tier skill: one-shot `/api/chat` (stream:false), no history, no tool
+// loop, no streaming stub. Mirrors Claude runSkill's audit + reply shape so
+// operator-side observability is identical (`skill.done` log, audit row tagged
+// `ollama:<model>:skill:<name>`). Cost is always 0 — the per-chat hourly cap
+// pre-flight is skipped: a chat that's been throttled by Claude burn shouldn't
+// also lose access to free local inference.
+async function runOllamaSkill(
+  deps: RunCommandDeps,
+  msg: Message,
+  updateId: number,
+  skill: Skill,
+  args: string,
+): Promise<void> {
+  const startedAt = Date.now();
+
+  if (!deps.ollamaSkillDeps) {
+    const errMsg = "ollama not configured for this deploy (set OLLAMA_ENABLED=true and OLLAMA_MODEL)";
+    writeSkillAudit(
+      deps,
+      msg,
+      updateId,
+      `ollama:unconfigured:skill:${skill.name}`,
+      startedAt,
+      0,
+      "error",
+      errMsg,
+    );
+    await sendOrLog(
+      deps.tg,
+      msg.chat.id,
+      `❌ skill <b>${htmlEscapeText(skill.name)}</b> failed: ${htmlEscapeText(errMsg)}`,
+      "cmd.skill_reply_failed",
+    );
+    return;
+  }
+
+  const ollama = deps.ollamaSkillDeps;
+  const engineModelTag = `ollama:${ollama.model}:skill:${skill.name}`;
+  const { text: trimmed, errorMessage, inputTokens, outputTokens } =
+    await runSkillBare(ollama, skill, args);
+
+  const auditId = deps.db.insertAudit({
+    chatId: msg.chat.id,
+    fromId: msg.from!.id,
+    updateId,
+    prompt: truncateAuditPrompt(msg.text ?? ""),
+    startedAt,
+    model: engineModelTag,
+  });
+
+  if (errorMessage !== null) {
+    deps.db.updateAuditEnd({
+      id: auditId,
+      response: null,
+      toolCalls: null,
+      inputTokens,
+      outputTokens,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+      costUsd: 0,
+      agentSessionId: null,
+      status: "error",
+      errorMessage,
+      endedAt: Date.now(),
+    });
+    await sendOrLog(
+      deps.tg,
+      msg.chat.id,
+      `❌ skill <b>${htmlEscapeText(skill.name)}</b> failed: ${htmlEscapeText(errorMessage)}`,
+      "cmd.skill_reply_failed",
+    );
+    return;
+  }
+
+  deps.db.updateAuditEnd({
+    id: auditId,
+    response: snippet(trimmed, 200),
+    toolCalls: null,
+    inputTokens,
+    outputTokens,
+    cacheCreationInputTokens: null,
+    cacheReadInputTokens: null,
+    costUsd: 0,
+    agentSessionId: null,
+    status: "ok",
+    errorMessage: null,
+    endedAt: Date.now(),
+  });
+
+  log.info("skill.done", {
+    chatId: msg.chat.id,
+    skill: skill.name,
+    tier: "ollama",
+    inputTokens,
+    outputTokens,
+    cacheCreationInputTokens: null,
+    cacheReadInputTokens: null,
+    costUsd: 0,
+    replyLength: trimmed.length,
+  });
+
+  const replyBody =
+    trimmed.length > SKILL_REPLY_MAX
+      ? trimmed.slice(0, SKILL_REPLY_MAX - 1) + "…"
+      : trimmed;
+  await sendOrLog(deps.tg, msg.chat.id, htmlEscapeText(replyBody), "cmd.skill_reply_failed");
+}
+
+// ---------------------------------------------------------------------------
+// /tasks
+// ---------------------------------------------------------------------------
+
+async function runTasksList(
+  deps: RunCommandDeps,
+  msg: Message,
+  updateId: number,
+): Promise<void> {
+  if (!deps.taskRegistry || deps.taskRegistry.size() === 0) {
+    const reply =
+      "📅 <b>tasks</b>: scheduler disabled or no TASK.md files loaded.\n" +
+      "Set <code>SOLRAC_TASKS_ENABLED=true</code> and drop TASK.md files into <code>$SOLRAC_TASKS_DIR</code>.";
+    await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.tasks_reply_failed");
+    writeSystemAudit(deps, msg, updateId, "tasks_disabled", "ok");
+    return;
+  }
+  const now = Date.now();
+  const lines = [`📅 <b>scheduled tasks</b> (${deps.taskRegistry.size()})`];
+  for (const t of deps.taskRegistry.all) {
+    const state = deps.db.getTaskState(t.name);
+    const last = state?.lastRunAt
+      ? formatAbsoluteUtc(state.lastRunAt)
+      : "never";
+    const lastStatus = state?.lastStatus ?? "—";
+    const enabled = t.enabled ? "" : " (disabled)";
+    const consumed = state?.oneOffConsumed ? " (consumed)" : "";
+    const sched = formatScheduleSpec(t);
+    const next = formatNextFire(t, state, now);
+    lines.push(
+      `· <b>${htmlEscapeText(t.name)}</b>${enabled}${consumed}\n` +
+        `    schedule: <code>${htmlEscapeText(sched)}</code> · engine: ${t.engine}\n` +
+        `    last: ${last} · ${htmlEscapeText(lastStatus)}\n` +
+        `    next: ${htmlEscapeText(next)}`,
+    );
+  }
+  const reply = lines.join("\n");
+  await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.tasks_reply_failed");
+  writeSystemAudit(deps, msg, updateId, "tasks_listed", "ok");
+}
+
+async function runTasksRun(
+  deps: RunCommandDeps,
+  msg: Message,
+  updateId: number,
+  name: string,
+): Promise<void> {
+  if (!deps.triggerScheduledTask || !deps.taskRegistry) {
+    const reply = "📅 <b>tasks</b>: scheduler disabled.";
+    await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.tasks_reply_failed");
+    writeSystemAudit(deps, msg, updateId, "tasks_disabled", "ok");
+    return;
+  }
+  const result = deps.triggerScheduledTask(name);
+  let reply: string;
+  let status: "ok" | "error" = "ok";
+  switch (result.kind) {
+    case "fired":
+      reply = `🔥 fired task <b>${htmlEscapeText(result.name)}</b>`;
+      break;
+    case "unknown_task":
+      reply = `❌ unknown task <b>${htmlEscapeText(result.name)}</b>`;
+      status = "error";
+      break;
+    case "disabled":
+      reply = `⏸ task <b>${htmlEscapeText(result.name)}</b> is disabled`;
+      status = "error";
+      break;
+    case "one_off_consumed":
+      reply = `✅ task <b>${htmlEscapeText(result.name)}</b> already consumed (one-off)`;
+      status = "error";
+      break;
+  }
+  await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.tasks_reply_failed");
+  writeSystemAudit(deps, msg, updateId, `tasks_run:${result.kind}`, status);
+}
+
+function formatScheduleSpec(t: ScheduledTask): string {
+  const s = t.spec;
+  if (s.kind === "every") {
+    const ms = s.ms;
+    if (ms % 86_400_000 === 0) return `every ${ms / 86_400_000}d`;
+    if (ms % 3_600_000 === 0) return `every ${ms / 3_600_000}h`;
+    if (ms % 60_000 === 0) return `every ${ms / 60_000}m`;
+    return `every ${ms / 1000}s`;
+  }
+  if (s.kind === "daily_at") {
+    const hh = String(s.hourUtc).padStart(2, "0");
+    const mm = String(s.minuteUtc).padStart(2, "0");
+    return `daily_at ${hh}:${mm}`;
+  }
+  return `at ${new Date(s.atMs).toISOString()}`;
+}
+
+/**
+ * Render the next scheduled fire as `<absolute UTC> (in <duration>)`, or
+ * `<absolute UTC> (<duration> late)` when the fire is overdue (the tick hasn't
+ * caught up yet — usually a transient state, but operator-visible).
+ *
+ * Returns:
+ *   - `"consumed"` when the task is one-off and already fired.
+ *   - `"—"` when the task is disabled (no upcoming fire to report).
+ *   - `"—"` when `nextRunAt` returns null (defensive; only happens for
+ *     consumed one-off tasks, already covered above).
+ */
+function formatNextFire(
+  task: ScheduledTask,
+  state: { lastRunAt: number | null; oneOffConsumed: boolean } | null,
+  now: number,
+): string {
+  if (state?.oneOffConsumed) return "consumed";
+  if (!task.enabled) return "—";
+  const due = nextRunAt(task.spec, state?.lastRunAt ?? null, now);
+  if (due === null) return "—";
+  const delta = due - now;
+  const abs = formatAbsoluteUtc(due);
+  if (delta <= 0) {
+    const lateMs = Math.abs(delta);
+    if (lateMs < 1000) return `${abs} (now)`;
+    return `${abs} (${formatRelativeDuration(lateMs)} late)`;
+  }
+  return `${abs} (in ${formatRelativeDuration(delta)})`;
+}
+
+function formatAbsoluteUtc(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 16).replace("T", " ") + "Z";
+}
+
+function formatRelativeDuration(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
 }
 
 // ---------------------------------------------------------------------------
