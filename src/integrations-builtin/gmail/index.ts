@@ -65,7 +65,23 @@ function jsonResult(payload: unknown): ToolResult {
   };
 }
 
-function errorResult(err: unknown): ToolResult {
+// `invalid_grant` is what Google's OAuth token endpoint returns when a
+// refresh token has been revoked or expired. It surfaces from googleapis'
+// auto-refresh path as a 400 (NOT 401), and the marker can live either on
+// the top-level error message or under `response.data.error`. Detect both.
+// Common cause for solrac operators: OAuth client is in "Testing" status
+// and the 7-day refresh-token TTL elapsed; fix is to re-run the bootstrap
+// script per affected alias.
+function isInvalidGrant(err: unknown): boolean {
+  const e = err as LooseAny;
+  const message = typeof e?.message === "string" ? e.message : "";
+  const dataError = typeof e?.response?.data?.error === "string"
+    ? e.response.data.error
+    : "";
+  return message.includes("invalid_grant") || dataError === "invalid_grant";
+}
+
+function errorResult(err: unknown, account?: string): ToolResult {
   const e = err as LooseAny;
   // Friendly message for the most common operator failure modes; falls back
   // to the raw error string. The model receives this verbatim — keep it
@@ -73,10 +89,18 @@ function errorResult(err: unknown): ToolResult {
   const status = e?.response?.status ?? e?.code ?? null;
   const apiMessage = e?.response?.data?.error?.message ?? e?.message ?? String(err);
 
-  if (status === 401) {
+  // Auth-required path covers both:
+  //   - HTTP 401 from the Gmail API (rare; auto-refresh usually handles)
+  //   - invalid_grant from the OAuth token endpoint (refresh-token revoked)
+  // The latter is what operators most commonly hit when an OAuth client
+  // sits in "Testing" mode beyond Google's 7-day refresh-token TTL.
+  if (status === 401 || isInvalidGrant(err)) {
+    const aliasHint = account ?? "<alias>";
     return jsonResult({
       success: false,
-      error: `Gmail authentication expired. Run: bun scripts/gmail-auth.ts <alias>`,
+      error:
+        `Gmail authentication needs renewal for "${aliasHint}". ` +
+        `Run: bun scripts/gmail-auth.ts ${aliasHint}`,
       authRequired: true,
     });
   }
@@ -405,7 +429,7 @@ export default async function setup(
             labels: formatted,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -462,7 +486,7 @@ export default async function setup(
             messages,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -494,7 +518,7 @@ export default async function setup(
             message: formatFullMessage(res.data),
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -559,7 +583,7 @@ export default async function setup(
             threads,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -601,7 +625,7 @@ export default async function setup(
             labelsApplied: lblIds,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -637,7 +661,7 @@ export default async function setup(
             labelsRemoved: lblIds,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -667,7 +691,7 @@ export default async function setup(
           );
           return jsonResult({ success: true, archived: msgIds.length });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -691,7 +715,7 @@ export default async function setup(
           );
           return jsonResult({ success: true, trashed: msgIds.length });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -735,7 +759,7 @@ export default async function setup(
             warning: "Messages have been permanently deleted and cannot be recovered.",
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -849,7 +873,7 @@ export default async function setup(
             subject: args.subject,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
