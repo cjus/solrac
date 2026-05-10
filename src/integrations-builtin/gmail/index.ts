@@ -65,7 +65,23 @@ function jsonResult(payload: unknown): ToolResult {
   };
 }
 
-function errorResult(err: unknown): ToolResult {
+// `invalid_grant` is what Google's OAuth token endpoint returns when a
+// refresh token has been revoked or expired. It surfaces from googleapis'
+// auto-refresh path as a 400 (NOT 401), and the marker can live either on
+// the top-level error message or under `response.data.error`. Detect both.
+// Common cause for solrac operators: OAuth client is in "Testing" status
+// and the 7-day refresh-token TTL elapsed; fix is to re-run the bootstrap
+// script per affected alias.
+function isInvalidGrant(err: unknown): boolean {
+  const e = err as LooseAny;
+  const message = typeof e?.message === "string" ? e.message : "";
+  const dataError = typeof e?.response?.data?.error === "string"
+    ? e.response.data.error
+    : "";
+  return message.includes("invalid_grant") || dataError === "invalid_grant";
+}
+
+function errorResult(err: unknown, account?: string): ToolResult {
   const e = err as LooseAny;
   // Friendly message for the most common operator failure modes; falls back
   // to the raw error string. The model receives this verbatim — keep it
@@ -73,10 +89,18 @@ function errorResult(err: unknown): ToolResult {
   const status = e?.response?.status ?? e?.code ?? null;
   const apiMessage = e?.response?.data?.error?.message ?? e?.message ?? String(err);
 
-  if (status === 401) {
+  // Auth-required path covers both:
+  //   - HTTP 401 from the Gmail API (rare; auto-refresh usually handles)
+  //   - invalid_grant from the OAuth token endpoint (refresh-token revoked)
+  // The latter is what operators most commonly hit when an OAuth client
+  // sits in "Testing" mode beyond Google's 7-day refresh-token TTL.
+  if (status === 401 || isInvalidGrant(err)) {
+    const aliasHint = account ?? "<alias>";
     return jsonResult({
       success: false,
-      error: `Gmail authentication expired. Run: bun scripts/gmail-auth.ts <alias>`,
+      error:
+        `Gmail authentication needs renewal for "${aliasHint}". ` +
+        `Run: bun scripts/gmail-auth.ts ${aliasHint}`,
       authRequired: true,
     });
   }
@@ -101,6 +125,108 @@ function errorResult(err: unknown): ToolResult {
 
 function toArray<T>(value: T | T[]): T[] {
   return Array.isArray(value) ? value : [value];
+}
+
+// Truncate any single rendered line so a 200-message bulk action doesn't
+// produce a 50KB confirm prompt. Subjects above this cap are tail-trimmed
+// with an ellipsis. Number tuned by hand: 90 chars fits a typical desktop
+// row without wrapping.
+const MAX_SUBJECT_DISPLAY_LEN = 90;
+// Message-list cap for confirm-prompt rendering. Beyond this, we summarize
+// "and N more" so the prompt never blows past Telegram's ~4KB practical ceiling.
+const MAX_MESSAGE_ROWS = 12;
+
+interface MessageDigest {
+  id: string;
+  subject: string;
+  from: string;
+}
+
+// Strip emoji code points from operator-display strings. Email subjects
+// from marketers love leading 🚀✨🚗 noise that adds nothing to a confirm
+// prompt; the regex covers Extended_Pictographic plus the ZWJ + variation
+// selectors that compose multi-codepoint emoji. Run after subject extraction.
+function stripEmojis(s: string): string {
+  return s
+    .replace(/[\p{Extended_Pictographic}‍️]+/gu, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+// Escape characters that would break our markdown interpolation: backticks
+// (would close inline code), backslashes, and asterisks/underscores at word
+// boundaries (would render as bold/italic). Subjects are user-controlled so
+// we have to assume hostile input.
+function mdEsc(s: string): string {
+  return s.replace(/[\\`*_~[\]()<>]/g, (m) => `\\${m}`);
+}
+
+function shortenSubject(s: string): string {
+  if (s.length <= MAX_SUBJECT_DISPLAY_LEN) return s;
+  return s.slice(0, MAX_SUBJECT_DISPLAY_LEN - 1) + "…";
+}
+
+// Strip an RFC-5322 display name's "Name <email>" wrapping so we can show
+// just "Name" — falls back to the raw value when the format isn't matched.
+function shortenFrom(raw: string): string {
+  const trimmed = raw.trim();
+  const m = /^"?([^"<]+?)"?\s*<[^>]+>\s*$/.exec(trimmed);
+  if (m && m[1]) return m[1].trim();
+  return trimmed;
+}
+
+async function fetchDigests(
+  c: LooseAny,
+  ids: ReadonlyArray<string>,
+): Promise<MessageDigest[]> {
+  // Cap the per-render fan-out. Callers with N>MAX_MESSAGE_ROWS get the
+  // first MAX_MESSAGE_ROWS expanded plus an overflow line; we only pay for
+  // the visible ones.
+  const visible = ids.slice(0, MAX_MESSAGE_ROWS);
+  const results = await Promise.all(
+    visible.map(async (id): Promise<MessageDigest> => {
+      try {
+        const res = await c.users.messages.get({
+          userId: "me",
+          id,
+          format: "metadata",
+          metadataHeaders: ["Subject", "From"],
+        });
+        const headers = extractHeaders(res.data.payload?.headers);
+        return {
+          id,
+          subject: stripEmojis(headers.subject?.trim() || "") || "(no subject)",
+          from: stripEmojis(headers.from?.trim() || "") || "(unknown sender)",
+        };
+      } catch {
+        return {
+          id,
+          subject: `(metadata unavailable · id: ${id.slice(-8)})`,
+          from: "",
+        };
+      }
+    }),
+  );
+  return results;
+}
+
+// Markdown bullet list. Both marked (web) and `mdToTelegramHtml` (Telegram)
+// render `- item` lines as a list — web gets `<ul><li>`, Telegram gets `•`
+// per-item with proper line breaks.
+function renderMessageList(
+  digests: ReadonlyArray<MessageDigest>,
+  totalCount: number,
+): string {
+  const lines = digests.map((d) => {
+    const subject = mdEsc(shortenSubject(d.subject));
+    const from =
+      d.from === "" ? "" : ` — *${mdEsc(shortenSubject(shortenFrom(d.from)))}*`;
+    return `- ${subject}${from}`;
+  });
+  if (totalCount > digests.length) {
+    lines.push(`- *…and ${totalCount - digests.length} more*`);
+  }
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +271,101 @@ export default async function setup(
   // Common: fetch a Gmail client by account, surfacing friendly errors.
   async function client(account: string): Promise<LooseAny> {
     return await getGmailClient(account, log);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Confirm-prompt formatters (Issue: opaque message IDs in confirm prompts)
+  // ---------------------------------------------------------------------------
+  //
+  // The broker calls these BEFORE rendering the inline-keyboard prompt so the
+  // operator sees email subjects + senders instead of raw `messageIds`. Cost
+  // is a single batched `messages.get(format:metadata)` per render — bounded
+  // to MAX_MESSAGE_ROWS so a 200-message bulk action doesn't fan out.
+  //
+  // All formatters fail-soft: a Gmail API error inside renderMessageList
+  // produces "metadata unavailable · id: ..." rows but never throws. The
+  // broker has its own JSON-fallback path if these throw, so worst case is
+  // the operator sees the original opaque payload.
+
+  type LabelArgs = {
+    account: string;
+    messageIds: string | string[];
+    labelIds: string | string[];
+  };
+  type MessageIdsArgs = { account: string; messageIds: string | string[] };
+  type SendArgs = {
+    account: string;
+    to: string | string[];
+    cc?: string | string[];
+    bcc?: string | string[];
+    subject: string;
+    body: string;
+    bodyType?: "text" | "html";
+    replyTo?: string;
+    attachments?: ReadonlyArray<unknown>;
+  };
+
+  async function formatMessageIdsAction(
+    verb: string,
+    input: unknown,
+  ): Promise<string> {
+    const args = input as MessageIdsArgs;
+    const ids = toArray(args.messageIds);
+    const c = await client(args.account);
+    const digests = await fetchDigests(c, ids);
+    const account = mdEsc(args.account);
+    const list = renderMessageList(digests, ids.length);
+    const noun = ids.length === 1 ? "message" : "messages";
+    return `${verb} **${ids.length}** ${noun} in **${account}**:\n\n${list}`;
+  }
+
+  async function formatLabelAction(
+    verb: string,
+    input: unknown,
+  ): Promise<string> {
+    const args = input as LabelArgs;
+    const ids = toArray(args.messageIds);
+    const labels = toArray(args.labelIds).map(mdEsc).join(", ");
+    const c = await client(args.account);
+    const digests = await fetchDigests(c, ids);
+    const account = mdEsc(args.account);
+    const list = renderMessageList(digests, ids.length);
+    const noun = ids.length === 1 ? "message" : "messages";
+    const preposition = verb === "Apply" ? "to" : "from";
+    return `${verb} \`${labels}\` ${preposition} **${ids.length}** ${noun} in **${account}**:\n\n${list}`;
+  }
+
+  function formatSendAction(input: unknown): string {
+    const args = input as SendArgs;
+    const to = toArray(args.to).map(mdEsc).join(", ");
+    const cc = args.cc ? toArray(args.cc).map(mdEsc).join(", ") : null;
+    const bcc = args.bcc ? toArray(args.bcc).map(mdEsc).join(", ") : null;
+    const subject = mdEsc(args.subject || "(no subject)");
+    const account = mdEsc(args.account);
+    const bodyPreview =
+      args.body.length > 240 ? args.body.slice(0, 240) + "…" : args.body;
+    const attachCount = args.attachments?.length ?? 0;
+    const lines: string[] = [
+      `Send email **from** **${account}**`,
+      `- **To:** ${to}`,
+    ];
+    if (cc) lines.push(`- **Cc:** ${cc}`);
+    if (bcc) lines.push(`- **Bcc:** ${bcc}`);
+    lines.push(`- **Subject:** *${subject}*`);
+    if (attachCount > 0) {
+      const noun = attachCount === 1 ? "file" : "files";
+      lines.push(`- **Attachments:** ${attachCount} ${noun}`);
+    }
+    if (args.replyTo) {
+      lines.push(`- *(reply to message ${mdEsc(args.replyTo)})*`);
+    }
+    lines.push("");
+    // Body preview as a fenced code block — both renderers preserve newlines
+    // inside `<pre>`, so multi-line bodies stay readable.
+    lines.push("```");
+    lines.push(bodyPreview);
+    lines.push("```");
+    return lines.join("\n");
   }
 
   const tools = [
@@ -208,7 +429,7 @@ export default async function setup(
             labels: formatted,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -265,7 +486,7 @@ export default async function setup(
             messages,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -297,7 +518,7 @@ export default async function setup(
             message: formatFullMessage(res.data),
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -362,7 +583,7 @@ export default async function setup(
             threads,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -404,7 +625,7 @@ export default async function setup(
             labelsApplied: lblIds,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -440,7 +661,7 @@ export default async function setup(
             labelsRemoved: lblIds,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -470,7 +691,7 @@ export default async function setup(
           );
           return jsonResult({ success: true, archived: msgIds.length });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -494,7 +715,7 @@ export default async function setup(
           );
           return jsonResult({ success: true, trashed: msgIds.length });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -538,7 +759,7 @@ export default async function setup(
             warning: "Messages have been permanently deleted and cannot be recovered.",
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -652,7 +873,7 @@ export default async function setup(
             subject: args.subject,
           });
         } catch (err) {
-          return errorResult(err);
+          return errorResult(err, args.account);
         }
       },
       { alwaysLoad: true },
@@ -687,6 +908,19 @@ export default async function setup(
         gmail_trash_message: "confirm",
         gmail_delete_message: "confirm",
         gmail_send_message: "confirm",
+      },
+      // Per-tool confirm-prompt formatters. The broker invokes these instead
+      // of dumping JSON, so the operator sees subjects + senders for each
+      // affected message rather than opaque IDs.
+      confirmFormatters: {
+        gmail_apply_label: (input) => formatLabelAction("Apply", input),
+        gmail_remove_label: (input) => formatLabelAction("Remove", input),
+        gmail_archive_message: (input) => formatMessageIdsAction("Archive", input),
+        gmail_trash_message: (input) =>
+          formatMessageIdsAction("Move to Trash (recoverable 30 days)", input),
+        gmail_delete_message: (input) =>
+          formatMessageIdsAction("**PERMANENTLY DELETE**", input),
+        gmail_send_message: (input) => formatSendAction(input),
       },
     },
   };

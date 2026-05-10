@@ -318,6 +318,50 @@ describe("loadIntegrations — contract validation", () => {
     expect(result.errors[0]?.message).toMatch(/meta.toolTiers/);
   });
 
+  test("meta.confirmFormatters with non-function value → error", async () => {
+    const dir = tempDir();
+    writeIntegration(
+      dir,
+      "bad",
+      `export default function (ctx) {
+        return {
+          apiVersion: 1,
+          tools: [ctx.tool("good_name", "x", {}, async () => ({ content: [] }))],
+          meta: { confirmFormatters: { good_name: "not a function" } },
+        };
+      };`,
+    );
+    const result = await loadIntegrations([dir], makeCtx());
+    expect(result.errors[0]?.message).toMatch(/meta.confirmFormatters/);
+  });
+
+  test("meta.confirmFormatters with valid function aggregates into result", async () => {
+    const dir = tempDir();
+    writeIntegration(
+      dir,
+      "good",
+      `export default function (ctx) {
+        return {
+          apiVersion: 1,
+          tools: [ctx.tool("good_name", "x", {}, async () => ({ content: [] }))],
+          meta: {
+            tier: "confirm",
+            confirmFormatters: {
+              good_name: (input) => "rendered: " + JSON.stringify(input),
+            },
+          },
+        };
+      };`,
+    );
+    const result = await loadIntegrations([dir], makeCtx());
+    expect(result.errors.length).toBe(0);
+    expect(result.confirmFormatters.size).toBe(1);
+    const formatter = result.confirmFormatters.get("good_name");
+    expect(typeof formatter).toBe("function");
+    const out = await formatter!({ a: 1 });
+    expect(out).toBe('rendered: {"a":1}');
+  });
+
   test("one bad integration does not stop the others", async () => {
     const dir = tempDir();
     writeIntegration(dir, "bad", `export default function () { return 42; };`);

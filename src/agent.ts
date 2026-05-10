@@ -94,8 +94,10 @@ import { readInstanceMd, wrapInstanceMd } from "./instance.ts";
 import { log } from "./log.ts";
 import {
   createLoopDetector,
+  createPostToolUseHook,
   createPreToolUseHook,
   truncateAuditPrompt,
+  type ConfirmHandle,
   type CostCapGuard,
   type GlobalCostCapGuard,
   type PolicyDenyEvent,
@@ -195,10 +197,17 @@ export interface AgentRunDeps {
   // per-chat in createPreToolUseHook so over-budget hosts deny uniformly.
   // Optional for tests; production wires it from main.ts.
   globalCostGuard?: GlobalCostCapGuard;
-  // Per-turn factory for the interactive permission UX. Closures over chatId
-  // and auditId; the SDK only invokes this for tools its internal classifier
-  // considers non-trivial. If omitted, every tool that reaches it is allowed.
-  createCanUseTool?: (args: { chatId: number; auditId: number }) => CanUseTool;
+  // Per-turn factory for the interactive permission UX. Closures over chatId,
+  // auditId, and the per-turn `pendingHandles` map (used to bridge canUseTool
+  // → PostToolUse so the confirm prompt's footer reflects the tool outcome).
+  // The SDK only invokes the returned callback for tools its internal
+  // classifier considers non-trivial. If omitted, every tool that reaches
+  // canUseTool is allowed.
+  createCanUseTool?: (args: {
+    chatId: number;
+    auditId: number;
+    pendingHandles: Map<string, ConfirmHandle>;
+  }) => CanUseTool;
   // Optional in-process MCP server hosting operator + blessed integrations
   // (Phase 2). When non-null, registered as `mcpServers: { solrac }` so the
   // model sees integration tools as `mcp__solrac__<name>`. `null` when
@@ -254,8 +263,19 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
 
   const prevSessionId = deps.sessions.getSessionId(input.chatId, input.engine);
   const loopDetector = createLoopDetector({ threshold: LOOP_THRESHOLD });
+  // Per-turn ConfirmHandle map. Populated by `canUseTool` when the user
+  // approves a confirm-tier tool; consumed by the PostToolUse hook so the
+  // confirm prompt gets a final outcome footer ("succeeded" / "failed: ...").
+  // Lifetime is exactly this turn; the map gets discarded when runAgent
+  // returns. Keyed by tool_name + JSON.stringify(input) — see
+  // `policy.ts::pendingHandleKey`.
+  const pendingHandles = new Map<string, ConfirmHandle>();
   const canUseTool: CanUseTool =
-    deps.createCanUseTool?.({ chatId: input.chatId, auditId }) ?? defaultAllowAll;
+    deps.createCanUseTool?.({
+      chatId: input.chatId,
+      auditId,
+      pendingHandles,
+    }) ?? defaultAllowAll;
 
   // Captured by the PreToolUse hook on cost-cap or loop-detector deny. Surfaced
   // into the audit row's `error_message` even when the SDK reports the turn as
@@ -275,6 +295,11 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
         },
       })
     : null;
+  // PostToolUse + PostToolUseFailure: finalize the confirm prompt's footer
+  // with the tool outcome ("succeeded"/"failed: ..."). Only fires when a
+  // confirm-tier tool was approved; auto-tier tools never reach the broker
+  // and have no handle to find. Best-effort — a missing handle is a no-op.
+  const postToolUseHook = createPostToolUseHook({ pendingHandles });
 
   const options: Options = {
     cwd,
@@ -307,7 +332,11 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
     // permissionMode:'default'. Cost cap + loop detector live here so the gate
     // is uniform across every tool.
     ...(preToolUseHook && {
-      hooks: { PreToolUse: [{ hooks: [preToolUseHook] }] },
+      hooks: {
+        PreToolUse: [{ hooks: [preToolUseHook] }],
+        PostToolUse: [{ hooks: [postToolUseHook] }],
+        PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+      },
     }),
   };
   if (prevSessionId) options.resume = prevSessionId;

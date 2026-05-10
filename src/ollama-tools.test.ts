@@ -211,13 +211,22 @@ describe("mcpToOllamaTools", () => {
 // Test helpers shared across the Phase 2 cases.
 function makeBroker(
   verdict: ConfirmDecision = "allow",
-  hooks: { onRequest?: () => void; throwOnRequest?: Error } = {},
+  hooks: {
+    onRequest?: () => void;
+    throwOnRequest?: Error;
+    onFinalize?: (outcome: { ok: boolean; message?: string }) => void;
+  } = {},
 ): ConfirmationBroker {
   return {
     request: async () => {
       hooks.onRequest?.();
       if (hooks.throwOnRequest) throw hooks.throwOnRequest;
-      return verdict;
+      return {
+        decision: verdict,
+        finalize: async (outcome) => {
+          hooks.onFinalize?.(outcome);
+        },
+      };
     },
     resolve: () => true,
     size: () => 0,
@@ -881,7 +890,7 @@ describe("runToolLoop", () => {
     const broker: ConfirmationBroker = {
       request: async () => {
         brokerCalls++;
-        return "allow";
+        return { decision: "allow", finalize: async () => {} };
       },
       resolve: () => true,
       size: () => 0,
