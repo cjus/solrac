@@ -183,7 +183,9 @@ function handleEvent(event) {
   } else if (event.kind === "edit") {
     const node = messageNodes.get(event.message_id);
     if (!node) return;
+    const stick = isNearBottom();
     renderBody(node.querySelector(".body"), event.markdown_source, event.html);
+    if (stick) scrollToBottom();
   } else if (event.kind === "reaction") {
     // We don't render reactions in the web UI v1.
   }
@@ -332,4 +334,13 @@ function showError(text) {
 
 function scrollToBottom() {
   els.messages.scrollTop = els.messages.scrollHeight;
+}
+
+// Sticky-bottom threshold: treat the user as "at the bottom" if they're within
+// this many pixels of it. Bigger than 0 because line-wrap during a streaming
+// edit can shift scrollHeight by a few px between frames.
+const STICK_THRESHOLD_PX = 64;
+function isNearBottom() {
+  const el = els.messages;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX;
 }
