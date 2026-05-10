@@ -49,6 +49,18 @@ If you'd rather use Claude Code's official Telegram plugin, that's a perfectly g
 
 ## Quick start
 
+### Install — packaged binary (macOS, Linux)
+
+```sh
+curl -fsSL https://cjus.dev/solrac/install.sh | sh
+```
+
+Drops a self-contained binary at `~/.solrac/bin/solrac` and (with sudo if needed) symlinks it onto `/usr/local/bin/solrac`. Add `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `ALLOWLIST_BOOTSTRAP` to `~/.solrac/.env`, then run `solrac`. Persona files (`SOUL.md`, `SOLRAC.md`) and the SQLite data dir land in `~/.solrac/` on first boot. Reinstalling never touches your customizations.
+
+Full reference: [docs/INSTALL.md](./docs/INSTALL.md).
+
+### Install — from source (developers)
+
 If you have Bun and a Telegram bot:
 
 ```sh
@@ -79,6 +91,7 @@ There is no `>`-style escape prefix; a leading `>` is literal user text routed v
 
 | Doc | Audience | What it covers |
 |-----|----------|---------------|
+| [docs/INSTALL.md](./docs/INSTALL.md) | Operators | curl-pipe install, `~/.solrac/` layout, upgrade & uninstall, building local binaries |
 | [docs/SETUP.md](./docs/SETUP.md) | First-time users | Bun install, Telegram bot creation, `from.id` lookup, Anthropic key, `.env`, first boot |
 | [docs/USAGE.md](./docs/USAGE.md) | Daily users | Concepts (turn / session / `from.id` vs `chat.id`), interaction patterns, permission UX, cost cap, loop detector |
 | [docs/CONFIG.md](./docs/CONFIG.md) | Operators | Full env-var reference: defaults, ranges, validation, secret-scrub rules |

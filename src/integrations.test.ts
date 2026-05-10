@@ -62,9 +62,12 @@ import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { log } from "./log.ts";
 import {
+  BUILTIN_INTEGRATION_NAMES,
   EMPTY_INTEGRATION_RESULT,
   INTEGRATION_API_VERSION,
+  loadBuiltinIntegrations,
   loadIntegrations,
+  mergeIntegrationResults,
   type IntegrationContext,
 } from "./integrations.ts";
 
@@ -461,5 +464,120 @@ describe("loadIntegrations — composition", () => {
 describe("INTEGRATION_API_VERSION", () => {
   test("is 1 (current contract version)", () => {
     expect(INTEGRATION_API_VERSION).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Builtin static-import registry (PNX-168 Bun packaging)
+// ---------------------------------------------------------------------------
+
+// Builtin tests temporarily clear NOTION_API_KEY so the notion setup's probe
+// doesn't fire against whatever token the dev has in their shell (avoids a
+// 3s network timeout per test, plus avoids real API calls). Gmail self-gates
+// on credentials.json existence, not env, so no env scrub needed there.
+function makeBuiltinCtx(): IntegrationContext {
+  return Object.freeze({
+    z,
+    tool,
+    fetch: globalThis.fetch,
+    log,
+    env: process.env as Readonly<Record<string, string | undefined>>,
+  });
+}
+
+describe("loadBuiltinIntegrations", () => {
+  let savedNotionKey: string | undefined;
+  beforeEach(() => {
+    savedNotionKey = process.env.NOTION_API_KEY;
+    delete process.env.NOTION_API_KEY;
+  });
+  afterEach(() => {
+    if (savedNotionKey === undefined) delete process.env.NOTION_API_KEY;
+    else process.env.NOTION_API_KEY = savedNotionKey;
+  });
+
+  test("loads all three blessed builtins (notion, gmail, time)", async () => {
+    const result = await loadBuiltinIntegrations(makeBuiltinCtx());
+    expect(result.loadedCount).toBe(3);
+    expect(result.errors).toEqual([]);
+    expect(result.sources.map((s) => s.name).sort()).toEqual(["gmail", "notion", "time"]);
+  });
+
+  test("each source path uses the synthetic <builtin>:<name> label", async () => {
+    const result = await loadBuiltinIntegrations(makeBuiltinCtx());
+    for (const s of result.sources) {
+      expect(s.path).toBe(`<builtin>:${s.name}`);
+    }
+  });
+
+  test("time_now is registered (notion + gmail self-gate without credentials so may register zero tools)", async () => {
+    const result = await loadBuiltinIntegrations(makeBuiltinCtx());
+    const names = result.tools.map((t) => t.name);
+    expect(names).toContain("time_now");
+  });
+
+  test("toolSources maps each registered tool to its <builtin>:<name> label", async () => {
+    const result = await loadBuiltinIntegrations(makeBuiltinCtx());
+    for (const t of result.tools) {
+      const src = result.toolSources.get(t.name);
+      expect(src).toMatch(/^<builtin>:/);
+    }
+  });
+});
+
+describe("BUILTIN_INTEGRATION_NAMES", () => {
+  test("matches the blessed registry contents in declaration order", () => {
+    expect(BUILTIN_INTEGRATION_NAMES).toEqual(["notion", "gmail", "time"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mergeIntegrationResults
+// ---------------------------------------------------------------------------
+
+describe("mergeIntegrationResults", () => {
+  test("merges two non-overlapping results", async () => {
+    const dirA = tempDir();
+    writeIntegration(dirA, "echo", VALID_ECHO);
+    const dirB = tempDir();
+    writeIntegration(dirB, "time", VALID_TIME);
+    const a = await loadIntegrations([dirA], makeCtx());
+    const b = await loadIntegrations([dirB], makeCtx());
+    const merged = mergeIntegrationResults(a, b);
+    expect(merged.loadedCount).toBe(2);
+    expect(merged.tools.map((t) => t.name).sort()).toEqual(["echo_say", "time_now"]);
+    expect(merged.errors).toEqual([]);
+  });
+
+  test("first-wins on cross-result tool-name collisions", async () => {
+    // Both results register "echo_say" — the second's copy is dropped on merge.
+    const dirA = tempDir();
+    writeIntegration(dirA, "first", VALID_ECHO);
+    const dirB = tempDir();
+    writeIntegration(dirB, "second", VALID_ECHO);
+    const first = await loadIntegrations([dirA], makeCtx());
+    const second = await loadIntegrations([dirB], makeCtx());
+    const merged = mergeIntegrationResults(first, second);
+    expect(merged.tools.length).toBe(1);
+    // The kept tool comes from the first result.
+    expect(merged.toolSources.get("echo_say")).toBe(first.toolSources.get("echo_say"));
+  });
+
+  test("concatenates errors and sources from each result", async () => {
+    const dirA = tempDir();
+    writeIntegration(dirA, "good", VALID_TIME);
+    writeIntegration(dirA, "bad", `export const x = 1;`); // no default export
+    const a = await loadIntegrations([dirA], makeCtx());
+    const b = EMPTY_INTEGRATION_RESULT;
+    const merged = mergeIntegrationResults(a, b);
+    expect(merged.errors.length).toBe(1);
+    expect(merged.sources.length).toBe(1);
+  });
+
+  test("merging zero arguments returns an empty result", () => {
+    const merged = mergeIntegrationResults();
+    expect(merged.loadedCount).toBe(0);
+    expect(merged.tools.length).toBe(0);
+    expect(merged.errors.length).toBe(0);
   });
 });

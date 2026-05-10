@@ -36,6 +36,11 @@
     "smoke:integrations": "bun test/smokes/integrations.ts",
     "smoke:notion": "bun test/smokes/notion-smoke.ts",
     "smoke:ollama": "bun test/smokes/ollama.ts",
+    "embed:web-sanitize": "bun scripts/embed-web-sanitize.ts",
+    "prepare": "bun scripts/embed-web-sanitize.ts",
+    "pretest": "bun scripts/embed-web-sanitize.ts",
+    "prebuild:bin": "bun scripts/embed-web-sanitize.ts",
+    "build:bin": "bun scripts/build.ts",
     "clean": "rm -rf dist"
   },
   "devDependencies": {
