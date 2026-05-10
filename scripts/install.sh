@@ -172,8 +172,10 @@ next steps:
        ALLOWLIST_BOOTSTRAP=<your telegram from.id>
 
   3. run \`solrac\`. SOUL.md, SOLRAC.md, and data/ will appear in $HOME_DIR
-     on first boot. edits to SOUL.md/SOLRAC.md survive future reinstalls of
-     this script — only the binary at $BIN_PATH is replaced on update.
+     on first boot. reinstalling this script ONLY replaces the binary at
+     $BIN_PATH — everything else under $HOME_DIR
+     (SOUL.md, SOLRAC.md, .env, data/, skills/, tasks/, integrations/, and
+     any other files you add) is left untouched.
 
 reinstall:  \`curl -fsSL https://cjus.dev/solrac/install.sh | sh\`
 uninstall:  \`rm -rf $HOME_DIR /usr/local/bin/solrac\`
