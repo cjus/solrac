@@ -23,6 +23,17 @@ on:
 permissions:
   contents: write  # needed to create the GitHub Release + upload assets
 
+# Opt into Node 24 for JavaScript-based actions (checkout, setup-node,
+# setup-bun, action-gh-release, etc.). Node 20 is deprecated on GitHub
+# runners — forced switch starts 2026-06-02, removal 2026-09-16. Setting
+# the env var early lets us validate the new runtime before the forced
+# migration. The release is unaffected by which Node runs the actions —
+# the binary's snapshotted Bun runtime comes from the `bun-version` pin
+# below, not from the runner's Node.
+# See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   release:
     runs-on: ubuntu-latest
