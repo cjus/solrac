@@ -1014,6 +1014,20 @@ If we reordered (offset before claim), a crash between steps 2 and 3 would re-pr
 
 **See also.** PNX-170 ticket for the original repro with a 429-driven `error_during_execution`.
 
+### 9. Embedded assets vs. operator-edited overlay (PNX-168)
+
+**Problem.** The compiled Bun binary has no source tree at runtime, but `instance.ts` and `web.ts` previously read `SOUL.md`/`SOLRAC.md`/`public/*`/`web-sanitize.ts` from the filesystem at boot or per-request. `import.meta.url`-based path traversal (`packageDir()`) resolved to the bundle's virtual `/$bunfs/...` path, which contains no source files — `loadSoul` would throw on first boot of any compiled binary.
+
+**Solution.** Three changes in `instance.ts`, `integrations.ts`, and `web.ts`:
+
+1. **Persona files.** `instance.ts` text-imports `../SOUL.md` and `../SOLRAC.md` (`with { type: "text" }`) into `EMBEDDED_DEFAULTS`. `bootstrapInstanceFiles($SOLRAC_HOME)` writes them to disk on first boot — operator edits live on disk; the embedded copies are a one-time seed plus an upgrade signal (`SOUL.md.new` emits when the embedded default diverges from the on-disk copy).
+2. **Builtin integrations.** `integrations.ts` imports the three blessed builtins (`notion`, `gmail`, `time`) statically via the top-level `BUILTIN_INTEGRATIONS` registry. Operator-supplied `SOLRAC_INTEGRATIONS_DIR/*/index.ts` modules continue to load via dynamic `import()` (works in `--compile` because Bun's runtime supports it). `mergeIntegrationResults(builtins, operator)` composes the two with first-wins collision tracking.
+3. **Web UI.** `web.ts` text-imports `../public/{index.html,style.css,app.js}`, `./web-sanitize.ts`, and `../node_modules/marked/lib/marked.umd.js`. The static handler serves these from in-memory string constants. `Bun.Transpiler` runs once at first request to convert the embedded `web-sanitize.ts` into browser-runnable JS.
+
+**Implication.** Adding a new browser asset requires adding both a text import in `web.ts` AND an entry in `EMBEDDED_STATIC_ASSETS`. Adding a new builtin integration requires adding an import + entry in `BUILTIN_INTEGRATIONS`. Forgetting either makes the dev workflow keep working but the compiled binary serve a 404 / register zero tools — a silent regression. Until we have a CI test that boots the compiled binary and exercises every embedded path, the PR reviewer is the safety net.
+
+**See also.** `docs/INSTALL.md` for the operator-facing install flow; `scripts/build.ts` for the multi-target build runner; `text-modules.d.ts` for the ambient `*.md`/`*.html`/`*.css`/`*.js` declarations that satisfy `tsc --noEmit`.
+
 ---
 
 ## Logging

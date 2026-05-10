@@ -36,6 +36,36 @@ import { log } from "./log.ts";
 import { sanitizeHtml } from "./web-sanitize.ts";
 import type { WebClient, WebBusEvent } from "./web-client.ts";
 
+// PNX-168 — text imports of UI assets so the compiled binary serves the web
+// UI without runtime fs reads of the source tree. In dev these resolve to the
+// checked-in files at module-evaluation time; in the packaged binary they're
+// baked-in string constants.
+//
+// `with { type: "text" }` is honored by Bun at runtime — every import below
+// receives the file content as a string. TypeScript's resolver does NOT honor
+// the attribute and falls back to bun-types' built-in `*.html` declaration
+// (which types as `HTMLBundle`). We cast through `unknown` to land each
+// binding as `string`. Single-site rather than mass-edited at every consumer.
+//
+// `web-sanitize.embed.js` is generated from `web-sanitize.ts` via the
+// `embed:web-sanitize` script (run automatically by the prepare/pretest/
+// prebuild:bin lifecycle hooks). Bun's text-import attribute does NOT work
+// on `.ts` files — the loader treats them as TS modules first regardless of
+// the attribute, so the source must live in a non-TS file.
+import _EMBEDDED_INDEX_HTML from "../public/index.html" with { type: "text" };
+import _EMBEDDED_APP_JS from "../public/app.js" with { type: "text" };
+import _EMBEDDED_STYLE_CSS from "../public/style.css" with { type: "text" };
+import _EMBEDDED_WEB_SANITIZE_JS from "./web-sanitize.embed.js" with { type: "text" };
+// `marked` is the only browser-side dep that lives outside `public/` — text-
+// import the UMD build so we don't need the node_modules tree at runtime.
+import _EMBEDDED_MARKED_JS from "../node_modules/marked/lib/marked.umd.js" with { type: "text" };
+
+const EMBEDDED_INDEX_HTML = _EMBEDDED_INDEX_HTML as unknown as string;
+const EMBEDDED_APP_JS = _EMBEDDED_APP_JS as unknown as string;
+const EMBEDDED_STYLE_CSS = _EMBEDDED_STYLE_CSS as unknown as string;
+const EMBEDDED_WEB_SANITIZE_JS = _EMBEDDED_WEB_SANITIZE_JS as unknown as string;
+const EMBEDDED_MARKED_JS = _EMBEDDED_MARKED_JS as unknown as string;
+
 export interface WebServerDeps {
   host: string;
   port: number;
@@ -66,8 +96,6 @@ export interface WebServerDeps {
    * runs `marked` + sanitizer.
    */
   loadHistory: () => Array<{ prompt: string; response: string; model: string }>;
-  /** Project root so static files resolve regardless of cwd. */
-  rootDir: string;
 }
 
 export interface WebServerHandle {
@@ -215,28 +243,19 @@ export function startWebServer(deps: WebServerDeps): WebServerHandle {
     });
   }
 
-  async function staticHandler(req: Request, fileName: string): Promise<Response> {
+  function staticHandler(req: Request, fileName: string): Response {
     if (fileName === "sanitize.js") {
-      const js = await fetchSanitizeJs(deps.rootDir);
-      return new Response(js, {
+      return new Response(getSanitizeJs(), {
         headers: { "content-type": "application/javascript" },
       });
     }
-    // Restrict to a small allowlist of file names — no path traversal.
-    const allowed = ALLOWED_STATIC.get(fileName);
-    if (!allowed) return new Response("not found", { status: 404 });
-    const file = Bun.file(allowed.path(deps.rootDir));
-    if (!(await file.exists())) {
-      return new Response("not found", { status: 404 });
-    }
-    return new Response(file, { headers: { "content-type": allowed.mime } });
+    const asset = EMBEDDED_STATIC_ASSETS.get(fileName);
+    if (!asset) return new Response("not found", { status: 404 });
+    return new Response(asset.body, { headers: { "content-type": asset.mime } });
   }
 
-  async function rootHandler(req: Request): Promise<Response> {
-    const file = Bun.file(`${deps.rootDir}/public/index.html`);
-    if (!(await file.exists())) return new Response("ui missing", { status: 500 });
-    const raw = await file.text();
-    const html = renderIndexHtml(raw, deps.defaultEngineLabel);
+  function rootHandler(req: Request): Response {
+    const html = renderIndexHtml(EMBEDDED_INDEX_HTML, deps.defaultEngineLabel);
     return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
   }
 
@@ -251,9 +270,9 @@ export function startWebServer(deps: WebServerDeps): WebServerHandle {
       const url = new URL(req.url);
       const path = url.pathname;
       try {
-        if (req.method === "GET" && path === "/") return await rootHandler(req);
+        if (req.method === "GET" && path === "/") return rootHandler(req);
         if (req.method === "GET" && path.startsWith("/static/")) {
-          return await staticHandler(req, path.slice("/static/".length));
+          return staticHandler(req, path.slice("/static/".length));
         }
         if (req.method === "POST" && path === "/api/login") {
           const body = (await req.json().catch(() => ({}))) as { token?: unknown };
@@ -298,32 +317,22 @@ export function startWebServer(deps: WebServerDeps): WebServerHandle {
 // Internals exported for tests
 // ---------------------------------------------------------------------------
 
-const ALLOWED_STATIC = new Map<
-  string,
-  { path: (root: string) => string; mime: string }
->([
-  ["app.js", { path: (r) => `${r}/public/app.js`, mime: "application/javascript" }],
-  ["style.css", { path: (r) => `${r}/public/style.css`, mime: "text/css" }],
-  [
-    "marked.min.js",
-    {
-      path: (r) => `${r}/node_modules/marked/lib/marked.umd.js`,
-      mime: "application/javascript",
-    },
-  ],
+// Embedded static assets served under /static/<filename>. Strict allowlist —
+// no path traversal because we look up by exact filename. Bodies are baked
+// into the binary at build time via the text imports at the top of this file.
+const EMBEDDED_STATIC_ASSETS = new Map<string, { body: string; mime: string }>([
+  ["app.js", { body: EMBEDDED_APP_JS, mime: "application/javascript" }],
+  ["style.css", { body: EMBEDDED_STYLE_CSS, mime: "text/css" }],
+  ["marked.min.js", { body: EMBEDDED_MARKED_JS, mime: "application/javascript" }],
 ]);
 
 // `web-sanitize.ts` is the single source of truth for HTML allowlisting; it's
-// tested under bun:test (server-side) and shipped to the browser by
-// transpiling it on the fly (Bun.Transpiler). Cached in module scope so we
-// transpile once per process.
-let cachedSanitizeJs: string | null = null;
-async function fetchSanitizeJs(rootDir: string): Promise<string> {
-  if (cachedSanitizeJs !== null) return cachedSanitizeJs;
-  const text = await Bun.file(`${rootDir}/src/web-sanitize.ts`).text();
-  const transpiler = new Bun.Transpiler({ loader: "ts", target: "browser" });
-  cachedSanitizeJs = transpiler.transformSync(text);
-  return cachedSanitizeJs;
+// tested under bun:test (server-side) and shipped to the browser as
+// `web-sanitize.embed.js` (pre-transpiled by `scripts/embed-web-sanitize.ts`).
+// No runtime transpilation step needed — the embed file is already
+// browser-ready JS, just served as-is.
+function getSanitizeJs(): string {
+  return EMBEDDED_WEB_SANITIZE_JS;
 }
 
 /**

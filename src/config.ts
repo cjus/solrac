@@ -45,6 +45,10 @@
  *   - .env.example — template
  */
 
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, resolve } from "node:path";
+
 type Transport = "poll" | "webhook";
 
 // Engine selected when a user message has no `@` or `!` prefix. Mirrors
@@ -69,6 +73,13 @@ export interface Config {
   readonly allowlistBootstrap: readonly number[];
   readonly transport: Transport;
   readonly port: number;
+  // Absolute path to the solrac "home" directory — where SOUL.md, SOLRAC.md,
+  // the SQLite data dir, and operator subdirectories (skills/tasks/integrations)
+  // live by default. Resolution order: explicit `SOLRAC_HOME` env > cwd if it
+  // contains a SOUL.md (the dev workflow: a clean clone has it checked-in) >
+  // `~/.solrac/` (packaged-binary default). All other path-like configs below
+  // resolve relative paths against this dir.
+  readonly solracHome: string;
   readonly dataDir: string;
   readonly hourlyCostCapUsd: number;
   readonly globalHourlyCostCapUsd: number;
@@ -202,6 +213,33 @@ function parseDefaultEngine(raw: string | undefined): DefaultEngine {
   throw new Error(
     `SOLRAC_DEFAULT_ENGINE must be "ollama", "primary", or "secondary", got "${raw}"`,
   );
+}
+
+/**
+ * Resolve `SOLRAC_HOME` to an absolute path. Order:
+ *
+ *   1. `$SOLRAC_HOME` if set — operator-explicit; resolved against cwd if relative.
+ *   2. `process.cwd()` if `SOUL.md` is checked in there — the dev workflow.
+ *      A fresh git clone of solrac has SOUL.md at the repo root; running
+ *      `bun src/main.ts` or `npm run dev` from there should "just work" with
+ *      data + persona files staying inside the checkout.
+ *   3. `~/.solrac/` — the packaged-binary default. install.sh creates this
+ *      dir; the binary's bootstrap writes embedded SOUL.md/SOLRAC.md here on
+ *      first run.
+ *
+ * The detection is intentionally local-state-aware (existsSync, not a build
+ * flag) so the same binary behaves correctly whether it's `bun src/main.ts`
+ * in a checkout or `solrac` from `/usr/local/bin/`.
+ */
+function resolveSolracHome(raw: string | undefined): string {
+  if (raw && raw.trim() !== "") return resolve(raw.trim());
+  if (existsSync(resolve(process.cwd(), "SOUL.md"))) return process.cwd();
+  return resolve(homedir(), ".solrac");
+}
+
+/** Resolve `raw` against `home` if relative, return as-is if absolute. */
+function resolveAgainstHome(home: string, raw: string): string {
+  return isAbsolute(raw) ? raw : resolve(home, raw);
 }
 
 function parseNegativeInt(name: string, raw: string | undefined, fallback: number): number {
@@ -365,13 +403,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     }
   }
 
+  const solracHome = resolveSolracHome(env.SOLRAC_HOME);
+  const dataDirRaw =
+    env.DATA_DIR && env.DATA_DIR.trim() !== "" ? env.DATA_DIR.trim() : "./data";
+  const skillsDirRaw =
+    env.SOLRAC_SKILLS_DIR && env.SOLRAC_SKILLS_DIR.trim() !== ""
+      ? env.SOLRAC_SKILLS_DIR.trim()
+      : "./skills";
+  const tasksDirRaw =
+    env.SOLRAC_TASKS_DIR && env.SOLRAC_TASKS_DIR.trim() !== ""
+      ? env.SOLRAC_TASKS_DIR.trim()
+      : "./tasks";
+  const integrationsDirRaw =
+    env.SOLRAC_INTEGRATIONS_DIR && env.SOLRAC_INTEGRATIONS_DIR.trim() !== ""
+      ? env.SOLRAC_INTEGRATIONS_DIR.trim()
+      : "./integrations";
+
   return Object.freeze({
     anthropicApiKey: env.ANTHROPIC_API_KEY!,
     telegramBotToken: env.TELEGRAM_BOT_TOKEN!,
     allowlistBootstrap: Object.freeze(parseAllowlist(env.ALLOWLIST_BOOTSTRAP!)),
     transport,
     port,
-    dataDir: env.DATA_DIR && env.DATA_DIR.trim() !== "" ? env.DATA_DIR : "./data",
+    solracHome,
+    dataDir: resolveAgainstHome(solracHome, dataDirRaw),
     hourlyCostCapUsd,
     globalHourlyCostCapUsd,
     maxConcurrentTurns,
@@ -395,20 +450,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ollamaToolsEnabled,
     ollamaMaxToolIterations,
     skillsEnabled: parseBoolean("SOLRAC_SKILLS_ENABLED", env.SOLRAC_SKILLS_ENABLED, false),
-    skillsDir:
-      env.SOLRAC_SKILLS_DIR && env.SOLRAC_SKILLS_DIR.trim() !== ""
-        ? env.SOLRAC_SKILLS_DIR.trim()
-        : "./skills",
+    skillsDir: resolveAgainstHome(solracHome, skillsDirRaw),
     tasksEnabled: parseBoolean("SOLRAC_TASKS_ENABLED", env.SOLRAC_TASKS_ENABLED, false),
-    tasksDir:
-      env.SOLRAC_TASKS_DIR && env.SOLRAC_TASKS_DIR.trim() !== ""
-        ? env.SOLRAC_TASKS_DIR.trim()
-        : "./tasks",
+    tasksDir: resolveAgainstHome(solracHome, tasksDirRaw),
     integrationsEnabled,
-    integrationsDir:
-      env.SOLRAC_INTEGRATIONS_DIR && env.SOLRAC_INTEGRATIONS_DIR.trim() !== ""
-        ? env.SOLRAC_INTEGRATIONS_DIR.trim()
-        : "./integrations",
+    integrationsDir: resolveAgainstHome(solracHome, integrationsDirRaw),
     webEnabled,
     webHost,
     webPort,

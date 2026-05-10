@@ -71,7 +71,6 @@ import {
   type SdkMcpToolDefinition,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Update } from "@grammyjs/types";
-import { join } from "node:path";
 import { runAgent } from "./agent.ts";
 import { createAllowlist, type Allowlist } from "./allowlist.ts";
 import {
@@ -89,7 +88,6 @@ import {
   instanceMdPath,
   loadSoul,
   logBootstrapResult,
-  packageDir,
 } from "./instance.ts";
 import { installShutdown } from "./lifecycle.ts";
 import { log } from "./log.ts";
@@ -127,9 +125,12 @@ import { startServer } from "./server.ts";
 import { createSessionStore, type SessionStore } from "./session.ts";
 import {
   type ConfirmFormatter,
+  BUILTIN_INTEGRATION_NAMES,
   createIntegrationContext,
+  loadBuiltinIntegrations,
   loadIntegrations,
   logIntegrationLoadResult,
+  mergeIntegrationResults,
 } from "./integrations.ts";
 import { buildSkillTools } from "./skill-tools.ts";
 import {
@@ -558,20 +559,23 @@ async function main(): Promise<void> {
     });
   }
 
-  // PNX-167 (system-prompt externalization). Bootstrap SOUL.md + SOLRAC.md
-  // into the launch cwd from the package defaults if absent, then load SOUL
-  // into memory and remember the SOLRAC.md path for per-turn re-reads.
-  const launchCwd = process.cwd();
-  const bootstrap = bootstrapInstanceFiles(launchCwd, packageDir());
-  logBootstrapResult(launchCwd, bootstrap);
+  // PNX-167 (system-prompt externalization) + PNX-168 (Bun packaging).
+  // Bootstrap SOUL.md + SOLRAC.md into `solracHome` (resolved at config time
+  // — defaults to cwd in dev, ~/.solrac/ in the packaged binary) from the
+  // embedded canonical defaults baked into the binary via text imports. Then
+  // load SOUL into memory and remember the SOLRAC.md path for per-turn
+  // re-reads. SOUL.md.new emits when an upgraded binary's embedded SOUL
+  // diverges from the operator's edited copy.
+  const bootstrap = bootstrapInstanceFiles(config.solracHome);
+  logBootstrapResult(config.solracHome, bootstrap);
   let soul: string;
   try {
-    soul = loadSoul(launchCwd);
+    soul = loadSoul(config.solracHome);
   } catch (err) {
     log.error("instance.soul_load_failed", { error: (err as Error).message });
     process.exit(1);
   }
-  const solracMdPath = instanceMdPath(launchCwd);
+  const solracMdPath = instanceMdPath(config.solracHome);
 
   const db = await openDb(config.dataDir);
   const allowlist = createAllowlist(db);
@@ -604,12 +608,19 @@ async function main(): Promise<void> {
     // are off so downstream `Array.isArray + length>0` checks work uniformly.
     let integrationTools: ReadonlyArray<SdkMcpToolDefinition<any>> = [];
     if (config.integrationsEnabled) {
-      const builtinDir = join(import.meta.dir, "integrations-builtin");
-      const result = await loadIntegrations(
-        [builtinDir, config.integrationsDir],
-        createIntegrationContext(),
+      // PNX-168 — builtins now load from a static-import registry so the
+      // compiled binary includes them. Operator dirs still load via dynamic
+      // `import()` (works in --compile because Bun's runtime handles it).
+      // Builtins win on tool-name collisions; the merge logs each cross-source
+      // collision with both source identifiers.
+      const ctx = createIntegrationContext();
+      const builtinResult = await loadBuiltinIntegrations(ctx);
+      const operatorResult = await loadIntegrations([config.integrationsDir], ctx);
+      const result = mergeIntegrationResults(builtinResult, operatorResult);
+      logIntegrationLoadResult(
+        [`<builtin>:[${BUILTIN_INTEGRATION_NAMES.join(",")}]`, config.integrationsDir],
+        result,
       );
-      logIntegrationLoadResult([builtinDir, config.integrationsDir], result);
       integrationToolTiers = result.toolTiers;
       integrationConfirmFormatters = result.confirmFormatters;
       integrationTools = result.tools;
@@ -933,7 +944,6 @@ async function main(): Promise<void> {
         token: config.webToken,
         webChatId: config.webChatId,
         webClient,
-        rootDir: packageDir(),
         defaultEngineLabel: defaultEngineLabel(config.defaultEngine),
         onMessage: (text) => {
           const id = nextWebUpdateId++;

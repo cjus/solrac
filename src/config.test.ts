@@ -44,11 +44,16 @@ import { loadConfig } from "./config.ts";
 // specifically about the inversion don't have to also configure Ollama.
 // The new default since PR-B is `ollama`, which requires `OLLAMA_ENABLED=true`
 // — covered by the dedicated default-engine test block below.
+// Pin SOLRAC_HOME to a deterministic absolute path so path-config assertions
+// don't depend on whatever cwd `bun test` runs from. The dir doesn't need to
+// exist — loadConfig only joins/resolves strings, never touches the fs.
+const TEST_HOME = "/tmp/solrac-config-test-home";
 const baseEnv: NodeJS.ProcessEnv = {
   ANTHROPIC_API_KEY: "sk-ant-test",
   TELEGRAM_BOT_TOKEN: "fake-tg-token",
   ALLOWLIST_BOOTSTRAP: "100",
   SOLRAC_DEFAULT_ENGINE: "primary",
+  SOLRAC_HOME: TEST_HOME,
 };
 
 describe("loadConfig — required vars", () => {
@@ -327,10 +332,10 @@ describe("loadConfig — web UI", () => {
 });
 
 describe("loadConfig — skills", () => {
-  test("default: skillsEnabled=false, skillsDir=./skills", () => {
+  test("default: skillsEnabled=false, skillsDir resolves under solracHome", () => {
     const cfg = loadConfig({ ...baseEnv });
     expect(cfg.skillsEnabled).toBe(false);
-    expect(cfg.skillsDir).toBe("./skills");
+    expect(cfg.skillsDir).toBe(`${TEST_HOME}/skills`);
   });
 
   test("SOLRAC_SKILLS_ENABLED=true is parsed", () => {
@@ -338,22 +343,27 @@ describe("loadConfig — skills", () => {
     expect(cfg.skillsEnabled).toBe(true);
   });
 
-  test("SOLRAC_SKILLS_DIR overrides default", () => {
+  test("SOLRAC_SKILLS_DIR absolute overrides default", () => {
     const cfg = loadConfig({ ...baseEnv, SOLRAC_SKILLS_DIR: "/var/solrac/skills" });
     expect(cfg.skillsDir).toBe("/var/solrac/skills");
   });
 
-  test("SOLRAC_SKILLS_DIR blank falls back to ./skills", () => {
+  test("SOLRAC_SKILLS_DIR relative resolves against solracHome", () => {
+    const cfg = loadConfig({ ...baseEnv, SOLRAC_SKILLS_DIR: "./alt-skills" });
+    expect(cfg.skillsDir).toBe(`${TEST_HOME}/alt-skills`);
+  });
+
+  test("SOLRAC_SKILLS_DIR blank falls back to <home>/skills", () => {
     const cfg = loadConfig({ ...baseEnv, SOLRAC_SKILLS_DIR: "  " });
-    expect(cfg.skillsDir).toBe("./skills");
+    expect(cfg.skillsDir).toBe(`${TEST_HOME}/skills`);
   });
 });
 
 describe("loadConfig — integrations", () => {
-  test("default: integrationsEnabled=false, integrationsDir=./integrations", () => {
+  test("default: integrationsEnabled=false, integrationsDir resolves under solracHome", () => {
     const cfg = loadConfig({ ...baseEnv });
     expect(cfg.integrationsEnabled).toBe(false);
-    expect(cfg.integrationsDir).toBe("./integrations");
+    expect(cfg.integrationsDir).toBe(`${TEST_HOME}/integrations`);
   });
 
   test("SOLRAC_INTEGRATIONS_ENABLED=true is parsed", () => {
@@ -361,13 +371,36 @@ describe("loadConfig — integrations", () => {
     expect(cfg.integrationsEnabled).toBe(true);
   });
 
-  test("SOLRAC_INTEGRATIONS_DIR overrides default", () => {
+  test("SOLRAC_INTEGRATIONS_DIR absolute overrides default", () => {
     const cfg = loadConfig({ ...baseEnv, SOLRAC_INTEGRATIONS_DIR: "/var/solrac/integrations" });
     expect(cfg.integrationsDir).toBe("/var/solrac/integrations");
   });
 
-  test("SOLRAC_INTEGRATIONS_DIR blank falls back to ./integrations", () => {
+  test("SOLRAC_INTEGRATIONS_DIR blank falls back to <home>/integrations", () => {
     const cfg = loadConfig({ ...baseEnv, SOLRAC_INTEGRATIONS_DIR: "  " });
-    expect(cfg.integrationsDir).toBe("./integrations");
+    expect(cfg.integrationsDir).toBe(`${TEST_HOME}/integrations`);
+  });
+});
+
+describe("loadConfig — solracHome resolution", () => {
+  test("explicit SOLRAC_HOME wins (absolute)", () => {
+    const cfg = loadConfig({ ...baseEnv, SOLRAC_HOME: "/explicit/home" });
+    expect(cfg.solracHome).toBe("/explicit/home");
+    expect(cfg.dataDir).toBe("/explicit/home/data");
+  });
+
+  test("explicit SOLRAC_HOME relative resolves against process.cwd()", () => {
+    const cfg = loadConfig({ ...baseEnv, SOLRAC_HOME: "./relative-home" });
+    expect(cfg.solracHome).toBe(`${process.cwd()}/relative-home`);
+  });
+
+  test("DATA_DIR absolute overrides default", () => {
+    const cfg = loadConfig({ ...baseEnv, DATA_DIR: "/var/solrac/data" });
+    expect(cfg.dataDir).toBe("/var/solrac/data");
+  });
+
+  test("DATA_DIR relative resolves against solracHome", () => {
+    const cfg = loadConfig({ ...baseEnv, DATA_DIR: "./mydata" });
+    expect(cfg.dataDir).toBe(`${TEST_HOME}/mydata`);
   });
 });

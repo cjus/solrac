@@ -86,6 +86,15 @@ import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { log } from "./log.ts";
 
+// Static imports of the blessed builtins so `bun build --compile` can include
+// their source in the binary. Dynamic `import()` of a fs path (the legacy
+// loader) doesn't work under --compile because the source tree isn't on disk
+// inside the binary's virtual filesystem. New builtins must be added to
+// `BUILTIN_INTEGRATIONS` below — that's the single source of truth.
+import notionSetup from "./integrations-builtin/notion/index.ts";
+import gmailSetup from "./integrations-builtin/gmail/index.ts";
+import timeSetup from "./integrations-builtin/time/index.ts";
+
 // ---------------------------------------------------------------------------
 // Public types + constants
 // ---------------------------------------------------------------------------
@@ -166,6 +175,12 @@ export interface IntegrationLoadResult {
   readonly toolTiers: ReadonlyMap<string, IntegrationTier>;
   /** Map of short tool name → confirm-prompt formatter (used by the broker). */
   readonly confirmFormatters: ReadonlyMap<string, ConfirmFormatter>;
+  /**
+   * Map of tool name → source path/label that registered it. `mergeIntegrationResults`
+   * uses this to log meaningful collision warnings when two results contribute
+   * the same tool name.
+   */
+  readonly toolSources: ReadonlyMap<string, string>;
   readonly errors: ReadonlyArray<IntegrationLoadError>;
   readonly sources: ReadonlyArray<IntegrationSource>;
   readonly loadedCount: number;
@@ -175,10 +190,39 @@ export const EMPTY_INTEGRATION_RESULT: IntegrationLoadResult = Object.freeze({
   tools: Object.freeze([] as ReadonlyArray<SdkMcpToolDefinition<any>>),
   toolTiers: new Map<string, IntegrationTier>(),
   confirmFormatters: new Map<string, ConfirmFormatter>(),
+  toolSources: new Map<string, string>(),
   errors: Object.freeze([] as ReadonlyArray<IntegrationLoadError>),
   sources: Object.freeze([] as ReadonlyArray<IntegrationSource>),
   loadedCount: 0,
 });
+
+/**
+ * Static registry of builtin integrations baked into the binary. New builtins
+ * MUST be added here so they ship in the compiled binary — `loadIntegrations`
+ * walks `src/integrations-builtin/` from disk in dev, but `bun build --compile`
+ * doesn't include source files. This map is the single source of truth.
+ *
+ * The `label` is a synthetic `<builtin>:<name>` string that appears in
+ * `IntegrationSource.path`, `IntegrationLoadError.path`, and collision logs
+ * so operators can distinguish builtins from operator-supplied integrations.
+ */
+const BUILTIN_INTEGRATIONS: ReadonlyArray<{
+  readonly name: string;
+  readonly setup: IntegrationSetup;
+  readonly label: string;
+}> = Object.freeze([
+  { name: "notion", setup: notionSetup, label: "<builtin>:notion" },
+  { name: "gmail", setup: gmailSetup, label: "<builtin>:gmail" },
+  { name: "time", setup: timeSetup, label: "<builtin>:time" },
+]);
+
+/**
+ * Names of the builtin integrations, exposed for tests + boot logging so
+ * callers don't have to reach into the private registry.
+ */
+export const BUILTIN_INTEGRATION_NAMES: ReadonlyArray<string> = Object.freeze(
+  BUILTIN_INTEGRATIONS.map((b) => b.name),
+);
 
 // ---------------------------------------------------------------------------
 // Naming validation
@@ -326,12 +370,113 @@ function resolveAbs(p: string): string {
   return isAbsolute(p) ? p : resolve(p);
 }
 
+// ---------------------------------------------------------------------------
+// Shared accumulator + per-setup processor
+// ---------------------------------------------------------------------------
+
+interface LoadAcc {
+  readonly tools: SdkMcpToolDefinition<any>[];
+  readonly toolTiers: Map<string, IntegrationTier>;
+  readonly confirmFormatters: Map<string, ConfirmFormatter>;
+  readonly toolSources: Map<string, string>;
+  readonly errors: IntegrationLoadError[];
+  readonly sources: IntegrationSource[];
+  loadedCount: number;
+}
+
+function newAcc(): LoadAcc {
+  return {
+    tools: [],
+    toolTiers: new Map(),
+    confirmFormatters: new Map(),
+    toolSources: new Map(),
+    errors: [],
+    sources: [],
+    loadedCount: 0,
+  };
+}
+
+function freezeAcc(a: LoadAcc): IntegrationLoadResult {
+  return {
+    tools: Object.freeze(a.tools),
+    toolTiers: a.toolTiers,
+    confirmFormatters: a.confirmFormatters,
+    toolSources: a.toolSources,
+    errors: Object.freeze(a.errors),
+    sources: Object.freeze(a.sources),
+    loadedCount: a.loadedCount,
+  };
+}
+
+/**
+ * Run one setup function and merge its outputs into `acc`. Used by both the
+ * filesystem-walking loader (operator dirs) and the static-registry loader
+ * (builtins). `sourcePath` is whatever string identifies the integration in
+ * logs and `sources[]` (a real fs path for operator dirs; a `<builtin>:<name>`
+ * label for builtins).
+ */
+async function processSetup(
+  acc: LoadAcc,
+  ctx: IntegrationContext,
+  name: string,
+  sourcePath: string,
+  setupFn: IntegrationSetup,
+): Promise<void> {
+  let raw: unknown;
+  try {
+    raw = await setupFn(ctx);
+  } catch (err) {
+    acc.errors.push({
+      path: sourcePath,
+      message: `setup(ctx) threw: ${(err as Error).message}`,
+    });
+    return;
+  }
+  const { module, error } = validateModule(raw);
+  if (error !== null || module === null) {
+    acc.errors.push({ path: sourcePath, message: error ?? "invalid module" });
+    return;
+  }
+
+  const defaultTier: IntegrationTier = module.meta?.tier ?? "confirm";
+  const overrides = module.meta?.toolTiers ?? {};
+  const formatterOverrides = module.meta?.confirmFormatters ?? {};
+  let added = 0;
+  for (const t of module.tools) {
+    const existingOwner = acc.toolSources.get(t.name);
+    if (existingOwner !== undefined) {
+      // First wins. Log so the operator can resolve deliberately.
+      log.warn("integrations.tool_name_collision", {
+        tool: t.name,
+        kept: existingOwner,
+        dropped: sourcePath,
+      });
+      continue;
+    }
+    acc.toolSources.set(t.name, sourcePath);
+    acc.tools.push(t);
+    const tier = overrides[t.name] ?? defaultTier;
+    acc.toolTiers.set(t.name, tier);
+    const formatter = formatterOverrides[t.name];
+    if (formatter !== undefined) {
+      acc.confirmFormatters.set(t.name, formatter);
+    }
+    added++;
+  }
+  acc.sources.push({ name, path: sourcePath, toolCount: added });
+  acc.loadedCount++;
+}
+
+// ---------------------------------------------------------------------------
+// Public loaders
+// ---------------------------------------------------------------------------
+
 /**
  * Load integrations from one or more directories.
  *
  * Caller supplies an ordered list of directories. The first dir's tools win
- * on name collisions — pass blessed first, operator second so the runtime's
- * shipped behavior cannot be silently overridden by a stale operator copy.
+ * on name collisions — operators with multiple integration trees should pass
+ * authoritative copies first.
  *
  * Missing directories are non-fatal: they contribute zero integrations
  * without raising an error. A typo in `SOLRAC_INTEGRATIONS_DIR` is logged
@@ -340,20 +485,16 @@ function resolveAbs(p: string): string {
  * Each integration's setup is awaited individually; setup errors are
  * captured per-integration and reported in `result.errors` rather than
  * aborting the whole load.
+ *
+ * Builtins are NOT loaded here — they live in `BUILTIN_INTEGRATIONS` and
+ * are loaded via `loadBuiltinIntegrations`. main.ts composes the two with
+ * `mergeIntegrationResults(builtins, operator)` so builtins win on collisions.
  */
 export async function loadIntegrations(
   dirs: ReadonlyArray<string>,
   ctx: IntegrationContext,
 ): Promise<IntegrationLoadResult> {
-  const tools: SdkMcpToolDefinition<any>[] = [];
-  const toolTiers = new Map<string, IntegrationTier>();
-  const confirmFormatters = new Map<string, ConfirmFormatter>();
-  const errors: IntegrationLoadError[] = [];
-  const sources: IntegrationSource[] = [];
-  // Tracks which integration registered each tool name, for collision logging.
-  const toolOwners = new Map<string, string>();
-  let loadedCount = 0;
-
+  const acc = newAcc();
   for (const rawDir of dirs) {
     const dir = resolveAbs(rawDir);
     const subdirs = listIntegrationSubdirs(dir);
@@ -362,77 +503,86 @@ export async function loadIntegrations(
       try {
         mod = (await import(sub.indexPath)) as { default?: unknown };
       } catch (err) {
-        errors.push({
+        acc.errors.push({
           path: sub.indexPath,
           message: `import failed: ${(err as Error).message}`,
         });
         continue;
       }
       if (typeof mod.default !== "function") {
-        errors.push({
+        acc.errors.push({
           path: sub.indexPath,
           message: "module must default-export a setup(ctx) function",
         });
         continue;
       }
-      let raw: unknown;
-      try {
-        raw = await (mod.default as IntegrationSetup)(ctx);
-      } catch (err) {
-        errors.push({
-          path: sub.indexPath,
-          message: `setup(ctx) threw: ${(err as Error).message}`,
+      await processSetup(
+        acc,
+        ctx,
+        sub.name,
+        sub.indexPath,
+        mod.default as IntegrationSetup,
+      );
+    }
+  }
+  return freezeAcc(acc);
+}
+
+/**
+ * Load the blessed builtins from the static `BUILTIN_INTEGRATIONS` registry.
+ * Works under `bun build --compile` because the builtin source lives in the
+ * static-import map at the top of this file — Bun's bundler walks those.
+ *
+ * No fs access. Setup errors are captured per-integration in `result.errors`.
+ */
+export async function loadBuiltinIntegrations(
+  ctx: IntegrationContext,
+): Promise<IntegrationLoadResult> {
+  const acc = newAcc();
+  for (const b of BUILTIN_INTEGRATIONS) {
+    await processSetup(acc, ctx, b.name, b.label, b.setup);
+  }
+  return freezeAcc(acc);
+}
+
+/**
+ * Merge two or more `IntegrationLoadResult`s, first-wins on tool-name
+ * collisions across results. Within a single result, collisions are already
+ * resolved by `processSetup`; this function only handles cross-result
+ * collisions (typically: builtin vs. operator-supplied tool with the same
+ * name). Logs each cross-result collision with both sources so operators
+ * can resolve deliberately.
+ *
+ * Per-result `errors` and `sources` arrays are concatenated in order.
+ */
+export function mergeIntegrationResults(
+  ...results: ReadonlyArray<IntegrationLoadResult>
+): IntegrationLoadResult {
+  const acc = newAcc();
+  for (const r of results) {
+    for (const t of r.tools) {
+      const existing = acc.toolSources.get(t.name);
+      const incoming = r.toolSources.get(t.name) ?? "<unknown>";
+      if (existing !== undefined) {
+        log.warn("integrations.tool_name_collision", {
+          tool: t.name,
+          kept: existing,
+          dropped: incoming,
         });
         continue;
       }
-      const { module, error } = validateModule(raw);
-      if (error !== null || module === null) {
-        errors.push({ path: sub.indexPath, message: error ?? "invalid module" });
-        continue;
-      }
-
-      const defaultTier: IntegrationTier = module.meta?.tier ?? "confirm";
-      const overrides = module.meta?.toolTiers ?? {};
-      const formatterOverrides = module.meta?.confirmFormatters ?? {};
-      let added = 0;
-      for (const t of module.tools) {
-        const existingOwner = toolOwners.get(t.name);
-        if (existingOwner !== undefined) {
-          // First wins. Log so the operator can resolve deliberately.
-          log.warn("integrations.tool_name_collision", {
-            tool: t.name,
-            kept: existingOwner,
-            dropped: sub.indexPath,
-          });
-          continue;
-        }
-        toolOwners.set(t.name, sub.indexPath);
-        tools.push(t);
-        const tier = overrides[t.name] ?? defaultTier;
-        toolTiers.set(t.name, tier);
-        const formatter = formatterOverrides[t.name];
-        if (formatter !== undefined) {
-          confirmFormatters.set(t.name, formatter);
-        }
-        added++;
-      }
-      sources.push({
-        name: sub.name,
-        path: sub.indexPath,
-        toolCount: added,
-      });
-      loadedCount++;
+      acc.toolSources.set(t.name, incoming);
+      acc.tools.push(t);
+      const tier = r.toolTiers.get(t.name);
+      if (tier !== undefined) acc.toolTiers.set(t.name, tier);
+      const formatter = r.confirmFormatters.get(t.name);
+      if (formatter !== undefined) acc.confirmFormatters.set(t.name, formatter);
     }
+    for (const e of r.errors) acc.errors.push(e);
+    for (const s of r.sources) acc.sources.push(s);
+    acc.loadedCount += r.loadedCount;
   }
-
-  return {
-    tools: Object.freeze(tools),
-    toolTiers,
-    confirmFormatters,
-    errors: Object.freeze(errors),
-    sources: Object.freeze(sources),
-    loadedCount,
-  };
+  return freezeAcc(acc);
 }
 
 // Convenience: emit a one-line boot summary plus per-error warns. Mirrors

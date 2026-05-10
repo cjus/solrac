@@ -12,7 +12,8 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `SOLRAC_DEFAULT_ENGINE` | no | `ollama` | `ollama` \| `primary` \| `secondary` | Engine for messages with no `@`/`!` prefix. `ollama` (the default) requires `OLLAMA_ENABLED=true`. `primary`/`secondary` is the Claude-only-deploy fallback. Ollama is reachable only as the default engine — there is no `>`-style escape prefix. Boot rejects mismatches (e.g. `default=ollama && !ollamaEnabled`, or `default!=ollama && ollamaToolsEnabled`). |
 | `SOLRAC_TRANSPORT` | no | `poll` | `poll` \| `webhook` | `webhook` requires `TG_WEBHOOK_SECRET ≥32 chars`; v1 ships poll only. |
 | `PORT` | no | `8443` | positive int | `Bun.serve` port (`/health`, `/stats`). Webhook would also bind here. |
-| `DATA_DIR` | no | `./data` | path | sqlite db, WAL, PID file, workspaces. Must be writable. |
+| `SOLRAC_HOME` | no | cwd if it has `SOUL.md`, else `~/.solrac/` | path | Solrac's "home" dir — where `SOUL.md`, `SOLRAC.md`, and (by default) `data/`, `skills/`, `tasks/`, `integrations/` live. Resolution: explicit `SOLRAC_HOME` > cwd-with-`SOUL.md` (the dev workflow) > `~/.solrac/` (the packaged-binary default). All four `*_DIR` values below resolve relative paths against this. See [docs/INSTALL.md](./INSTALL.md). |
+| `DATA_DIR` | no | `<SOLRAC_HOME>/data` | path | sqlite db, WAL, PID file, workspaces. Must be writable. Relative paths resolve against `SOLRAC_HOME`; absolute paths pass through. |
 | `HOURLY_COST_CAP_USD` | no | `1.00` | positive float | **Per-chat** sliding-hour spend ceiling (fairness — every chat gets its own budget). |
 | `GLOBAL_HOURLY_COST_CAP_USD` | no | `HOURLY_COST_CAP_USD × MAX_CONCURRENT_TURNS` (computed) | positive float | **Cross-chat** sliding-hour spend ceiling (absolute safety — total Anthropic burn across ALL chats). Default scales with the per-chat cap and concurrency; override to anything stricter or laxer. See [ARCHITECTURE.md#cost-caps](./ARCHITECTURE.md#cost-caps). |
 | `MAX_CONCURRENT_TURNS` | no | `4` | positive int | Global Semaphore limit. |
@@ -28,9 +29,9 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `OLLAMA_TOOLS_ENABLED` | no | `false` | boolean | Local model can call the same `mcp__solrac__*` integration tools the Claude tiers see. Requires `SOLRAC_INTEGRATIONS_ENABLED=true` AND `SOLRAC_DEFAULT_ENGINE=ollama` (boot rejects the unreachable `default!=ollama && tools=on` combo). Recommended `true` for Ollama-default deploys. |
 | `OLLAMA_MAX_TOOL_ITERATIONS` | no | `8` | positive int | Hard ceiling on tool-loop rounds per turn. Loop detector fires earlier on duplicate calls; this is the runaway-loop backstop. Iteration cap surfaces as `⚠️ stopped after N tool iterations`. |
 | `SOLRAC_SKILLS_ENABLED` | no | `false` | boolean | Master switch for operator-defined skills. When `true`, Solrac discovers `SKILL.md` files under `SOLRAC_SKILLS_DIR` at boot and exposes each as a `/<name>` slash command. |
-| `SOLRAC_SKILLS_DIR` | no | `./skills` | path | Directory scanned for `<name>/SKILL.md` files. Resolved relative to launch cwd. Loaded ONCE at boot — edit files and restart. See [USAGE.md#skills-operator-defined-commands](./USAGE.md#skills-operator-defined-commands). |
+| `SOLRAC_SKILLS_DIR` | no | `./skills` | path | Directory scanned for `<name>/SKILL.md` files. Resolved relative to `SOLRAC_HOME`. Loaded ONCE at boot — edit files and restart. See [USAGE.md#skills-operator-defined-commands](./USAGE.md#skills-operator-defined-commands). |
 | `SOLRAC_TASKS_ENABLED` | no | `false` | boolean | Master switch for scheduled tasks. When `true`, Solrac discovers `TASK.md` files under `SOLRAC_TASKS_DIR` at boot and fires each on its configured schedule (`every <dur>`, `daily_at HH:MM`, `at <ISO8601>`). Fires synthesize updates through the existing turn queue, so cost caps + allowlist gate + policy hooks all apply automatically. |
-| `SOLRAC_TASKS_DIR` | no | `./tasks` | path | Directory scanned for `<name>/TASK.md` files. Resolved relative to launch cwd. Loaded ONCE at boot — edit files and restart. See [USAGE.md#scheduled-tasks](./USAGE.md#scheduled-tasks). |
+| `SOLRAC_TASKS_DIR` | no | `./tasks` | path | Directory scanned for `<name>/TASK.md` files. Resolved relative to `SOLRAC_HOME`. Loaded ONCE at boot — edit files and restart. See [USAGE.md#scheduled-tasks](./USAGE.md#scheduled-tasks). |
 | `SOLRAC_INTEGRATIONS_ENABLED` | no | `false` | boolean | Master switch for operator + blessed integrations. When `true`, Solrac discovers `<name>/index.ts` modules under `src/integrations-builtin/` (always) and `SOLRAC_INTEGRATIONS_DIR` (operator-owned) at boot, and registers each one's tools as `mcp__solrac__<tool>`. **Effective for both Claude tiers (`@`, `!`) and Ollama (when `OLLAMA_TOOLS_ENABLED=true`).** Required `true` when `OLLAMA_TOOLS_ENABLED=true`. See [USAGE.md#integrations](./USAGE.md#integrations). |
 | `SOLRAC_INTEGRATIONS_DIR` | no | `./integrations` | path | Directory scanned for operator-authored `<name>/index.ts` integration modules. Resolved relative to launch cwd; can also be absolute (e.g. `~/.solrac/integrations`). Loaded ONCE at boot — edit files and restart. |
 | `NOTION_API_KEY` | when `notion` integration in use | — | string | Notion internal-integration secret (`secret_…`). Consumed by the blessed `notion` integration only — not validated in `config.ts`. Boot probes `GET /v1/users/me` (3s timeout); failure → integration self-gates to zero tools, solrac boots normally. **Scrubbed** from the SDK-spawned `claude` subprocess env by `agent.ts::sanitizedSubprocessEnv` (the integration handler runs in solrac's main process; the subprocess never needs the token). See [USAGE.md#notion-single-token-notion-workspace-opt-in-dep](./USAGE.md#notion--single-token-notion-workspace-opt-in-dep). |
@@ -168,18 +169,20 @@ Solrac doesn't hot-reload `.env`. Any change to environment variables requires a
 
 ## SOUL.md and SOLRAC.md
 
-Two operator-editable markdown files at the **launch cwd** (the directory `solrac` is run from):
+Two operator-editable markdown files at `$SOLRAC_HOME` (default: cwd in dev — wherever a checked-in `SOUL.md` lives — or `~/.solrac/` in the packaged binary):
 
 | File | Purpose | Lifecycle | Failure mode |
 |---|---|---|---|
 | `SOUL.md` | Voice, stance, untrusted-content safety clause. Shared across engines. | Read once at boot. Joined with an engine-specific capability note and shipped as `systemPrompt.append` (Claude) or first `system` message (Ollama). | Hard-fail: boot exits 1 if missing or empty. |
 | `SOLRAC.md` | Operator-specific overlay: operator name, channel posture, project hints. | Re-read per turn. Wrapped in `<solrac-md>...</solrac-md>` and injected at the top of the user-message envelope (Claude) or as a second `system` message (Ollama). | Soft-warn: missing or unedited-template state injects nothing; Solrac runs vanilla. |
 
-Both ship in the package as canonical defaults (`SOUL.md`, `SOLRAC.md`). On first boot, if the launch cwd lacks them, `instance.ts::bootstrapInstanceFiles` copies the defaults into cwd so the operator has a customizable copy. Subsequent boots read from cwd; the package copies are a one-time seed.
+Both ship as **embedded text constants** baked into the binary via text imports of the canonical copies in the repo root (`instance.ts` — the `EMBEDDED_DEFAULTS` constant). On first boot, if `$SOLRAC_HOME` lacks them, `bootstrapInstanceFiles` writes the embedded defaults to `$SOLRAC_HOME` so the operator has a customizable copy. Subsequent boots read from disk; the embedded copies are a one-time seed.
 
 The shipped `SOLRAC.md` carries a `<!-- solrac-md:unedited -->` marker on its first line. While that line is present, Solrac treats the file as an unedited template and injects nothing. Delete the marker line to activate the overlay.
 
-To start over from the canonical defaults: delete `SOUL.md` and/or `SOLRAC.md` from cwd and restart Solrac.
+**Upgrade signal: `SOUL.md.new`.** When a binary upgrade ships a new embedded `SOUL.md` and your on-disk copy differs, the bootstrap writes `$SOLRAC_HOME/SOUL.md.new` alongside your customized copy and logs `instance.soul_md_new_written`. Your `SOUL.md` is **never** overwritten — diff/merge `SOUL.md.new` into `SOUL.md` manually, or delete it to ignore. (Repeat boots don't re-emit if `SOUL.md.new` already exists, so a pending merge is preserved.)
+
+To start over from the embedded defaults: delete `SOUL.md` and/or `SOLRAC.md` from `$SOLRAC_HOME` and restart Solrac.
 
 ## Boot logging
 

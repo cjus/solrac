@@ -21,27 +21,31 @@
  *     envelope (Claude path: prepended in `buildAugmentedPrompt`; Ollama path:
  *     a second `system` message).
  *
- * Both files ship in the package root (the repo root) as canonical defaults.
- * On boot, if the runtime cwd lacks them, `bootstrapInstanceFiles` copies the
- * defaults into cwd so the operator has a customizable copy. Reads thereafter
- * always come from cwd; the package copies are a one-time seed.
+ * Both files ship as **embedded text** inside the compiled Bun binary via
+ * text imports of the canonical copies in the repo root. On boot,
+ * `bootstrapInstanceFiles(home)` writes the embedded defaults to `home`
+ * (typically `~/.solrac/`) if the operator doesn't already have copies.
+ * Reads thereafter always come from disk; the embedded copies are a one-time
+ * seed plus an upgrade-path signal (see SOUL.md.new behaviour below).
  *
- * Why bootstrap into cwd instead of always reading from the package:
+ * Why embed-then-bootstrap instead of always reading from the binary:
  *   The whole point of externalization is operator customization. If we read
- *   from the package install dir, edits get clobbered on update. Bootstrap
- *   once into cwd, read from cwd onwards.
+ *   from the embedded string, edits would never take effect. Bootstrap once
+ *   to disk, read from disk onwards, and surface upgraded defaults via
+ *   SOUL.md.new — which the operator can diff/merge manually without losing
+ *   their voice edits.
  *
  * Position in the dependency graph:
  *   log → instance → consumed by main, agent, ollama
  *
  * Exports:
  *   - `INSTANCE_FILE_NAMES` — `{ SOUL: "SOUL.md", SOLRAC: "SOLRAC.md" }`.
- *   - `packageDir()` — resolves the package root (where canonical defaults live).
- *   - `bootstrapInstanceFiles(cwd, pkgDir)` — copy missing files from pkgDir → cwd.
- *   - `loadSoul(cwd)` — read SOUL.md once; throws on missing/empty.
+ *   - `EMBEDDED_DEFAULTS` — `{ SOUL, SOLRAC }` text content baked into the binary.
+ *   - `bootstrapInstanceFiles(home)` — write missing files; emit SOUL.md.new on diff.
+ *   - `loadSoul(home)` — read SOUL.md once; throws on missing/empty.
  *   - `readInstanceMd(path)` — read SOLRAC.md per turn; null if missing or
  *     comment-only (unedited template).
- *   - `instanceMdPath(cwd)` — `join(cwd, "SOLRAC.md")` helper.
+ *   - `instanceMdPath(home)` — `join(home, "SOLRAC.md")` helper.
  *
  * Key invariants:
  *   - `loadSoul` is the only hard-fail path. SOLRAC.md missing or empty is
@@ -50,25 +54,42 @@
  *     before returning content. The shipped SOLRAC.md template is all
  *     comments — that means a fresh install injects nothing until the
  *     operator edits real content into the file.
- *   - Bootstrap is idempotent. An existing file in cwd is never overwritten,
- *     so repeated boots don't clobber operator edits.
+ *   - Bootstrap is idempotent. An existing file in `home` is never overwritten,
+ *     so repeated boots don't clobber operator edits. When the embedded
+ *     default differs from the on-disk SOUL.md, a SOUL.md.new sidecar is
+ *     written for manual merge — and only if no SOUL.md.new is already there
+ *     (don't clobber a pending merge).
  *
  * Cross-references:
- *   - SOUL.md — canonical default voice
- *   - SOLRAC.md — operator overlay template
+ *   - SOUL.md — canonical default voice (embedded into the binary)
+ *   - SOLRAC.md — operator overlay template (embedded into the binary)
  *   - agent.ts::runAgent — Claude path consumer
  *   - ollama.ts::runOllamaTurn — Ollama path consumer
  *   - main.ts — boot wires bootstrap + load
+ *   - text-modules.d.ts — ambient string type for `*.md` text imports
  */
 
-import { copyFileSync, existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { log } from "./log.ts";
+
+import EMBEDDED_SOUL_MD from "../SOUL.md" with { type: "text" };
+import EMBEDDED_SOLRAC_MD from "../SOLRAC.md" with { type: "text" };
 
 export const INSTANCE_FILE_NAMES = {
   SOUL: "SOUL.md",
   SOLRAC: "SOLRAC.md",
+} as const;
+
+/**
+ * Embedded canonical defaults. These ship inside the compiled Bun binary via
+ * text imports. In dev (`bun src/main.ts` from the repo root) they resolve
+ * to the checked-in copies at build/start time. In a packaged binary they're
+ * baked-in string constants — no source tree required.
+ */
+export const EMBEDDED_DEFAULTS = {
+  SOUL: EMBEDDED_SOUL_MD,
+  SOLRAC: EMBEDDED_SOLRAC_MD,
 } as const;
 
 /**
@@ -84,74 +105,71 @@ export const INSTANCE_FILE_NAMES = {
  */
 export const SOLRAC_MD_UNEDITED_MARKER = "solrac-md:unedited";
 
-/**
- * Matches a line that contains *only* the unedited-marker HTML comment, with
- * any leading/trailing whitespace. The body of the comment may include extra
- * descriptive text after the marker (e.g., "— delete this line to activate")
- * but must NOT contain `>` characters before the closing `-->` (so other HTML
- * comments on the same line don't false-match).
- */
 const UNEDITED_MARKER_LINE_RE =
   /^[ \t]*<!--[ \t]*solrac-md:unedited\b[^>]*-->[ \t]*$/m;
-
-/**
- * Resolve the package directory (where the canonical SOUL.md and SOLRAC.md
- * default copies live). In dev: `src/instance.ts` → the repo root. The
- * function is called once at boot from `main.ts`; nothing in the hot path
- * depends on it.
- *
- * TODO(solrac-bun-packaging): when Solrac ships as a single-file Bun bundle,
- * `import.meta.url` resolves into the bundle's virtual filesystem and the
- * `../..` traversal no longer points at a directory containing SOUL.md /
- * SOLRAC.md. The deferred packaging effort needs to either embed the defaults
- * via `with { type: "text" }` imports or ship sidecar resource files keyed by
- * `dirname(process.execPath)` / `$SOLRAC_PACKAGE_DIR`. Failure mode today is
- * loud — `loadSoul` throws on boot — but the next person on this surface
- * should grep for this TODO before refactoring.
- * See: https://www.notion.so/357a52efd130810cb587d2db8d234c58
- */
-export function packageDir(): string {
-  return dirname(dirname(fileURLToPath(import.meta.url)));
-}
 
 export interface BootstrapResult {
   soulCreated: boolean;
   solracCreated: boolean;
+  /**
+   * True when an existing SOUL.md differs from the embedded default and we
+   * wrote SOUL.md.new alongside. Operator can diff/merge manually so a binary
+   * upgrade can ship a new default voice without clobbering operator edits.
+   */
+  soulNewWritten: boolean;
 }
 
 /**
- * If `cwd` lacks SOUL.md or SOLRAC.md, copy the canonical default from
- * `pkgDir`. Idempotent — existing files are never touched. Caller is expected
- * to log the result so first-run users see what happened.
+ * If `home` lacks SOUL.md or SOLRAC.md, write the embedded default. Idempotent
+ * — existing files are never overwritten. If an existing SOUL.md disagrees
+ * with the embedded default, write `SOUL.md.new` alongside (skipping if one
+ * already exists, so a pending operator merge isn't clobbered on every boot).
+ *
+ * SOLRAC.md does not get a `.new` because the shipped default is intentionally
+ * a near-empty operator-overlay template — diverging is the point.
+ *
+ * `home` is created (recursive) if missing — packaged binary first run on a
+ * machine without `~/.solrac/` shouldn't need a separate mkdir step.
  */
-export function bootstrapInstanceFiles(cwd: string, pkgDir: string): BootstrapResult {
-  const result: BootstrapResult = { soulCreated: false, solracCreated: false };
-  const targets = [
-    { name: INSTANCE_FILE_NAMES.SOUL, key: "soulCreated" as const },
-    { name: INSTANCE_FILE_NAMES.SOLRAC, key: "solracCreated" as const },
-  ];
-  for (const t of targets) {
-    const dest = join(cwd, t.name);
-    if (existsSync(dest)) continue;
-    const src = join(pkgDir, t.name);
-    if (!existsSync(src)) {
-      // Package template missing. SOUL.md absence is fatal but surfaces later
-      // via `loadSoul`; SOLRAC.md absence is fine (soft-warn).
-      continue;
+export function bootstrapInstanceFiles(home: string): BootstrapResult {
+  const result: BootstrapResult = {
+    soulCreated: false,
+    solracCreated: false,
+    soulNewWritten: false,
+  };
+  mkdirSync(home, { recursive: true });
+
+  const soulDest = join(home, INSTANCE_FILE_NAMES.SOUL);
+  if (!existsSync(soulDest)) {
+    writeFileSync(soulDest, EMBEDDED_DEFAULTS.SOUL, "utf8");
+    result.soulCreated = true;
+  } else {
+    const onDisk = readFileSync(soulDest, "utf8");
+    if (onDisk !== EMBEDDED_DEFAULTS.SOUL) {
+      const newPath = `${soulDest}.new`;
+      if (!existsSync(newPath)) {
+        writeFileSync(newPath, EMBEDDED_DEFAULTS.SOUL, "utf8");
+        result.soulNewWritten = true;
+      }
     }
-    copyFileSync(src, dest);
-    result[t.key] = true;
   }
+
+  const solracDest = join(home, INSTANCE_FILE_NAMES.SOLRAC);
+  if (!existsSync(solracDest)) {
+    writeFileSync(solracDest, EMBEDDED_DEFAULTS.SOLRAC, "utf8");
+    result.solracCreated = true;
+  }
+
   return result;
 }
 
 /**
- * Read SOUL.md from `cwd`. Hard-fails if the file is missing, unreadable, or
+ * Read SOUL.md from `home`. Hard-fails if the file is missing, unreadable, or
  * empty after trimming. Solrac without identity is broken — boot should die
  * loudly rather than silently fall back to a default.
  */
-export function loadSoul(cwd: string): string {
-  const path = join(cwd, INSTANCE_FILE_NAMES.SOUL);
+export function loadSoul(home: string): string {
+  const path = join(home, INSTANCE_FILE_NAMES.SOUL);
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
@@ -197,9 +215,9 @@ export function readInstanceMd(path: string): string | null {
   return stripped;
 }
 
-/** `join(cwd, "SOLRAC.md")` — kept here so callers don't repeat the constant. */
-export function instanceMdPath(cwd: string): string {
-  return join(cwd, INSTANCE_FILE_NAMES.SOLRAC);
+/** `join(home, "SOLRAC.md")` — kept here so callers don't repeat the constant. */
+export function instanceMdPath(home: string): string {
+  return join(home, INSTANCE_FILE_NAMES.SOLRAC);
 }
 
 /**
@@ -214,13 +232,20 @@ export function wrapInstanceMd(body: string): string {
 /**
  * Convenience: log the bootstrap outcome. Called from `main.ts` after
  * `bootstrapInstanceFiles` so the first-run operator sees the new files
- * appear in their cwd. Subsequent boots log nothing (idempotent).
+ * appear in their home dir. Subsequent boots log nothing (idempotent) unless
+ * a SOUL.md.new was emitted by an upgrade-on-modified-file diff.
  */
-export function logBootstrapResult(cwd: string, r: BootstrapResult): void {
+export function logBootstrapResult(home: string, r: BootstrapResult): void {
   if (r.soulCreated) {
-    log.info("instance.soul_md_created", { path: join(cwd, INSTANCE_FILE_NAMES.SOUL) });
+    log.info("instance.soul_md_created", { path: join(home, INSTANCE_FILE_NAMES.SOUL) });
   }
   if (r.solracCreated) {
-    log.info("instance.solrac_md_created", { path: join(cwd, INSTANCE_FILE_NAMES.SOLRAC) });
+    log.info("instance.solrac_md_created", { path: join(home, INSTANCE_FILE_NAMES.SOLRAC) });
+  }
+  if (r.soulNewWritten) {
+    log.warn("instance.soul_md_new_written", {
+      path: `${join(home, INSTANCE_FILE_NAMES.SOUL)}.new`,
+      hint: "embedded SOUL.md default differs from your edited copy; diff/merge SOUL.md.new into SOUL.md to pick up the new default voice, or delete SOUL.md.new to ignore",
+    });
   }
 }
