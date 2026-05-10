@@ -79,7 +79,7 @@ import type { BotCommand } from "./telegram.ts";
 // Types
 // ---------------------------------------------------------------------------
 
-export type SkillTier = "primary" | "secondary";
+export type SkillTier = "primary" | "secondary" | "ollama";
 
 export interface Skill {
   readonly name: string;
@@ -87,6 +87,13 @@ export interface Skill {
   readonly tier: SkillTier;
   readonly body: string;
   readonly sourcePath: string;
+  // PNX-167.x — when true, the skill is exposed as a callable MCP tool to the
+  // Ollama agent (in addition to its existing /<name> slash invocation). The
+  // model decides when to call based on `description`; the handler runs the
+  // skill body and returns its text as the tool result. Phase 1 restriction:
+  // `tool: true` requires `tier: "ollama"` (free-only — avoids cross-engine
+  // cost surprises from agent-driven invocations).
+  readonly tool: boolean;
 }
 
 export interface SkillLoadError {
@@ -199,6 +206,7 @@ export function parseSkillFile(
   content: string,
   sourcePath: string,
   reservedNames: ReadonlySet<string>,
+  defaultTier: SkillTier = "primary",
 ): Skill {
   // Split frontmatter and body. Expected layout:
   //   ---\n
@@ -255,22 +263,51 @@ export function parseSkillFile(
       `${sourcePath}: "description" must be ≤${MAX_DESCRIPTION_LEN} chars (got ${descVal.length})`,
     );
   }
-  // tier
-  let tier: SkillTier = "primary";
+  // tier — defaults to deploy's default engine. When explicit `ollama`, refuse
+  // if the deploy default isn't ollama (PR-B removed the `>` prefix; mirrors
+  // scheduler.ts engine handling).
+  let tier: SkillTier = defaultTier;
   if ("tier" in f) {
     const tierVal = f.tier;
-    if (tierVal !== "primary" && tierVal !== "secondary") {
-      throw new Error(`${sourcePath}: "tier" must be "primary" or "secondary" (got "${String(tierVal)}")`);
+    if (tierVal !== "primary" && tierVal !== "secondary" && tierVal !== "ollama") {
+      throw new Error(`${sourcePath}: "tier" must be primary | secondary | ollama (got "${String(tierVal)}")`);
+    }
+    if (tierVal === "ollama" && defaultTier !== "ollama") {
+      throw new Error(
+        `${sourcePath}: "tier: ollama" is unreachable when SOLRAC_DEFAULT_ENGINE != ollama ` +
+          `(PR-B removed the > prefix). Set SOLRAC_DEFAULT_ENGINE=ollama or use tier: primary/secondary`,
+      );
     }
     tier = tierVal;
   }
+  // tool — opt-in flag exposing the skill as a callable MCP tool. Default
+  // false. Phase 1 restriction: only `tier: "ollama"` skills are tool-eligible
+  // (the Claude path's tool catalog is untouched until Phase 2). Operators who
+  // want a Claude-tier skill keep it slash-only.
+  let toolFlag = false;
+  if ("tool" in f) {
+    const v = f.tool;
+    if (typeof v !== "boolean") {
+      throw new Error(`${sourcePath}: "tool" must be a boolean (got "${String(v)}")`);
+    }
+    if (v && tier !== "ollama") {
+      throw new Error(
+        `${sourcePath}: "tool: true" requires "tier: ollama" in Phase 1 ` +
+          `(got tier=${tier}). Set tier: ollama or omit tier to inherit ` +
+          `SOLRAC_DEFAULT_ENGINE=ollama, or remove tool: true to keep this ` +
+          `skill slash-only.`,
+      );
+    }
+    toolFlag = v;
+  }
+
   // body
   if (body.trim() === "") {
     throw new Error(`${sourcePath}: body must be non-empty (no prompt template)`);
   }
 
   // Reject unknown keys so typos don't silently skip.
-  const ALLOWED = new Set(["name", "description", "tier"]);
+  const ALLOWED = new Set(["name", "description", "tier", "tool"]);
   for (const k of Object.keys(f)) {
     if (!ALLOWED.has(k)) {
       throw new Error(
@@ -285,6 +322,7 @@ export function parseSkillFile(
     tier,
     body,
     sourcePath,
+    tool: toolFlag,
   });
 }
 
@@ -295,6 +333,7 @@ export function parseSkillFile(
 export function loadSkillsSync(
   dir: string,
   reservedNames: ReadonlySet<string>,
+  defaultTier: SkillTier,
 ): SkillLoadResult {
   const errors: SkillLoadError[] = [];
   const byName = new Map<string, Skill>();
@@ -334,7 +373,7 @@ export function loadSkillsSync(
     }
     let skill: Skill;
     try {
-      skill = parseSkillFile(content, skillPath, reservedNames);
+      skill = parseSkillFile(content, skillPath, reservedNames, defaultTier);
     } catch (err) {
       errors.push({ path: skillPath, message: (err as Error).message });
       continue;

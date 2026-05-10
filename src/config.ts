@@ -118,6 +118,14 @@ export interface Config {
   // for `./data` (dataDir).
   readonly skillsEnabled: boolean;
   readonly skillsDir: string;
+  // Scheduled tasks (PLAN). Off by default. When on, the scheduler loads
+  // `<tasksDir>/<name>/TASK.md` files at boot and fires them on a per-task
+  // schedule (`every <duration>`, `daily_at HH:MM`, `at <ISO8601>`). Same
+  // cwd-relative convention as skills/integrations. Tasks fire as synthetic
+  // updates through the same turn queue, so cost caps + allowlist gate +
+  // policy hooks all apply automatically.
+  readonly tasksEnabled: boolean;
+  readonly tasksDir: string;
   // Operator-authored integrations (Phase 1). `integrationsEnabled` is the
   // master switch; when off, neither blessed (`src/integrations-builtin/`)
   // nor operator integrations (`integrationsDir`) load — solrac runs with
@@ -391,6 +399,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       env.SOLRAC_SKILLS_DIR && env.SOLRAC_SKILLS_DIR.trim() !== ""
         ? env.SOLRAC_SKILLS_DIR.trim()
         : "./skills",
+    tasksEnabled: parseBoolean("SOLRAC_TASKS_ENABLED", env.SOLRAC_TASKS_ENABLED, false),
+    tasksDir:
+      env.SOLRAC_TASKS_DIR && env.SOLRAC_TASKS_DIR.trim() !== ""
+        ? env.SOLRAC_TASKS_DIR.trim()
+        : "./tasks",
     integrationsEnabled,
     integrationsDir:
       env.SOLRAC_INTEGRATIONS_DIR && env.SOLRAC_INTEGRATIONS_DIR.trim() !== ""

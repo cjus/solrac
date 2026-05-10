@@ -29,6 +29,8 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `OLLAMA_MAX_TOOL_ITERATIONS` | no | `8` | positive int | Hard ceiling on tool-loop rounds per turn. Loop detector fires earlier on duplicate calls; this is the runaway-loop backstop. Iteration cap surfaces as `⚠️ stopped after N tool iterations`. |
 | `SOLRAC_SKILLS_ENABLED` | no | `false` | boolean | Master switch for operator-defined skills. When `true`, Solrac discovers `SKILL.md` files under `SOLRAC_SKILLS_DIR` at boot and exposes each as a `/<name>` slash command. |
 | `SOLRAC_SKILLS_DIR` | no | `./skills` | path | Directory scanned for `<name>/SKILL.md` files. Resolved relative to launch cwd. Loaded ONCE at boot — edit files and restart. See [USAGE.md#skills-operator-defined-commands](./USAGE.md#skills-operator-defined-commands). |
+| `SOLRAC_TASKS_ENABLED` | no | `false` | boolean | Master switch for scheduled tasks. When `true`, Solrac discovers `TASK.md` files under `SOLRAC_TASKS_DIR` at boot and fires each on its configured schedule (`every <dur>`, `daily_at HH:MM`, `at <ISO8601>`). Fires synthesize updates through the existing turn queue, so cost caps + allowlist gate + policy hooks all apply automatically. |
+| `SOLRAC_TASKS_DIR` | no | `./tasks` | path | Directory scanned for `<name>/TASK.md` files. Resolved relative to launch cwd. Loaded ONCE at boot — edit files and restart. See [USAGE.md#scheduled-tasks](./USAGE.md#scheduled-tasks). |
 | `SOLRAC_INTEGRATIONS_ENABLED` | no | `false` | boolean | Master switch for operator + blessed integrations. When `true`, Solrac discovers `<name>/index.ts` modules under `src/integrations-builtin/` (always) and `SOLRAC_INTEGRATIONS_DIR` (operator-owned) at boot, and registers each one's tools as `mcp__solrac__<tool>`. **Effective for both Claude tiers (`@`, `!`) and Ollama (when `OLLAMA_TOOLS_ENABLED=true`).** Required `true` when `OLLAMA_TOOLS_ENABLED=true`. See [USAGE.md#integrations](./USAGE.md#integrations). |
 | `SOLRAC_INTEGRATIONS_DIR` | no | `./integrations` | path | Directory scanned for operator-authored `<name>/index.ts` integration modules. Resolved relative to launch cwd; can also be absolute (e.g. `~/.solrac/integrations`). Loaded ONCE at boot — edit files and restart. |
 | `NOTION_API_KEY` | when `notion` integration in use | — | string | Notion internal-integration secret (`secret_…`). Consumed by the blessed `notion` integration only — not validated in `config.ts`. Boot probes `GET /v1/users/me` (3s timeout); failure → integration self-gates to zero tools, solrac boots normally. **Scrubbed** from the SDK-spawned `claude` subprocess env by `agent.ts::sanitizedSubprocessEnv` (the integration handler runs in solrac's main process; the subprocess never needs the token). See [USAGE.md#notion-single-token-notion-workspace-opt-in-dep](./USAGE.md#notion--single-token-notion-workspace-opt-in-dep). |
@@ -121,6 +123,10 @@ TG_WEBHOOK_SECRET=                # set when SOLRAC_TRANSPORT=webhook
 # Operator-defined skills. Off by default.
 SOLRAC_SKILLS_ENABLED=false       # set to true to load $SOLRAC_SKILLS_DIR/<name>/SKILL.md at boot
 SOLRAC_SKILLS_DIR=./skills        # cwd-relative; edit + restart to pick up changes
+
+# Scheduled tasks. Off by default.
+SOLRAC_TASKS_ENABLED=false        # set to true to load $SOLRAC_TASKS_DIR/<name>/TASK.md at boot
+SOLRAC_TASKS_DIR=./tasks          # cwd-relative; edit + restart to pick up changes
 
 # Web UI. Off by default. When SOLRAC_WEB_ENABLED=true, SOLRAC_WEB_TOKEN is required.
 SOLRAC_WEB_ENABLED=false

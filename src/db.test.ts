@@ -586,3 +586,172 @@ describe("openDb engine-scoped helpers (PNX-167)", () => {
     expect(db.sumChatBytesForEngine(99, "claude:primary:%")).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Scheduler — scheduled_tasks table + audit origin/task_name + per-task cost
+// ---------------------------------------------------------------------------
+
+describe("scheduled_tasks table + audit origin/task_name", () => {
+  test("audit.origin defaults to 'user' for inserts that omit it", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    const id = db.insertAudit({
+      chatId: 1,
+      fromId: 99,
+      updateId: 0,
+      prompt: "p",
+      startedAt: 100,
+      model: "claude:primary:m",
+    });
+    const row = db.raw
+      .query("SELECT origin, task_name FROM audit WHERE id = ?")
+      .get(id) as { origin: string; task_name: string | null };
+    expect(row.origin).toBe("user");
+    expect(row.task_name).toBeNull();
+  });
+
+  test("audit.origin='scheduled' + task_name persists when supplied", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    const id = db.insertAudit({
+      chatId: 1,
+      fromId: 99,
+      updateId: null,
+      prompt: "task:digest",
+      startedAt: 100,
+      model: "claude:primary:m",
+      origin: "scheduled",
+      taskName: "digest",
+    });
+    const row = db.raw
+      .query("SELECT origin, task_name, update_id FROM audit WHERE id = ?")
+      .get(id) as { origin: string; task_name: string | null; update_id: number | null };
+    expect(row.origin).toBe("scheduled");
+    expect(row.task_name).toBe("digest");
+    expect(row.update_id).toBeNull();
+  });
+
+  test("upsertTaskMetadata + getTaskState round-trip", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    db.upsertTaskMetadata({
+      name: "digest",
+      sourcePath: "/tasks/digest/TASK.md",
+      sourceHash: "abc123",
+    });
+    const row = db.getTaskState("digest");
+    expect(row).not.toBeNull();
+    expect(row!.name).toBe("digest");
+    expect(row!.sourcePath).toBe("/tasks/digest/TASK.md");
+    expect(row!.sourceHash).toBe("abc123");
+    expect(row!.lastRunAt).toBeNull();
+    expect(row!.oneOffConsumed).toBe(false);
+  });
+
+  test("markTaskFired updates last_run_at and last_status", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    db.upsertTaskMetadata({ name: "digest", sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name: "digest",
+      lastRunAt: 1_700_000_000_000,
+      lastAuditId: 42,
+      lastStatus: "fired",
+    });
+    const row = db.getTaskState("digest")!;
+    expect(row.lastRunAt).toBe(1_700_000_000_000);
+    expect(row.lastAuditId).toBe(42);
+    expect(row.lastStatus).toBe("fired");
+    expect(row.oneOffConsumed).toBe(false);
+  });
+
+  test("setTaskOneOffConsumed flips one_off_consumed", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    db.upsertTaskMetadata({ name: "alarm", sourcePath: "/p", sourceHash: "h" });
+    db.setTaskOneOffConsumed({
+      name: "alarm",
+      lastRunAt: 1_700_000_000_000,
+      lastAuditId: null,
+      lastStatus: "fired",
+    });
+    const row = db.getTaskState("alarm")!;
+    expect(row.oneOffConsumed).toBe(true);
+  });
+
+  test("listTaskStates returns rows sorted by name", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    db.upsertTaskMetadata({ name: "zebra", sourcePath: "/p", sourceHash: "h" });
+    db.upsertTaskMetadata({ name: "alpha", sourcePath: "/p", sourceHash: "h" });
+    const rows = db.listTaskStates();
+    expect(rows.map((r) => r.name)).toEqual(["alpha", "zebra"]);
+  });
+
+  test("sumTaskCostSince filters by task_name and started_at", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    function seed(taskName: string, startedAt: number, cost: number) {
+      const id = db.insertAudit({
+        chatId: 1,
+        fromId: 99,
+        updateId: null,
+        prompt: "p",
+        startedAt,
+        model: "claude:primary:m",
+        origin: "scheduled",
+        taskName,
+      });
+      db.updateAuditEnd({
+        id,
+        response: "r",
+        toolCalls: null,
+        inputTokens: null,
+        outputTokens: null,
+        cacheCreationInputTokens: null,
+        cacheReadInputTokens: null,
+        costUsd: cost,
+        agentSessionId: null,
+        status: "ok",
+        errorMessage: null,
+        endedAt: startedAt + 100,
+      });
+    }
+    seed("digest", 100, 0.10);
+    seed("digest", 200, 0.05);
+    seed("digest", 50, 0.20); // before window
+    seed("other", 150, 0.30); // wrong task
+    expect(db.sumTaskCostSince("digest", 100)).toBeCloseTo(0.15, 5);
+    expect(db.sumTaskCostSince("digest", 0)).toBeCloseTo(0.35, 5);
+    expect(db.sumTaskCostSince("nope", 0)).toBe(0);
+  });
+
+  test("idempotent ALTER on second openDb (origin, task_name not duplicated)", async () => {
+    const dir = newDir();
+    const db1 = await openDb(dir);
+    dbs.push(db1);
+    db1.close();
+    const db2 = await openDb(dir);
+    dbs.push(db2);
+    const cols = (db2.raw.query("PRAGMA table_info(audit)").all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    expect(cols.filter((c) => c === "origin").length).toBe(1);
+    expect(cols.filter((c) => c === "task_name").length).toBe(1);
+  });
+
+  test("scheduled_tasks table exists and is empty on fresh install", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    const rows = db.raw.query("SELECT * FROM scheduled_tasks").all();
+    expect(rows.length).toBe(0);
+  });
+});

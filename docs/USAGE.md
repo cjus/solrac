@@ -339,7 +339,8 @@ The directory path comes from `SOLRAC_SKILLS_DIR` (default `./skills`, resolved 
 ---
 name: summarize           # required, [a-z0-9_]{1,32}, must not collide with built-in commands
 description: Summarize the URL or pasted text in 3 bullets.   # required, ≤256 chars
-tier: primary             # optional, primary|secondary, default primary
+tier: primary             # optional, primary|secondary|ollama, default = SOLRAC_DEFAULT_ENGINE
+tool: false               # optional, default false. When true, also expose this skill as a callable MCP tool to the Ollama agent (Phase 1: requires tier: ollama).
 ---
 You are a concise summarizer. Produce exactly 3 bullets, no preamble.
 
@@ -363,11 +364,13 @@ This means skills are best for:
 
 If you need tool use, file an issue — that's a v1.1 conversation.
 
-**Skills always run on Claude.** The `tier:` frontmatter accepts `primary` (default) or `secondary` only. Skills are **not affected by `SOLRAC_DEFAULT_ENGINE`** — even when the default engine is Ollama, a `/<skill>` invocation always hits Claude. If you want a free / local-Ollama-backed shortcut, just type the prompt without a slash so it routes via the default engine.
+**Tier inherits the deploy default.** When `tier:` is omitted, the skill runs on whatever `SOLRAC_DEFAULT_ENGINE` resolves to (`ollama`, `primary`, or `secondary`). Override per-skill with an explicit `tier:` value. `tier: ollama` is rejected at load if `SOLRAC_DEFAULT_ENGINE != ollama` (PR-B removed the `>` prefix; Ollama is reachable only as the deploy default).
 
 ### Cost & caps
 
-Skills cost a real Claude turn each. The audit row is tagged `claude:<tier>:<model>:skill:<name>` so cost rolls up under the existing per-chat hourly cap (`HOURLY_COST_CAP_USD`) and the global cap. The pre-flight cap check fires *before* the SDK call — a cap-rejected skill costs $0.
+A Claude-tier skill (`primary` or `secondary`) costs a real Claude turn. The audit row is tagged `claude:<tier>:<model>:skill:<name>` so cost rolls up under the existing per-chat hourly cap (`HOURLY_COST_CAP_USD`) and the global cap. The pre-flight cap check fires *before* the SDK call — a cap-rejected skill costs $0.
+
+An Ollama-tier skill is free. The audit row is tagged `ollama:<model>:skill:<name>` with `cost_usd = 0`; the per-chat hourly cap pre-flight is skipped (a chat throttled by Claude burn shouldn't lose access to local inference). Ollama skills run a single non-streaming `/api/chat` round trip — no history, no SOLRAC.md overlay, no tool loop, no streaming stub. Tool use is unavailable on this path even if `OLLAMA_TOOLS_ENABLED=true`; skills are tool-less by design across both engines.
 
 ### Failure modes
 
@@ -400,6 +403,104 @@ EOF
 - Reply text is truncated to ~3,500 chars (Telegram's per-message ceiling is 4,096; we reserve headroom for HTML escaping overhead).
 - The model's output is HTML-escaped before sending — your skill body cannot produce raw `<b>` tags. If a skill author wants formatted output, that's a v1.1 conversation.
 - Hot-reload is intentionally absent: edit a `SKILL.md`, restart Solrac. This matches the boot-once config story (see `docs/CONFIG.md`).
+
+### Skills as tools (Phase 1: Ollama-only)
+
+A skill with `tool: true` in its frontmatter is *also* exposed as a callable MCP tool to the Ollama agent. The model sees the tool in its catalog as `mcp__solrac__skills__<name>` (wire format on Ollama: `skills__<name>`) with the operator-authored `description`. When the user types something natural like *"summarize this article: ..."*, the model can decide to call `skills__tldr` with `args: "<the article>"` instead of summarizing inline.
+
+Phase 1 restrictions (locked-in):
+
+- **`tool: true` requires `tier: ollama`.** Tool-callable skills run on the local model, free. Cross-engine tool calls (Ollama agent → Sonnet skill) are deferred to Phase 2 to avoid cost surprises.
+- **Skill tools are exposed only to the Ollama agent.** The Claude SDK's tool catalog is untouched — Claude tiers can't yet call skills as tools.
+- **Tools are auto-allow.** No Telegram-confirm prompt before each call. Cost cap is the backstop (Phase 1 ollama skills are free anyway).
+- **Skills remain tool-less themselves.** The skill body cannot call other tools — recursion is structurally impossible. A test (`skill-tools.test.ts`) asserts the outgoing fetch body has no `tools` field; a regression breaks CI.
+
+Audit visibility: every tool-called skill writes its own `audit` row tagged `origin='tool_call'` and `model='ollama:<model>:skill:<name>'`. Operator-typed `/<skill>` invocations stay tagged `origin='user'`, so the two surfaces are distinguishable in the audit log:
+
+```sh
+sqlite3 data/solrac.sqlite "SELECT started_at, origin, model, status FROM audit WHERE model LIKE '%:skill:%' ORDER BY started_at DESC LIMIT 20;"
+```
+
+Description quality matters: the model's natural-language → tool routing depends entirely on `skill.description`. Bad descriptions → wrong tool fires or misses. Write descriptions as if you're describing a tool to a model.
+
+Latency: a tool-called skill is one extra `/api/chat` round trip mid-loop. With `OLLAMA_MAX_TOOL_ITERATIONS=8` and `OLLAMA_TIMEOUT_MS=60000`, two skill calls per turn is roughly the practical ceiling on a busy turn before timeout risk.
+
+Example: `skills/tldr/SKILL.md` ships with `tool: true`. Type `summarize this: <long text>` to your Ollama deploy and watch the audit log — you'll see two rows: the Ollama parent turn (`origin: user`, `model: ollama:<m>`) plus the skill tool call (`origin: tool_call`, `model: ollama:<m>:skill:tldr`).
+
+## Scheduled tasks
+
+> Status: opt-in via `SOLRAC_TASKS_ENABLED=true`. Disabled by default.
+
+Scheduled tasks are operator-authored prompts that fire on a timer into a configured chat. Use them for daily digests, weekly PR reviews, one-off reminders, or any prompt you want Solrac to run without you having to type it.
+
+Each task is a `TASK.md` file in `$SOLRAC_TASKS_DIR/<name>/` (default `./tasks`). The file has YAML-ish frontmatter (metadata) plus a markdown body (the prompt that fires).
+
+### Minimal example
+
+```markdown
+---
+name: morning_digest
+description: Weekday morning Notion ticket digest.
+schedule: daily_at 13:00
+---
+
+You are running as the morning digest. List any Notion tickets in "In progress"
+with no update in the last 48h. If there are none, reply "All clear."
+```
+
+Drop this file at `./tasks/morning_digest/TASK.md`, set `SOLRAC_TASKS_ENABLED=true`, restart. The prompt fires every UTC day at 13:00 into the operator's DM.
+
+### Schedule grammar
+
+One of (mutually exclusive):
+
+| Form | Meaning | Example |
+|------|---------|---------|
+| `every <N><unit>` | Periodic interval from `last_run_at`. Units: `s`, `m`, `h`, `d`. | `every 1h`, `every 24h`, `every 30m` |
+| `daily_at HH:MM` | Anchored daily fire (UTC). | `daily_at 09:00`, `daily_at 23:30` |
+| `at <ISO8601>` | Single fire at an absolute timestamp. Must include timezone (`Z` or `±HH:MM`). | `at 2026-05-15T13:00:00Z` |
+
+**Minimum interval for `every`:** 5 minutes for Claude tiers (cost-runaway guard); 1 minute for Ollama.
+
+### Frontmatter reference
+
+| Key | Required | Default | Notes |
+|-----|----------|---------|-------|
+| `name` | yes | — | `[a-z0-9_]{1,32}` (Telegram bot-command shape). Lowercased automatically. |
+| `description` | yes | — | ≤256 chars. Shown in `/tasks`. |
+| `schedule` | yes | — | See grammar above. |
+| `chat_id` | no | first allowlist entry | Where the reply lands. Use a negative integer for group chats. |
+| `engine` | no | `config.defaultEngine` | `primary` (Sonnet, `@`), `secondary` (Opus, `!`), or `ollama` (free, default-engine deploys only). |
+| `catch_up` | no | `true` for periodic, `false` for `at` | If Solrac was down through a missed window, fire once on next boot. Set to `false` to skip catch-up fires. |
+| `enabled` | no | `true` | Set `false` to pause without deleting. |
+| `max_cost_usd` | no | unset | Per-task hourly cap (Claude tiers only). Pre-flight skip when `SUM(cost_usd)` for this task in past 1 hour ≥ cap. Silently ignored on Ollama. |
+| `boot_catch_up_jitter_s` | no | `0` | Stagger boot catch-up fires by `random(0, N)` seconds so 12 daily tasks don't pile up simultaneously on restart. |
+
+Unknown frontmatter keys are rejected at parse — typos surface as boot-time warnings rather than silently ignored fields.
+
+### Operator commands
+
+`/tasks` — list every loaded task with its schedule, engine, last fire, and last status.
+
+`/tasks run <name>` — fire a task on demand. Bypasses the schedule clock; honors `enabled`, `one_off_consumed`, and `max_cost_usd`. Useful for debugging without waiting for the next anchor.
+
+### Visibility
+
+Every fire writes one `audit` row tagged `origin='scheduled'` with `task_name=<name>`. The per-task `scheduled_tasks` table tracks `last_run_at`, `last_status`, `last_audit_id`, and `one_off_consumed`. Query both directly when needed:
+
+```sh
+sqlite3 data/solrac.sqlite \
+  "SELECT started_at, task_name, status, cost_usd FROM audit WHERE origin='scheduled' ORDER BY started_at DESC LIMIT 20"
+```
+
+### Safety notes
+
+- Scheduled fires share the same turn queue as user-typed messages. The per-chat hourly cap, the global hourly cap, `MAX_CONCURRENT_TURNS`, and the policy hooks all apply automatically.
+- Tier-3 tools (Telegram-confirm) called from a scheduled fire prompt for confirmation. Without an operator at the keyboard the broker times out at 60s and fail-closes — write your TASK.md body for tools that auto-allow.
+- A task that fires while a user is mid-conversation in the same chat waits behind the user (per-chat KeyedMutex). Pick a `chat_id` you don't actively type in if you need deterministic timing.
+- Hot-reload is intentionally absent: edit a `TASK.md`, restart Solrac. Same contract as skills/integrations.
+
+See `examples/tasks/` for two ready-to-edit samples.
 
 ## Integrations
 

@@ -82,6 +82,9 @@ export interface ShutdownDeps {
   // Optional second server for the web UI transport. Stopped right after the
   // ops `server` so SSE writers terminate before tracker drain begins.
   webServer?: ShutdownServer | null;
+  // Scheduler tick handle. Stopped FIRST so no new fires land mid-drain;
+  // any in-flight task turns ride the existing tracker through drain.
+  scheduler?: { stop: () => void } | null;
   drainTimeoutMs?: number;
   exit?: (code: number) => void;
   signals?: NodeJS.Signals[];
@@ -117,6 +120,15 @@ export function installShutdown(deps: ShutdownDeps): ShutdownHandle {
 
   const run = async (reason: string): Promise<void> => {
     log.info("shutdown.start", { reason, inFlight: deps.tracker.count });
+
+    if (deps.scheduler) {
+      try {
+        deps.scheduler.stop();
+        log.info("shutdown.scheduler_stopped");
+      } catch (err) {
+        log.warn("shutdown.scheduler_stop_failed", { error: (err as Error).message });
+      }
+    }
 
     deps.pollAbort.abort();
 

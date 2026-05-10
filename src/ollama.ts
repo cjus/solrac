@@ -111,6 +111,7 @@ import {
   type OllamaMessage as ToolOllamaMessage,
   type RunToolLoopRenderer,
 } from "./ollama-tools.ts";
+import { skillToolCtx } from "./skill-tools.ts";
 import { htmlEscapeText, type TelegramClient } from "./telegram.ts";
 
 const TELEGRAM_TEXT_MAX = 3800;
@@ -229,8 +230,15 @@ export interface OllamaRunDeps {
 export interface OllamaRunInput {
   chatId: number;
   fromId: number;
-  updateId: number;
+  // Nullable for synthesized scheduler updates — they don't ride the poll
+  // offset so there's no real Telegram update_id to record.
+  updateId: number | null;
   prompt: string;
+  // Scheduler — set when this turn fired from a scheduled task. The audit
+  // row gets origin='scheduled' + task_name; runtime behavior is otherwise
+  // identical to a user turn (and Ollama is free, so max_cost_usd has no
+  // role here).
+  scheduledTaskName?: string | null;
 }
 
 interface OllamaMessage {
@@ -257,6 +265,8 @@ export async function runOllamaTurn(
     prompt: truncateAuditPrompt(input.prompt),
     startedAt: Date.now(),
     model: `ollama:${deps.model}`,
+    origin: input.scheduledTaskName ? "scheduled" : "user",
+    taskName: input.scheduledTaskName ?? null,
   });
 
   const stub = await deps.tg.sendMessage(input.chatId, THINKING_STUB).catch((err) => {
@@ -612,23 +622,37 @@ async function runOllamaTurnWithTools(
 
   let result;
   try {
-    result = await runToolLoop(
+    // Wrap the loop in `skillToolCtx.run(...)` so any `skills__*` tool the
+    // model calls mid-loop can read per-turn context (chatId, fromId,
+    // updateId, parentAuditId) via `AsyncLocalStorage.getStore()` from
+    // its handler. ALS propagates across `await` boundaries; concurrent
+    // turns each get their own context.
+    result = await skillToolCtx.run(
       {
-        fetch: deps.fetch,
-        url: deps.url,
-        model: deps.model,
-        signal: ac.signal,
-        tools: toolMap,
-        toolTiers,
-        toolDefs,
-        broker,
-        loopDetector,
-        maxIterations,
-        auditId,
         chatId: input.chatId,
-        renderer,
+        fromId: input.fromId,
+        updateId: input.updateId,
+        parentAuditId: auditId,
       },
-      { initialMessages },
+      () =>
+        runToolLoop(
+          {
+            fetch: deps.fetch,
+            url: deps.url,
+            model: deps.model,
+            signal: ac.signal,
+            tools: toolMap,
+            toolTiers,
+            toolDefs,
+            broker,
+            loopDetector,
+            maxIterations,
+            auditId,
+            chatId: input.chatId,
+            renderer,
+          },
+          { initialMessages },
+        ),
     );
   } finally {
     clearTimeout(timer);

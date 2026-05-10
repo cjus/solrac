@@ -357,6 +357,31 @@ describe("parseCommand", () => {
     });
   });
 
+  test("/skill-name with multi-line args (newlines preserved, regex spans \\n)", () => {
+    // Regression: COMMAND_RE used `.+?` for args, which doesn't match `\n`
+    // without the `s` flag — multi-line `/tldr <text>\nmore text` then failed
+    // the whole regex and returned kind:unknown, even with the skill loaded.
+    // Now uses `[\s\S]+?` so multi-line pastes route correctly.
+    const skill = parseSkillFile(
+      "---\nname: tldr\ndescription: Summarize\n---\nSummary of: {{args}}",
+      "/p",
+      RESERVED_BUILTINS,
+    );
+    const registry: SkillRegistry = {
+      all: [skill],
+      get: (n) => (n.toLowerCase() === "tldr" ? skill : undefined),
+      size: () => 1,
+    };
+    const result = parseCommand("/tldr line one\nline two\nline three", {
+      ...DEPS,
+      skillRegistry: registry,
+    });
+    expect(result).toEqual({
+      kind: "run",
+      cmd: { kind: "skill", skill, args: "line one\nline two\nline three" },
+    });
+  });
+
   test(":skill-name also resolves against registry (dual-prefix consistent)", () => {
     const skill = parseSkillFile(
       "---\nname: greet\ndescription: Greet the user\n---\nHello {{args}}.",
@@ -503,6 +528,7 @@ async function makeHarness(
     hourlyCostCapUsd: opts.capUsd ?? 1.0,
     globalHourlyCostCapUsd: opts.globalCapUsd ?? 4.0,
     skillRegistry: opts.skillRegistry ?? EMPTY_SKILL_REGISTRY,
+    ollamaSkillDeps: null,
     defaultEngine: "ollama",
     ollamaToolsEnabled: false,
   };
@@ -1096,5 +1122,210 @@ describe("runCommand /help with skills", () => {
     const h = await makeHarness();
     await runCommand(h.deps, fakeMsg("/help"), { kind: "help" }, 1);
     expect(h.tg.sent[0]!.text).not.toContain("<b>Skills</b>");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /tasks
+// ---------------------------------------------------------------------------
+
+describe("parseCommand /tasks", () => {
+  test("/tasks → tasks_list", () => {
+    expect(parseCommand("/tasks", DEPS)).toEqual({
+      kind: "run",
+      cmd: { kind: "tasks_list" },
+    });
+  });
+
+  test("/tasks run morning_digest → tasks_run", () => {
+    expect(parseCommand("/tasks run morning_digest", DEPS)).toEqual({
+      kind: "run",
+      cmd: { kind: "tasks_run", name: "morning_digest" },
+    });
+  });
+
+  test("/tasks bogus → unknown", () => {
+    expect(parseCommand("/tasks foo bar", DEPS)).toEqual({
+      kind: "run",
+      cmd: { kind: "unknown", raw: "/tasks foo bar" },
+    });
+  });
+
+  test(":tasks works as alias", () => {
+    expect(parseCommand(":tasks", DEPS)).toEqual({
+      kind: "run",
+      cmd: { kind: "tasks_list" },
+    });
+  });
+});
+
+describe("runCommand /tasks", () => {
+  test("scheduler disabled → 'scheduler disabled' reply", async () => {
+    const h = await makeHarness();
+    await runCommand(h.deps, fakeMsg("/tasks"), { kind: "tasks_list" }, 1);
+    expect(h.tg.sent[0]!.text).toContain("scheduler disabled");
+  });
+
+  test("with registered tasks, /tasks lists each with next-fire", async () => {
+    const h = await makeHarness();
+    const fakeTask = {
+      name: "morning_digest",
+      description: "Morning digest task",
+      body: "Run the digest",
+      chatId: null,
+      engine: "ollama" as const,
+      spec: { kind: "every" as const, ms: 3_600_000 },
+      catchUp: true,
+      enabled: true,
+      maxCostUsd: null,
+      bootCatchUpJitterS: 0,
+      sourcePath: "/tasks/morning_digest/TASK.md",
+      sourceHash: "abc",
+    };
+    h.deps.taskRegistry = {
+      all: [fakeTask],
+      get: (n: string) => (n === "morning_digest" ? fakeTask : undefined),
+      size: () => 1,
+    };
+    await runCommand(h.deps, fakeMsg("/tasks"), { kind: "tasks_list" }, 1);
+    const text = h.tg.sent[0]!.text;
+    expect(text).toContain("morning_digest");
+    expect(text).toContain("every 1h");
+    expect(text).toContain("ollama");
+    // Next-fire rendering: never-run task → fire on next tick → "(now)" or
+    // "(<small> late)" depending on the millisecond clock the test ran at.
+    // Both forms include "next:" — that's the contract.
+    expect(text).toContain("next:");
+  });
+
+  test("/tasks renders 'consumed' for one_off_consumed task", async () => {
+    const h = await makeHarness();
+    const fakeTask = {
+      name: "alarm",
+      description: "One-off alarm",
+      body: "Ring",
+      chatId: null,
+      engine: "ollama" as const,
+      spec: { kind: "at" as const, atMs: Date.now() - 86_400_000 },
+      catchUp: false,
+      enabled: true,
+      maxCostUsd: null,
+      bootCatchUpJitterS: 0,
+      sourcePath: "/tasks/alarm/TASK.md",
+      sourceHash: "abc",
+    };
+    h.deps.taskRegistry = {
+      all: [fakeTask],
+      get: (n: string) => (n === "alarm" ? fakeTask : undefined),
+      size: () => 1,
+    };
+    h.db.upsertTaskMetadata({ name: "alarm", sourcePath: "/p", sourceHash: "h" });
+    h.db.setTaskOneOffConsumed({
+      name: "alarm",
+      lastRunAt: Date.now() - 86_400_000,
+      lastAuditId: null,
+      lastStatus: "fired",
+    });
+    await runCommand(h.deps, fakeMsg("/tasks"), { kind: "tasks_list" }, 1);
+    const text = h.tg.sent[0]!.text;
+    expect(text).toContain("next: consumed");
+  });
+
+  test("/tasks renders '—' for disabled task", async () => {
+    const h = await makeHarness();
+    const fakeTask = {
+      name: "paused",
+      description: "Paused task",
+      body: "noop",
+      chatId: null,
+      engine: "ollama" as const,
+      spec: { kind: "every" as const, ms: 3_600_000 },
+      catchUp: true,
+      enabled: false,
+      maxCostUsd: null,
+      bootCatchUpJitterS: 0,
+      sourcePath: "/tasks/paused/TASK.md",
+      sourceHash: "abc",
+    };
+    h.deps.taskRegistry = {
+      all: [fakeTask],
+      get: (n: string) => (n === "paused" ? fakeTask : undefined),
+      size: () => 1,
+    };
+    await runCommand(h.deps, fakeMsg("/tasks"), { kind: "tasks_list" }, 1);
+    const text = h.tg.sent[0]!.text;
+    expect(text).toContain("(disabled)");
+    expect(text).toContain("next: —");
+  });
+
+  test("/tasks renders 'in <duration>' for future fire", async () => {
+    const h = await makeHarness();
+    const lastRun = Date.now() - 30 * 60 * 1000; // 30 min ago
+    const fakeTask = {
+      name: "hourly",
+      description: "Hourly task",
+      body: "Run",
+      chatId: null,
+      engine: "ollama" as const,
+      spec: { kind: "every" as const, ms: 60 * 60 * 1000 }, // 1h
+      catchUp: true,
+      enabled: true,
+      maxCostUsd: null,
+      bootCatchUpJitterS: 0,
+      sourcePath: "/tasks/hourly/TASK.md",
+      sourceHash: "abc",
+    };
+    h.deps.taskRegistry = {
+      all: [fakeTask],
+      get: (n: string) => (n === "hourly" ? fakeTask : undefined),
+      size: () => 1,
+    };
+    h.db.upsertTaskMetadata({ name: "hourly", sourcePath: "/p", sourceHash: "h" });
+    h.db.markTaskFired({
+      name: "hourly",
+      lastRunAt: lastRun,
+      lastAuditId: 1,
+      lastStatus: "fired",
+    });
+    await runCommand(h.deps, fakeMsg("/tasks"), { kind: "tasks_list" }, 1);
+    const text = h.tg.sent[0]!.text;
+    // ~30m remain in the hour. Allow either "30m" or "29m" in case the clock
+    // rolled.
+    expect(text).toMatch(/\(in \d+m\)/);
+  });
+
+  test("/tasks run <name> calls triggerScheduledTask and reports outcome", async () => {
+    const h = await makeHarness();
+    const fired: string[] = [];
+    h.deps.triggerScheduledTask = (n) => {
+      fired.push(n);
+      return { kind: "fired", name: n };
+    };
+    h.deps.taskRegistry = {
+      all: [],
+      get: () => undefined,
+      size: () => 0,
+    };
+    await runCommand(
+      h.deps,
+      fakeMsg("/tasks run digest"),
+      { kind: "tasks_run", name: "digest" },
+      1,
+    );
+    expect(fired).toEqual(["digest"]);
+    expect(h.tg.sent[0]!.text).toContain("fired task");
+  });
+
+  test("/tasks run <unknown> reports unknown_task", async () => {
+    const h = await makeHarness();
+    h.deps.triggerScheduledTask = (n) => ({ kind: "unknown_task", name: n });
+    h.deps.taskRegistry = { all: [], get: () => undefined, size: () => 0 };
+    await runCommand(
+      h.deps,
+      fakeMsg("/tasks run nope"),
+      { kind: "tasks_run", name: "nope" },
+      1,
+    );
+    expect(h.tg.sent[0]!.text).toContain("unknown task");
   });
 });

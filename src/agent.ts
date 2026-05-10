@@ -220,12 +220,18 @@ export interface AgentRunDeps {
 export interface AgentRunInput {
   chatId: number;
   fromId: number;
-  updateId: number;
+  // Nullable for synthesized scheduler updates — they don't ride the poll
+  // offset so there's no real Telegram update_id to record.
+  updateId: number | null;
   prompt: string;
   // PLAN Step 12: which Claude tier handles this turn. `'primary'` = cheap
   // default tier (Sonnet), `'secondary'` = heavyweight tier (Opus). Selected
   // by `parseEnginePrefix` in main.ts.
   engine: SessionTier;
+  // Scheduler — set when this turn fired from a scheduled task. The audit
+  // row gets origin='scheduled' + task_name; runtime behavior is otherwise
+  // identical to a user turn.
+  scheduledTaskName?: string | null;
 }
 
 interface ToolCallSummary {
@@ -252,6 +258,8 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
     prompt: truncateAuditPrompt(input.prompt),
     startedAt: Date.now(),
     model: engineModelTag,
+    origin: input.scheduledTaskName ? "scheduled" : "user",
+    taskName: input.scheduledTaskName ?? null,
   });
 
   const thinkingStub = THINKING_STUB_BY_ENGINE[input.engine];
