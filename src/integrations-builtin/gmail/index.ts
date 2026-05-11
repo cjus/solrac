@@ -26,11 +26,11 @@
  *   - Credential paths: `~/.solrac/gmail/` (NOT inside the source tree).
  *     `accounts.json` enumerates aliases; `<alias>.json` holds OAuth
  *     tokens; `credentials.json` holds the OAuth client_id+secret. Operator
- *     runs `bun scripts/gmail-auth.ts <alias>` once per account to populate.
+ *     runs `solrac gmail-auth <alias>` once per account to populate.
  *
  * Cross-references:
  *   - apps/utcp-tools/src/integrations/gmail/ — original (HTTP-server form)
- *   - solrac/scripts/gmail-auth.ts — operator OAuth bootstrap
+ *   - src/integrations-builtin/gmail/auth-cli.ts — `solrac gmail-auth` bootstrap
  *   - docs/USAGE.md#integrations — operator setup walkthrough
  */
 
@@ -39,13 +39,8 @@ import type {
   IntegrationModule,
 } from "../../integrations.ts";
 import {
-  getAvailableAccounts,
-  getGmailClient,
+  createGmailClientApi,
   googleModulesAvailable,
-  hasConfiguredAccounts,
-  isGmailConfigured,
-  listAccounts,
-  resolveAccount,
 } from "./client.ts";
 import {
   buildMimeMessage,
@@ -100,7 +95,7 @@ function errorResult(err: unknown, account?: string): ToolResult {
       success: false,
       error:
         `Gmail authentication needs renewal for "${aliasHint}". ` +
-        `Run: bun scripts/gmail-auth.ts ${aliasHint}`,
+        `Run: solrac gmail-auth ${aliasHint}`,
       authRequired: true,
     });
   }
@@ -247,19 +242,22 @@ export default async function setup(
     });
     return { apiVersion: 1, tools: [] };
   }
-  if (!isGmailConfigured()) {
+
+  const api = createGmailClientApi(ctx.solracHome);
+
+  if (!api.isGmailConfigured()) {
     ctx.log.info("integrations.gmail.disabled", {
       reason: "credentials.json absent",
-      expectedAt: "~/.solrac/gmail/credentials.json",
+      expectedAt: api.paths.credentialsPath,
       hint:
         "Download OAuth client_id+secret from Google Cloud Console " +
-        "(APIs & Services → Credentials), save as ~/.solrac/gmail/credentials.json.",
+        `(APIs & Services → Credentials), save as ${api.paths.credentialsPath}.`,
     });
     return { apiVersion: 1, tools: [] };
   }
-  if (!hasConfiguredAccounts()) {
+  if (!api.hasConfiguredAccounts()) {
     ctx.log.info("integrations.gmail.no_accounts", {
-      hint: "Run `bun scripts/gmail-auth.ts <alias>` once per account to authenticate.",
+      hint: "Run `solrac gmail-auth <alias>` once per account to authenticate.",
     });
     return { apiVersion: 1, tools: [] };
   }
@@ -270,7 +268,7 @@ export default async function setup(
 
   // Common: fetch a Gmail client by account, surfacing friendly errors.
   async function client(account: string): Promise<LooseAny> {
-    return await getGmailClient(account, log);
+    return await api.getGmailClient(account, log);
   }
 
   // ---------------------------------------------------------------------------
@@ -380,7 +378,7 @@ export default async function setup(
       {},
       async (): Promise<ToolResult> => {
         try {
-          const accounts = listAccounts();
+          const accounts = api.listAccounts();
           return jsonResult({
             success: true,
             count: accounts.length,
@@ -814,9 +812,9 @@ export default async function setup(
               error: "confirm must be exactly `true` to send.",
             });
           }
-          const resolved = resolveAccount(args.account);
+          const resolved = api.resolveAccount(args.account);
           if (!resolved) {
-            const available = getAvailableAccounts();
+            const available = api.getAvailableAccounts();
             return jsonResult({
               success: false,
               error: `Account "${args.account}" not found. Available: ${available.join(", ") || "(none)"}`,
@@ -881,7 +879,7 @@ export default async function setup(
   ];
 
   ctx.log.info("integrations.gmail.loaded", {
-    accountCount: getAvailableAccounts().length,
+    accountCount: api.getAvailableAccounts().length,
     toolCount: tools.length,
   });
 

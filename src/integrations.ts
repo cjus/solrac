@@ -131,6 +131,13 @@ export interface IntegrationContext {
    * trusted operator code.
    */
   readonly env: Readonly<Record<string, string | undefined>>;
+  /**
+   * Absolute path to `$SOLRAC_HOME`. Blessed integrations that persist
+   * credentials/state on disk MUST root them under
+   * `<solracHome>/integrations/<name>/`. Resolution rules live in
+   * `config.ts::resolveSolracHome`.
+   */
+  readonly solracHome: string;
 }
 
 export interface IntegrationModule {
@@ -605,12 +612,13 @@ export function logIntegrationLoadResult(
 
 // Build a fresh `IntegrationContext` for production use. Tests construct
 // their own (typically with a stub `fetch`).
-export function createIntegrationContext(): IntegrationContext {
+export function createIntegrationContext(solracHome: string): IntegrationContext {
   return Object.freeze({
     z,
     tool,
     fetch: globalThis.fetch,
     log,
     env: process.env as Readonly<Record<string, string | undefined>>,
+    solracHome,
   });
 }

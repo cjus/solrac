@@ -1,49 +1,30 @@
-#!/usr/bin/env bun
 /**
- * @fileoverview Gmail OAuth bootstrap CLI for the blessed Gmail integration.
- * @purpose One-time interactive auth: opens a browser for Google's OAuth
- *          consent screen, captures the redirect, exchanges the code for
- *          tokens, and writes them to `~/.solrac/gmail/<alias>.json` plus
- *          `~/.solrac/gmail/accounts.json`.
+ * @fileoverview Gmail OAuth bootstrap, surfaced as `solrac gmail-auth <alias>`.
+ * @purpose One-time interactive OAuth per Gmail account the agent can access.
+ *          Opens a browser for Google consent, captures the redirect on a
+ *          loopback server, exchanges the code for tokens, and writes them
+ *          to `$SOLRAC_HOME/integrations/gmail/<alias>.json` plus an entry
+ *          in `accounts.json`.
  *
- * Run once per Gmail account the operator wants the agent to access:
- *
- *   bun scripts/gmail-auth.ts personal
- *   bun scripts/gmail-auth.ts work
- *
- * Prerequisite: download an OAuth client credentials.json from
- * Google Cloud Console (APIs & Services → Credentials) and save it to
- * `~/.solrac/gmail/credentials.json` first. The redirect URI in your
- * OAuth client config should include `http://localhost` (the script
- * binds a random ephemeral port at runtime; Google accepts loopback
- * with any port).
- *
- * Adapted from `apps/utcp-tools/scripts/gmail-auth.ts` with two changes:
- *
- *   1. **Paths in `~/.solrac/gmail/`** instead of relative-to-script.
- *      Solrac is a self-contained deployment; OAuth state belongs in
- *      the operator's home dir, not next to the source.
- *
- *   2. **Bun shebang.** Solrac runs on Bun (no `tsx`); the operator
- *      invokes via `bun scripts/gmail-auth.ts <alias>` rather than
- *      `pnpm gmail:auth`.
+ * Why this lives in `src/` (not `scripts/`): the curl-pipe binary install
+ * ships `solrac` only — no `bun`, no source tree. Putting the bootstrap
+ * behind a subcommand lets it run from the same binary the operator
+ * already has.
  *
  * Cross-references:
- *   - src/integrations-builtin/gmail/client.ts — reads what this writes.
+ *   - ./client.ts — reads what this writes.
+ *   - src/main.ts — `argv[2] === "gmail-auth"` dispatch arm.
  *   - docs/USAGE.md#integrations — operator-facing setup walkthrough.
  */
 
-import { OAuth2Client } from "google-auth-library";
-import { google } from "googleapis";
 import { exec } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveSolracHome } from "../../config.ts";
+import { resolveGmailPaths, type AccountsConfig } from "./client.ts";
 
-const GMAIL_DIR = join(homedir(), ".solrac", "gmail");
-const CREDENTIALS_PATH = join(GMAIL_DIR, "credentials.json");
-const ACCOUNTS_PATH = join(GMAIL_DIR, "accounts.json");
+type LooseAny = any; // eslint-disable-line @typescript-eslint/no-explicit-any
 
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
@@ -57,52 +38,93 @@ interface CredentialsFile {
   web?: { client_id: string; client_secret: string };
 }
 
-interface AccountInfo {
-  email: string;
-  tokenFile: string;
-  scopes: string[];
-  createdAt: string;
+function printUsage(): void {
+  console.error("Usage: solrac gmail-auth <alias>");
+  console.error("Example: solrac gmail-auth personal");
 }
 
-type AccountsConfig = Record<string, AccountInfo>;
+function printMissingCredentials(credentialsPath: string): void {
+  console.error(`Error: credentials.json not found at ${credentialsPath}\n`);
+  console.error("To create one:");
+  console.error(
+    "  1. Enable the Gmail API:",
+    "https://console.cloud.google.com/apis/library/gmail.googleapis.com",
+  );
+  console.error(
+    "  2. Create an OAuth client:",
+    "https://console.cloud.google.com/apis/credentials",
+  );
+  console.error(
+    "     → Create Credentials → OAuth client ID → Desktop app",
+  );
+  console.error(`  3. Download the JSON and save it to the path above.`);
+}
 
-async function main(): Promise<void> {
-  const alias = process.argv[2];
+/**
+ * Run the gmail-auth bootstrap. Returns the exit code; the dispatcher in
+ * `main.ts` calls `process.exit(code)` so this function stays testable.
+ */
+export async function runGmailAuth(argv: string[]): Promise<number> {
+  const alias = argv[0];
   if (!alias) {
-    console.error("Usage: bun scripts/gmail-auth.ts <alias>");
-    console.error('Example: bun scripts/gmail-auth.ts personal');
-    process.exit(1);
+    printUsage();
+    return 1;
   }
   if (!/^[a-z0-9_-]+$/i.test(alias)) {
     console.error(
       "Error: alias must be alphanumeric with dashes/underscores only.",
     );
-    process.exit(1);
+    return 1;
   }
 
-  if (!existsSync(GMAIL_DIR)) {
-    mkdirSync(GMAIL_DIR, { recursive: true });
+  const solracHome = resolveSolracHome(process.env.SOLRAC_HOME);
+  const paths = resolveGmailPaths(solracHome);
+
+  console.log(`solrac home: ${solracHome}`);
+  console.log(`gmail dir:   ${paths.gmailDir}\n`);
+
+  if (!existsSync(paths.gmailDir)) {
+    mkdirSync(paths.gmailDir, { recursive: true });
   }
-  if (!existsSync(CREDENTIALS_PATH)) {
-    console.error(`Error: ${CREDENTIALS_PATH} not found.`);
-    console.error(
-      "Download from Google Cloud Console → APIs & Services → Credentials, " +
-        "and save the JSON file as ~/.solrac/gmail/credentials.json.",
-    );
-    process.exit(1);
+  if (!existsSync(paths.credentialsPath)) {
+    printMissingCredentials(paths.credentialsPath);
+    return 1;
   }
 
   const credentials: CredentialsFile = JSON.parse(
-    readFileSync(CREDENTIALS_PATH, "utf8"),
+    readFileSync(paths.credentialsPath, "utf8"),
   );
   const config = credentials.installed ?? credentials.web;
   if (!config) {
     console.error(
       "Error: invalid credentials.json — missing 'installed' or 'web' key.",
     );
-    process.exit(1);
+    return 1;
   }
   const { client_id, client_secret } = config;
+
+  // googleapis / google-auth-library are optional deps; the gmail integration
+  // self-gates on their presence at boot. Lazy-load here so the bootstrap
+  // fails loud with an actionable hint instead of an import error.
+  let OAuth2Client: LooseAny;
+  let google: LooseAny;
+  try {
+    const [authLib, googleApis] = await Promise.all([
+      import("google-auth-library"),
+      import("googleapis"),
+    ]);
+    OAuth2Client = (authLib as LooseAny).OAuth2Client;
+    google = (googleApis as LooseAny).google;
+  } catch (err) {
+    console.error(
+      "Error: googleapis + google-auth-library are not installed.\n",
+    );
+    console.error(
+      "Run: npm install googleapis google-auth-library\n",
+    );
+    console.error(`(import error: ${(err as Error).message})`);
+    return 1;
+  }
 
   // Bind a random port in 3457-3556. Google accepts any localhost port
   // for OAuth callbacks even if not pre-registered.
@@ -116,7 +138,7 @@ async function main(): Promise<void> {
     prompt: "consent", // force consent so we always get a refresh_token
   });
 
-  console.log(`\nAuthenticating account: ${alias}`);
+  console.log(`Authenticating account: ${alias}`);
   console.log("Opening browser for Google sign-in...");
 
   const code = await new Promise<string>((resolve, reject) => {
@@ -149,7 +171,7 @@ async function main(): Promise<void> {
     });
 
     server.listen(port, () => {
-      // macOS `open` opens default browser. Linux operators may need to
+      // macOS `open` opens the default browser. Linux operators may need to
       // copy-paste the URL — print it as a fallback.
       exec(`open "${authUrl}"`, (err) => {
         if (err) {
@@ -158,8 +180,6 @@ async function main(): Promise<void> {
       });
     });
 
-    // 5-minute timeout — give the operator time to consent without leaving
-    // the script hanging forever if they walk away.
     setTimeout(
       () => {
         server.close();
@@ -173,22 +193,24 @@ async function main(): Promise<void> {
   const { tokens } = await oauth2Client.getToken(code);
   oauth2Client.setCredentials(tokens);
 
-  // Pull the email address so accounts.json carries human-readable info.
   const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
   const userInfo = await oauth2.userinfo.get();
   const email = userInfo.data.email;
   if (!email) {
     console.error("Error: could not retrieve email address from Google.");
-    process.exit(1);
+    return 1;
   }
 
   const tokenFile = `${alias}.json`;
-  writeFileSync(join(GMAIL_DIR, tokenFile), JSON.stringify(tokens, null, 2));
-  console.log(`Token saved to: ~/.solrac/gmail/${tokenFile}`);
+  const tokenPath = join(paths.gmailDir, tokenFile);
+  writeFileSync(tokenPath, JSON.stringify(tokens, null, 2));
+  console.log(`Token saved to: ${tokenPath}`);
 
   let accounts: AccountsConfig = {};
-  if (existsSync(ACCOUNTS_PATH)) {
-    accounts = JSON.parse(readFileSync(ACCOUNTS_PATH, "utf8")) as AccountsConfig;
+  if (existsSync(paths.accountsPath)) {
+    accounts = JSON.parse(
+      readFileSync(paths.accountsPath, "utf8"),
+    ) as AccountsConfig;
   }
   accounts[alias] = {
     email,
@@ -196,7 +218,7 @@ async function main(): Promise<void> {
     scopes: SCOPES.filter((s) => !s.includes("userinfo")),
     createdAt: new Date().toISOString(),
   };
-  writeFileSync(ACCOUNTS_PATH, JSON.stringify(accounts, null, 2));
+  writeFileSync(paths.accountsPath, JSON.stringify(accounts, null, 2));
   console.log(`Account registered: ${alias} → ${email}`);
 
   console.log(`\n✓ Authentication complete.`);
@@ -204,9 +226,5 @@ async function main(): Promise<void> {
     `\nRestart solrac to load the new account. Then via the agent:\n` +
       `  "search my ${alias} Gmail for unread emails"\n`,
   );
+  return 0;
 }
-
-main().catch((err: unknown) => {
-  console.error("Authentication failed:", (err as Error).message);
-  process.exit(1);
-});

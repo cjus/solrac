@@ -231,7 +231,7 @@ function parseDefaultEngine(raw: string | undefined): DefaultEngine {
  * flag) so the same binary behaves correctly whether it's `bun src/main.ts`
  * in a checkout or `solrac` from `/usr/local/bin/`.
  */
-function resolveSolracHome(raw: string | undefined): string {
+export function resolveSolracHome(raw: string | undefined): string {
   if (raw && raw.trim() !== "") return resolve(raw.trim());
   if (existsSync(resolve(process.cwd(), "SOUL.md"))) return process.cwd();
   return resolve(homedir(), ".solrac");

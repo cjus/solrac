@@ -613,7 +613,7 @@ async function main(): Promise<void> {
       // `import()` (works in --compile because Bun's runtime handles it).
       // Builtins win on tool-name collisions; the merge logs each cross-source
       // collision with both source identifiers.
-      const ctx = createIntegrationContext();
+      const ctx = createIntegrationContext(config.solracHome);
       const builtinResult = await loadBuiltinIntegrations(ctx);
       const operatorResult = await loadIntegrations([config.integrationsDir], ctx);
       const result = mergeIntegrationResults(builtinResult, operatorResult);
@@ -1044,12 +1044,38 @@ async function main(): Promise<void> {
   }
 }
 
+// CLI subcommand dispatch. Subcommands run without loadConfig() so they work
+// on a fresh install before TELEGRAM_BOT_TOKEN / ANTHROPIC_API_KEY are set.
+// Each subcommand resolves its own paths (via resolveSolracHome) and returns
+// a process exit code.
+async function dispatchSubcommand(subcommand: string): Promise<number> {
+  if (subcommand === "gmail-auth") {
+    const { runGmailAuth } = await import(
+      "./integrations-builtin/gmail/auth-cli.ts"
+    );
+    return await runGmailAuth(process.argv.slice(3));
+  }
+  console.error(`Unknown subcommand: ${subcommand}`);
+  console.error("Known subcommands: gmail-auth");
+  return 1;
+}
+
 // Only run as an entry script. `import.meta.main` is `true` when this file is
 // the program entry, `false` when imported by a test. Without this guard the
 // boot sequence runs on every test file that pulls in an exported helper.
 if (import.meta.main) {
-  main().catch((err) => {
-    log.error("solrac.fatal", { error: (err as Error).message });
-    process.exit(1);
-  });
+  const subcommand = process.argv[2];
+  if (subcommand !== undefined && !subcommand.startsWith("-")) {
+    dispatchSubcommand(subcommand)
+      .then((code) => process.exit(code))
+      .catch((err: unknown) => {
+        console.error(`${subcommand} failed:`, (err as Error).message);
+        process.exit(1);
+      });
+  } else {
+    main().catch((err) => {
+      log.error("solrac.fatal", { error: (err as Error).message });
+      process.exit(1);
+    });
+  }
 }

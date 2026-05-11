@@ -104,6 +104,7 @@ function makeCtx(): IntegrationContext {
     fetch: globalThis.fetch,
     log,
     env: process.env as Readonly<Record<string, string | undefined>>,
+    solracHome: "/tmp/solrac-test-home",
   });
 }
 
@@ -482,6 +483,7 @@ function makeBuiltinCtx(): IntegrationContext {
     fetch: globalThis.fetch,
     log,
     env: process.env as Readonly<Record<string, string | undefined>>,
+    solracHome: "/tmp/solrac-test-home",
   });
 }
 
