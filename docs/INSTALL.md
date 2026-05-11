@@ -63,6 +63,17 @@ solrac
 
 You should see structured JSON log lines on stdout. DM your bot — the first message should produce a 🤔 / 🦙 / 🙂 thinking stub within a second.
 
+## CLI subcommands
+
+The binary supports a small set of subcommands beyond the default server boot:
+
+| Command | Purpose |
+|---------|---------|
+| `solrac` | Boot the server (default). |
+| `solrac gmail-auth <alias>` | One-time OAuth bootstrap for a Gmail account. Opens the browser, captures the redirect, and writes tokens to `$SOLRAC_HOME/integrations/gmail/<alias>.json`. See [`docs/USAGE.md`](./USAGE.md) → Gmail integration for the full setup. |
+
+Subcommands do **not** require `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, or `ALLOWLIST_BOOTSTRAP` to be set — they run before solrac's full env validation, so a fresh install can authenticate Gmail accounts before configuring the bot.
+
 ## Upgrading
 
 Just rerun the install command:

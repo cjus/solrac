@@ -255,7 +255,9 @@ async function main(): Promise<void> {
   // ── Tools-on path (PR-A). Skipped unless `OLLAMA_TOOLS_ENABLED=true`. ──
   if (process.env.OLLAMA_TOOLS_ENABLED === "true") {
     // Load the built-in `time` integration the same way main.ts would.
-    const ctx = createIntegrationContext();
+    const ctx = createIntegrationContext(
+      process.env.SOLRAC_HOME ?? "/tmp/solrac-smoke-home",
+    );
     const timeMod = await timeIntegration(ctx);
     const tools: ReadonlyArray<SdkMcpToolDefinition<any>> = timeMod.tools;
     const toolTiers = new Map(

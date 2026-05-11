@@ -46,6 +46,7 @@ function makeCtx(): IntegrationContext {
     fetch: globalThis.fetch,
     log,
     env: process.env as Readonly<Record<string, string | undefined>>,
+    solracHome: process.env.SOLRAC_HOME ?? "/tmp/solrac-smoke-home",
   });
 }
 

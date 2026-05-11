@@ -7,3 +7,5 @@ node_modules/
 # npm prepare/pretest/prebuild:bin lifecycle hooks; manually via
 # `npm run embed:web-sanitize`.
 src/web-sanitize.embed.js
+
+integrations/gmail/

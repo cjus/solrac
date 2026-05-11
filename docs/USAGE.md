@@ -690,6 +690,8 @@ The destructive ops (`delete`, `send`) carry **two** safeguards: solrac's Telegr
 
 ##### Setup (~5 min one-time + ~1 min per account)
 
+All gmail on-disk state lives under `$SOLRAC_HOME/integrations/gmail/`. With the default `$SOLRAC_HOME=~/.solrac` that's `~/.solrac/integrations/gmail/`; with a custom value (e.g. `SOLRAC_HOME=/var/solrac`) the paths follow.
+
 ```bash
 # 1. Install Gmail's optional runtime deps. Run this in the same directory
 #    as solrac's `package.json` (the cloned repo root, e.g. `~/code/solrac`).
@@ -699,17 +701,25 @@ The destructive ops (`delete`, `send`) carry **two** safeguards: solrac's Telegr
 cd /path/to/solrac        # the directory with package.json
 npm install --save googleapis google-auth-library
 
-# 2. Get an OAuth client credentials.json from Google Cloud Console:
-#    APIs & Services → Credentials → Create credentials → OAuth client ID.
-#    Application type: "Desktop app".
-#    Save the downloaded JSON to:
-mkdir -p ~/.solrac/gmail
-mv ~/Downloads/client_secret_*.json ~/.solrac/gmail/credentials.json
+# (Skip step 1 entirely on a binary install — `solrac` ships googleapis +
+#  google-auth-library bundled.)
 
-# 3. Authenticate one or more accounts (opens browser per call).
-bun scripts/gmail-auth.ts personal
-bun scripts/gmail-auth.ts work
-# Each writes ~/.solrac/gmail/<alias>.json + appends to accounts.json.
+# 2. Get an OAuth client credentials.json from Google Cloud Console:
+#    - Enable Gmail API:   https://console.cloud.google.com/apis/library/gmail.googleapis.com
+#    - Create OAuth client: https://console.cloud.google.com/apis/credentials
+#      → Create Credentials → OAuth client ID → Desktop app
+#    Save the downloaded JSON to (substitute $SOLRAC_HOME as needed):
+mkdir -p ~/.solrac/integrations/gmail
+mv ~/Downloads/client_secret_*.json ~/.solrac/integrations/gmail/credentials.json
+
+# 3. Authenticate one or more accounts (opens browser per call). Works
+#    identically from a source checkout (`bun src/main.ts gmail-auth …`) or
+#    a curl-pipe binary install (`solrac gmail-auth …`).
+solrac gmail-auth personal
+solrac gmail-auth work
+# Each writes $SOLRAC_HOME/integrations/gmail/<alias>.json + appends to
+# accounts.json. The command prints the resolved solracHome + gmailDir on
+# its first two lines so the operator sees exactly where files land.
 
 # 4. Restart solrac. Boot log should show:
 #    integrations.gmail.loaded accountCount:2 toolCount:11
@@ -719,10 +729,21 @@ If Gmail is unconfigured, the boot log distinguishes which precondition failed:
 
 | Log event | Meaning |
 |---|---|
-| `integrations.gmail.deps_missing` | `googleapis` / `google-auth-library` not installed. Run the `npm install` above. |
-| `integrations.gmail.disabled` | `~/.solrac/gmail/credentials.json` not found. Get it from Google Cloud Console. |
-| `integrations.gmail.no_accounts` | Credentials present, but no accounts authed. Run `bun scripts/gmail-auth.ts <alias>`. |
+| `integrations.gmail.deps_missing` | `googleapis` / `google-auth-library` not installed. Run the `npm install` above. (Source checkouts only — the binary bundles these.) |
+| `integrations.gmail.disabled` | `credentials.json` not found at the path in `expectedAt`. Get it from Google Cloud Console. |
+| `integrations.gmail.no_accounts` | Credentials present, but no accounts authed. Run `solrac gmail-auth <alias>`. |
 | `integrations.gmail.loaded` | All set. Tool count + account count reported. |
+
+##### Migrating from `~/.solrac/gmail/` (pre-PNX-171 layout)
+
+Before PNX-171, gmail state lived in `~/.solrac/gmail/` regardless of `SOLRAC_HOME`. Move it once:
+
+```bash
+mkdir -p "$SOLRAC_HOME/integrations"
+mv ~/.solrac/gmail "$SOLRAC_HOME/integrations/gmail"
+```
+
+If `SOLRAC_HOME` is unset and you're on the default `~/.solrac`, the move is `mv ~/.solrac/gmail ~/.solrac/integrations/gmail`. No re-auth needed — token files carry over verbatim.
 
 ##### Use cases
 
@@ -737,8 +758,8 @@ The third one will require approving the send via inline-keyboard. The agent mus
 ##### Limits to know
 
 - **`gmail_delete_message` is permanent.** Use `gmail_trash_message` (Trash, recoverable 30 days) for normal deletes. The permanent-delete tool exists for cases where you really mean it.
-- **OAuth refresh** is automatic. The integration writes refreshed tokens back to `~/.solrac/gmail/<alias>.json` whenever Google rotates them.
-- **Scope is fixed** at read + modify + send + userinfo (for email-address discovery). To narrow scope, edit `scripts/gmail-auth.ts` SCOPES and re-auth per account.
+- **OAuth refresh** is automatic. The integration writes refreshed tokens back to `$SOLRAC_HOME/integrations/gmail/<alias>.json` whenever Google rotates them.
+- **Scope is fixed** at read + modify + send + userinfo (for email-address discovery). To narrow scope, edit `src/integrations-builtin/gmail/auth-cli.ts` SCOPES and re-auth per account.
 - **The `googleapis` package is ~30MB.** That's why it's an optional dep, not a runtime requirement. If you don't want Gmail, skip step 1 and Gmail self-gates on `deps_missing`.
 
 #### `notion` — single-token Notion workspace

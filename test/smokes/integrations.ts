@@ -51,7 +51,9 @@ async function run(): Promise<void> {
   // required — the smoke is a one-shot script.
   delete process.env.NOTION_API_KEY;
 
-  const ctx = createIntegrationContext();
+  const ctx = createIntegrationContext(
+    process.env.SOLRAC_HOME ?? "/tmp/solrac-smoke-home",
+  );
   const phases: Phase[] = [];
 
   // -------------------------------------------------------------------------
