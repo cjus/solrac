@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — local LLM backend abstraction: Ollama + LMStudio (BREAKING)
+## v0.7.0 — local LLM backend abstraction: Ollama + LMStudio (BREAKING)
 
 Replaces the Ollama-specific path with a generic `local` engine that supports multiple backends behind a unified driver interface (`src/local-driver.ts`). Hard cutover — every `OLLAMA_*` env var, `engine: ollama` / `tier: ollama` frontmatter value, and `/clear ollama` / `>` slash alias is rejected with a rename hint. The audit-row tag becomes three-segment `local:<backend>:<modelId>` and matches the `claude:<tier>:<modelId>` shape so cross-engine queries are symmetric. LMStudio joins Ollama as a first-class backend with its own SSE wire format, `parallel_tool_calls: false` Gemma-4 workaround, and tool-call argument-delta accumulation.
 
