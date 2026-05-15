@@ -357,6 +357,32 @@ describe("executeToolCall", () => {
     expect(r.content).toContain("network down");
   });
 
+  test("autoAllow: confirm-tier tool bypasses broker, handler invoked", async () => {
+    let requested = false;
+    const def = textTool("write_thing", "wrote ok");
+    const deps = buildDeps([{ def, tier: "confirm" }], {
+      broker: makeBroker("deny", { onRequest: () => (requested = true) }),
+      autoAllow: true,
+    });
+    const r = await executeToolCall(deps, {
+      name: "write_thing",
+      arguments: {},
+    });
+
+    expect(requested).toBe(false);
+    expect(r.disposition).toBe("ok");
+    expect(r.content).toBe("wrote ok");
+  });
+
+  test("autoAllow: auto-tier tool still works (no change)", async () => {
+    const def = textTool("time_now", "12:00");
+    const deps = buildDeps([{ def, tier: "auto" }], { autoAllow: true });
+    const r = await executeToolCall(deps, { name: "time_now", arguments: {} });
+
+    expect(r.disposition).toBe("ok");
+    expect(r.content).toBe("12:00");
+  });
+
   test("malformed args: zod validation fails, handler not invoked", async () => {
     let invoked = false;
     const def = tool(

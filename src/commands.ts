@@ -1315,12 +1315,18 @@ async function runSkill(
   const pendingHandles = new Map<string, ConfirmHandle>();
   const policyDeny: { event: PolicyDenyEvent | null } = { event: null };
 
-  const canUseTool: CanUseTool =
-    deps.createCanUseTool?.({
-      chatId: msg.chat.id,
-      auditId,
-      pendingHandles,
-    }) ?? skillDefaultAllowAll;
+  // `auto_allow: true` skills bypass the interactive confirm UX entirely —
+  // the PreToolUse hook (cost cap + loop detector) and SDK `disallowedTools`
+  // still run, but every tool the SDK routes to `canUseTool` is allowed
+  // without prompting the operator. Useful for skills whose entire purpose
+  // IS a known write (e.g. /log → notion).
+  const canUseTool: CanUseTool = skill.autoAllow
+    ? skillDefaultAllowAll
+    : (deps.createCanUseTool?.({
+        chatId: msg.chat.id,
+        auditId,
+        pendingHandles,
+      }) ?? skillDefaultAllowAll);
 
   const preToolUseHook = createPreToolUseHook({
     chatId: msg.chat.id,
@@ -1650,6 +1656,20 @@ async function runSkillBareWithTools(
   const toolTiers = ollama.toolTiers!;
   const broker = ollama.broker!;
 
+  // The broker uses `chatId` to send the Telegram inline-keyboard confirm
+  // prompt; without the real id, sends fail-close to a denial and the
+  // operator never sees a prompt. Both production callers (`runOllamaSkill`
+  // and `skill-tools.ts` dispatch) wrap us in `skillToolCtx.run({chatId,
+  // parentAuditId, ...})`, so we read context here. Missing context means
+  // a misconfigured test harness — log loudly and fall through with 0 (the
+  // broker's fail-closed path will surface the bug as a denied tool call).
+  const cx = skillToolCtx.getStore();
+  if (!cx) {
+    log.warn("skill.no_context_in_bare_with_tools", { skill: skill.name });
+  }
+  const chatId = cx?.chatId ?? 0;
+  const auditId = cx?.parentAuditId ?? 0;
+
   // Recursion guard. The skill's body must not see its own MCP entry. The
   // model can still call OTHER skills tools; cycles longer than 1 are bounded
   // by `maxIterations` and the loop detector.
@@ -1688,15 +1708,13 @@ async function runSkillBareWithTools(
         broker,
         loopDetector,
         maxIterations: skill.maxTurns,
-        // Skill audit row is owned by the caller (runOllamaSkill or
-        // skill-tools.ts::buildOneSkillTool); pass 0 here. The audit
-        // correlation in `log.info("ollama.tool_loop_start", ...)` is
-        // best-effort for skills.
-        auditId: 0,
-        // chatId is only used for log correlation inside runToolLoop. The
-        // ALS context (skillToolCtx) carries the real chatId for any
-        // nested skill calls.
-        chatId: 0,
+        // chatId is required by the broker to address the Telegram confirm
+        // prompt — sourced from the ALS context the caller set up. auditId
+        // is best-effort log correlation; we forward the caller's audit row
+        // so loop entries pin to the right turn.
+        auditId,
+        chatId,
+        autoAllow: skill.autoAllow,
       },
       { initialMessages },
     );

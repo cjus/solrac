@@ -242,6 +242,14 @@ export interface ExecuteToolCallDeps {
    * tests so they exercise the unbounded path.
    */
   readonly roundState?: { confirmsRemaining: number };
+  /**
+   * When true, `confirm`-tier classifications fall through to invocation
+   * without dispatching the broker. Set per-skill via SKILL.md `auto_allow:
+   * true` for skills whose entire purpose IS a known write. Loop detector
+   * and `deny`-tier still gate as normal — only the interactive prompt is
+   * suppressed.
+   */
+  readonly autoAllow?: boolean;
 }
 
 /**
@@ -336,8 +344,18 @@ export async function executeToolCall(
     };
   }
 
-  // Step 3: confirm UX for confirm-tier tools.
-  if (decision.kind === "confirm") {
+  // Step 3: confirm UX for confirm-tier tools. Per-skill `auto_allow:
+  // true` (SKILL.md) bypasses the broker entirely — the skill's purpose IS
+  // the operation, so re-prompting hurts UX. Loop detector + deny-tier above
+  // still ran. Logged so audit-greps can tell "operator approved" from
+  // "skill auto-allowed".
+  if (decision.kind === "confirm" && deps.autoAllow) {
+    log.info("ollama.tool_auto_allow", {
+      auditId: deps.auditId,
+      chatId: deps.chatId,
+      tool: shortName,
+    });
+  } else if (decision.kind === "confirm") {
     // Per-round confirm-cap (PLAN §3 / Phase 3). When the model emits
     // multiple parallel `tool_calls` and ≥2 are confirm-tier, the FIRST
     // gets the broker; subsequent ones short-circuit to a deny that tells
@@ -740,6 +758,12 @@ export interface RunToolLoopDeps {
   readonly denyTools?: ReadonlySet<string>;
   /** Optional throttled progress hook for live UI. */
   readonly renderer?: RunToolLoopRenderer;
+  /**
+   * When true, `confirm`-tier tool calls bypass the broker and run directly.
+   * Forwarded into every `executeToolCall` for this loop. Set by callers that
+   * already have a per-invocation trust signal (e.g. SKILL.md `auto_allow`).
+   */
+  readonly autoAllow?: boolean;
 }
 
 export interface RunToolLoopInput {
@@ -996,8 +1020,10 @@ export async function runToolLoop(
         }
 
         // Single-confirm-per-round: pre-classify confirm-tier; deny 2nd+.
+        // `autoAllow` skills bypass the broker entirely, so the cap (which
+        // exists to avoid stacking 60s prompts) doesn't apply to them.
         const tier = deps.toolTiers.get(call.name) ?? "confirm";
-        const wouldConfirm = tier !== "auto";
+        const wouldConfirm = tier !== "auto" && !deps.autoAllow;
         if (wouldConfirm && confirmsUsedThisRound > 0) {
           const msg =
             "denied: only one confirmable tool per round; retry separately";
@@ -1022,6 +1048,7 @@ export async function runToolLoop(
             toolTiers: deps.toolTiers,
             broker: deps.broker,
             loopDetector: deps.loopDetector,
+            autoAllow: deps.autoAllow,
           },
           call,
         );
