@@ -14,12 +14,14 @@
  *      and returns a frozen `TaskRegistry`. Fail-soft: a malformed TASK.md
  *      adds an error to the result but does not throw; boot continues.
  *
- *   2. Schedule grammar — three forms, parsed into a discriminated union
+ *   2. Schedule grammar — two forms, parsed into a discriminated union
  *      `ScheduleSpec`:
- *        - `every <duration>`    interval from last_run_at; `s/m/h/d` units
- *        - `daily_at HH:MM`      anchored daily fire (UTC)
- *        - `at <ISO8601>`        absolute one-off
- *      `nextRunAt(spec, lastRunAt, now)` is a pure function used by both
+ *        - `cron: <5-field expr>`  unix cron in the task's `tz` (default
+ *                                  host tz). Anchored cadence — no drift.
+ *        - `at: <ISO8601>`         absolute one-off
+ *      Exactly one of `cron:` or `at:` must be present. `cron-parser` 5.x
+ *      handles tz + DST (spring-forward skipped, fall-back single fire).
+ *      `nextRunAt(task, lastRunAt, now)` is a pure function used by both
  *      the tick loop and the unit tests; no I/O.
  *
  *   3. Tick driver — single shared `setInterval(60_000)` scans the registry,
@@ -41,14 +43,15 @@
  *
  * Catch-up policy (per task):
  *
- *   - `every <duration>`, `last_run_at` older than the interval: fire once
- *     on next tick (NOT N times for N missed intervals).
- *   - `daily_at`, today's anchor passed AND `last_run_at < today's anchor`:
- *     fire once.
+ *   - `cron`, `last_run_at` set AND next cron fire after it is in the past:
+ *     fire ONCE on the next tick (NOT N times for N missed slots).
+ *   - `cron`, never run (`last_run_at` null): does NOT boot-fire — waits
+ *     for the next cron tick. (cron is anchored, not stateful: a fresh
+ *     deploy at 14:00 with `0 9 * * *` waits until tomorrow 09:00.)
  *   - `at`, `at_ms < now` AND `!one_off_consumed`: fire once iff `catch_up`,
  *     else mark consumed without firing.
  *
- *   `catch_up: true` is the default for periodic, `false` for one-off.
+ *   `catch_up: true` is the default for `cron`, `false` for `at`.
  *   `boot_catch_up_jitter_s` deferrs the boot fire by `random(0, jitter_s)`
  *   seconds so 12 daily tasks don't pile up simultaneously on restart.
  *
@@ -59,9 +62,9 @@
  *   - `Task`, `TaskRegistry`, `ScheduleSpec`, `ScheduledTaskContext` — types.
  *   - `EMPTY_TASK_REGISTRY` — sentinel when scheduling is disabled.
  *   - `loadTasksSync(dir, defaultEngine)` — boot loader, returns registry + errors.
- *   - `parseScheduleSpec(raw)` — pure parser.
+ *   - `validateCronExpr(raw, tz)` — pure cron validator (wraps cron-parser).
  *   - `parseTaskFile(content, sourcePath, defaultEngine)` — pure parser.
- *   - `nextRunAt(spec, lastRunAt, now)` — pure timestamp computation.
+ *   - `nextRunAt(task, lastRunAt, now)` — pure timestamp computation.
  *   - `startScheduler(deps)` — installs the tick loop; returns `{ stop }`.
  *   - `getScheduledContext(message)` — runner-side helper to recover task
  *     metadata off a message that flowed through the queue.
@@ -109,6 +112,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Update } from "@grammyjs/types";
+import { CronExpressionParser } from "cron-parser";
 import type { DefaultEngine } from "./config.ts";
 import type { SolracDb } from "./db.ts";
 import { log } from "./log.ts";
@@ -122,8 +126,7 @@ import type { BotCommand } from "./telegram.ts";
 export type TaskEngine = "primary" | "secondary" | "ollama";
 
 export type ScheduleSpec =
-  | { kind: "every"; ms: number }
-  | { kind: "daily_at"; hourUtc: number; minuteUtc: number }
+  | { kind: "cron"; expr: string }
   | { kind: "at"; atMs: number };
 
 export interface Task {
@@ -133,6 +136,10 @@ export interface Task {
   readonly chatId: number | null;
   readonly engine: TaskEngine;
   readonly spec: ScheduleSpec;
+  // Resolved at parse time; never null. For `at` tasks this is informational
+  // only (the timestamp is absolute); for `cron` tasks it governs which
+  // wall-clock the expression evaluates against.
+  readonly tz: string;
   readonly catchUp: boolean;
   readonly enabled: boolean;
   readonly maxCostUsd: number | null;
@@ -253,58 +260,81 @@ function parseFrontmatter(yaml: string): RawFrontmatter {
 }
 
 // ---------------------------------------------------------------------------
-// Schedule grammar parser
+// Schedule grammar parser — 5-field unix cron OR ISO8601 `at`
 // ---------------------------------------------------------------------------
 
-const DURATION_UNIT_MS: Record<string, number> = {
-  s: 1_000,
-  m: 60_000,
-  h: 3_600_000,
-  d: 86_400_000,
-};
-
-export function parseScheduleSpec(raw: string): ScheduleSpec {
+/**
+ * Validate a 5-field cron expression and the tz it'll be evaluated under.
+ * Returns the normalized expression on success; throws with a contextual
+ * error on failure. cron-parser is permissive (accepts 4-field, 6-field,
+ * empty string, `@daily`/`@hourly`); we pre-validate at our layer for
+ * tighter semantics and clearer error messages.
+ */
+export function validateCronExpr(raw: string, tz: string): string {
   const v = raw.trim();
-  if (v === "") throw new Error('schedule must be one of "every <dur>", "daily_at HH:MM", "at <ISO8601>"');
-
-  // every <N><unit>
-  const everyMatch = /^every\s+(\d+)\s*([smhd])$/i.exec(v);
-  if (everyMatch) {
-    const n = Number(everyMatch[1]);
-    const unit = everyMatch[2]!.toLowerCase();
-    if (!Number.isInteger(n) || n <= 0) {
-      throw new Error(`every: duration must be a positive integer (got "${raw}")`);
-    }
-    const ms = n * DURATION_UNIT_MS[unit]!;
-    return { kind: "every", ms };
+  if (v === "") {
+    throw new Error('cron: expression is empty (use a 5-field expression like "*/30 12-18 * * 1-5")');
   }
-
-  // daily_at HH:MM
-  const dailyMatch = /^daily_at\s+(\d{1,2}):(\d{2})$/i.exec(v);
-  if (dailyMatch) {
-    const h = Number(dailyMatch[1]);
-    const m = Number(dailyMatch[2]);
-    if (h < 0 || h > 23) throw new Error(`daily_at: hour out of range (got ${h})`);
-    if (m < 0 || m > 59) throw new Error(`daily_at: minute out of range (got ${m})`);
-    return { kind: "daily_at", hourUtc: h, minuteUtc: m };
+  if (v.startsWith("@")) {
+    throw new Error(
+      `cron: predefined aliases like "${v}" are not supported. Use the 5-field equivalent ` +
+        `(e.g., @daily → "0 0 * * *", @hourly → "0 * * * *")`,
+    );
   }
-
-  // at <ISO8601>
-  const atMatch = /^at\s+(.+)$/i.exec(v);
-  if (atMatch) {
-    const isoStr = atMatch[1]!.trim();
-    // Reject timezone-naive strings: must end with `Z` or `+HH:MM`/`-HH:MM`.
-    if (!/(Z|[+\-]\d{2}:\d{2})$/.test(isoStr)) {
-      throw new Error(`at: timezone-naive timestamp rejected (got "${isoStr}"); use a Z suffix or explicit offset`);
-    }
-    const atMs = Date.parse(isoStr);
-    if (!Number.isFinite(atMs)) {
-      throw new Error(`at: not a valid ISO8601 timestamp (got "${isoStr}")`);
-    }
-    return { kind: "at", atMs };
+  const fieldCount = v.split(/\s+/).length;
+  if (fieldCount !== 5) {
+    throw new Error(
+      `cron: expected exactly 5 fields (minute hour day-of-month month day-of-week), got ${fieldCount} in "${v}"`,
+    );
   }
+  try {
+    CronExpressionParser.parse(v, { tz });
+  } catch (err) {
+    throw new Error(`cron: invalid expression "${v}" (tz=${tz}): ${(err as Error).message}`);
+  }
+  return v;
+}
 
-  throw new Error(`schedule: unrecognized form "${raw}" (expected "every <dur>", "daily_at HH:MM", or "at <ISO8601>")`);
+/** Parse an ISO8601 absolute timestamp; reject tz-naive strings. */
+function parseAtField(raw: string): number {
+  const isoStr = raw.trim();
+  if (!/(Z|[+\-]\d{2}:\d{2})$/.test(isoStr)) {
+    throw new Error(
+      `at: timezone-naive timestamp rejected (got "${isoStr}"); use a Z suffix or explicit offset`,
+    );
+  }
+  const atMs = Date.parse(isoStr);
+  if (!Number.isFinite(atMs)) {
+    throw new Error(`at: not a valid ISO8601 timestamp (got "${isoStr}")`);
+  }
+  return atMs;
+}
+
+/**
+ * Validate an IANA timezone name (e.g., "America/Denver", "UTC"). Uses the
+ * platform's tz database via `Intl.DateTimeFormat` — produces a clean error
+ * before cron-parser would emit a cryptic "CronDate: unhandled timestamp".
+ */
+function validateTz(tz: string): void {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+  } catch {
+    throw new Error(`tz: invalid IANA timezone "${tz}"`);
+  }
+}
+
+/** Resolve the host's local IANA timezone (explicit env > runtime default). */
+function resolveHostTz(): string {
+  const envTz = process.env.TZ;
+  if (envTz && envTz.trim() !== "") {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: envTz });
+      return envTz;
+    } catch {
+      // fall through to runtime default
+    }
+  }
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,41 +347,40 @@ export function parseScheduleSpec(raw: string): ScheduleSpec {
  * tick driver (which compares to `now`) and tests.
  *
  * Semantics:
- *   - `every`: returns `(lastRunAt ?? 0) + ms`. When `lastRunAt` is null
- *     the value is just `ms` ms after epoch — effectively "fire on first
- *     tick" (the tick compares due ≤ now). The tick caller decides whether
- *     catch-up is allowed.
- *   - `daily_at`: returns today's anchor if `lastRunAt < today's anchor`,
- *     otherwise tomorrow's anchor. "Today" computed in UTC.
+ *   - `cron`: returns `iter.next()` anchored at `lastRunAt ?? bootMs ?? now`.
+ *     When `lastRunAt` is set, the anchor is the previous fire — `iter.next()`
+ *     returns the next cron tick after that. When `lastRunAt` is null and a
+ *     stable `bootMs` is provided, the anchor is boot time — `iter.next()`
+ *     returns the first cron tick AFTER boot, which stays fixed across
+ *     subsequent ticks so the driver can detect `due ≤ now` and fire. When
+ *     both are null, the anchor falls back to `now` (display-time queries
+ *     from `commands.ts::formatNextFire` use this path — they want "next
+ *     fire from this moment").
  *   - `at`: returns `atMs` while `lastRunAt === null`; returns `null` once
  *     the task has fired (one-off).
+ *
+ * The `bootMs` parameter is what makes scheduled fires actually happen for
+ * never-run cron tasks: without it, anchoring on the moving `now` produces a
+ * `due` that advances with every tick and never crosses `due ≤ now`. The
+ * tick driver passes the process boot time; display callers omit it.
  */
 export function nextRunAt(
-  spec: ScheduleSpec,
+  task: Pick<Task, "spec" | "tz">,
   lastRunAt: number | null,
   now: number,
+  bootMs?: number,
 ): number | null {
-  if (spec.kind === "at") {
+  if (task.spec.kind === "at") {
     if (lastRunAt !== null) return null;
-    return spec.atMs;
+    return task.spec.atMs;
   }
-  if (spec.kind === "every") {
-    if (lastRunAt === null) return now;
-    return lastRunAt + spec.ms;
-  }
-  // daily_at
-  const d = new Date(now);
-  const todayAnchor = Date.UTC(
-    d.getUTCFullYear(),
-    d.getUTCMonth(),
-    d.getUTCDate(),
-    spec.hourUtc,
-    spec.minuteUtc,
-  );
-  if (lastRunAt === null || lastRunAt < todayAnchor) {
-    return todayAnchor;
-  }
-  return todayAnchor + 86_400_000;
+  // cron
+  const anchorMs = lastRunAt ?? bootMs ?? now;
+  const iter = CronExpressionParser.parse(task.spec.expr, {
+    tz: task.tz,
+    currentDate: new Date(anchorMs),
+  });
+  return iter.next().getTime();
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +390,9 @@ export function nextRunAt(
 const ALLOWED_KEYS = new Set([
   "name",
   "description",
-  "schedule",
+  "cron",
+  "at",
+  "tz",
   "chat_id",
   "engine",
   "catch_up",
@@ -428,16 +459,58 @@ export function parseTaskFile(
     throw new Error(`${sourcePath}: "description" must be ≤${MAX_DESCRIPTION_LEN} chars (got ${descVal.length})`);
   }
 
-  // schedule
-  const scheduleVal = f.schedule;
-  if (typeof scheduleVal !== "string" || scheduleVal.trim() === "") {
-    throw new Error(`${sourcePath}: "schedule" is required (e.g., "every 1h", "daily_at 09:00", "at 2026-05-15T13:00:00Z")`);
+  // tz — explicit > $TZ > runtime default. Resolved BEFORE cron validation
+  // so the parser sees the same tz the runtime will use.
+  let tz: string;
+  if ("tz" in f) {
+    const v = f.tz;
+    if (typeof v !== "string" || v.trim() === "") {
+      throw new Error(`${sourcePath}: "tz" must be a non-empty IANA timezone string`);
+    }
+    try {
+      validateTz(v);
+    } catch (err) {
+      throw new Error(`${sourcePath}: ${(err as Error).message}`);
+    }
+    tz = v;
+  } else {
+    tz = resolveHostTz();
+  }
+
+  // cron / at — exactly one required.
+  const hasCron = "cron" in f;
+  const hasAt = "at" in f;
+  if (hasCron && hasAt) {
+    throw new Error(`${sourcePath}: "cron" and "at" are mutually exclusive — pick one`);
+  }
+  if (!hasCron && !hasAt) {
+    throw new Error(
+      `${sourcePath}: one of "cron: <5-field expr>" or "at: <ISO8601>" is required`,
+    );
   }
   let spec: ScheduleSpec;
-  try {
-    spec = parseScheduleSpec(scheduleVal);
-  } catch (err) {
-    throw new Error(`${sourcePath}: ${(err as Error).message}`);
+  if (hasCron) {
+    const v = f.cron;
+    if (typeof v !== "string" || v.trim() === "") {
+      throw new Error(`${sourcePath}: "cron" must be a non-empty 5-field expression`);
+    }
+    try {
+      const expr = validateCronExpr(v, tz);
+      spec = { kind: "cron", expr };
+    } catch (err) {
+      throw new Error(`${sourcePath}: ${(err as Error).message}`);
+    }
+  } else {
+    const v = f.at;
+    if (typeof v !== "string" || v.trim() === "") {
+      throw new Error(`${sourcePath}: "at" must be a non-empty ISO8601 timestamp`);
+    }
+    try {
+      const atMs = parseAtField(v);
+      spec = { kind: "at", atMs };
+    } catch (err) {
+      throw new Error(`${sourcePath}: ${(err as Error).message}`);
+    }
   }
 
   // engine — defaults to deploy default. When explicit `ollama`, refuse if
@@ -457,13 +530,27 @@ export function parseTaskFile(
     engine = engineVal;
   }
 
-  // Enforce minimum interval for `every` based on the engine cost profile.
-  if (spec.kind === "every") {
+  // Min-interval guard for cron tasks. Inspect the first 5 fire times after
+  // a fixed anchor; reject if any consecutive gap < tier floor. Rejects
+  // pathological `* * * * *` on Claude tiers at load time with a clear error.
+  // `at` tasks are one-off; no interval to police.
+  if (spec.kind === "cron") {
     const minMs = engine === "ollama" ? MIN_OLLAMA_INTERVAL_MS : MIN_CLAUDE_INTERVAL_MS;
-    if (spec.ms < minMs) {
-      throw new Error(
-        `${sourcePath}: "every" interval too short for engine=${engine} (got ${spec.ms}ms, minimum ${minMs}ms)`,
-      );
+    const iter = CronExpressionParser.parse(spec.expr, {
+      tz,
+      currentDate: new Date(0),
+    });
+    let prev = iter.next().getTime();
+    for (let i = 0; i < 5; i++) {
+      const cur = iter.next().getTime();
+      const gap = cur - prev;
+      if (gap < minMs) {
+        throw new Error(
+          `${sourcePath}: cron interval too tight for engine=${engine} ` +
+            `(gap ${gap}ms < min ${minMs}ms in expression "${spec.expr}")`,
+        );
+      }
+      prev = cur;
     }
   }
 
@@ -526,6 +613,7 @@ export function parseTaskFile(
     chatId,
     engine,
     spec,
+    tz,
     catchUp,
     enabled,
     maxCostUsd,
@@ -726,6 +814,12 @@ interface TaskRuntime {
   // Set on boot for catch-up tasks with jitter > 0; after consumption
   // (the boot-fire actually happens), reset to null.
   bootFireAt: number | null;
+  // Process boot time. Used as the stable anchor for never-run cron tasks
+  // so the tick driver can detect `due ≤ now` once the wall clock crosses
+  // the first cron tick after boot. Without this, `nextRunAt(task, null,
+  // now)` would re-anchor on the moving `now` every tick and `due` would
+  // always be in the future.
+  bootAnchor: number;
 }
 
 export function startScheduler(deps: SchedulerDeps): SchedulerHandle {
@@ -748,17 +842,17 @@ export function startScheduler(deps: SchedulerDeps): SchedulerHandle {
       sourceHash: t.sourceHash,
     });
     if (!t.enabled) {
-      runtimes.set(t.name, { task: t, bootFireAt: null });
+      runtimes.set(t.name, { task: t, bootFireAt: null, bootAnchor: bootNow });
       continue;
     }
     const state = deps.db.getTaskState(t.name);
     if (state?.oneOffConsumed) {
-      runtimes.set(t.name, { task: t, bootFireAt: null });
+      runtimes.set(t.name, { task: t, bootFireAt: null, bootAnchor: bootNow });
       continue;
     }
-    const due = nextRunAt(t.spec, state?.lastRunAt ?? null, bootNow);
+    const due = nextRunAt(t, state?.lastRunAt ?? null, bootNow, bootNow);
     if (due === null) {
-      runtimes.set(t.name, { task: t, bootFireAt: null });
+      runtimes.set(t.name, { task: t, bootFireAt: null, bootAnchor: bootNow });
       continue;
     }
     const wouldFireOnBoot = due <= bootNow;
@@ -775,7 +869,7 @@ export function startScheduler(deps: SchedulerDeps): SchedulerHandle {
       } else {
         deps.db.setTaskLastRunOnly(t.name, bootNow);
       }
-      runtimes.set(t.name, { task: t, bootFireAt: null });
+      runtimes.set(t.name, { task: t, bootFireAt: null, bootAnchor: bootNow });
       continue;
     }
     let bootFireAt: number | null = null;
@@ -783,7 +877,7 @@ export function startScheduler(deps: SchedulerDeps): SchedulerHandle {
       const jitterMs = Math.floor(random() * t.bootCatchUpJitterS * 1000);
       bootFireAt = bootNow + jitterMs;
     }
-    runtimes.set(t.name, { task: t, bootFireAt });
+    runtimes.set(t.name, { task: t, bootFireAt, bootAnchor: bootNow });
   }
 
   function fireTask(rt: TaskRuntime, fireAt: number): void {
@@ -918,7 +1012,7 @@ export function startScheduler(deps: SchedulerDeps): SchedulerHandle {
         continue;
       }
 
-      const due = nextRunAt(rt.task.spec, state?.lastRunAt ?? null, t);
+      const due = nextRunAt(rt.task, state?.lastRunAt ?? null, t, rt.bootAnchor);
       if (due === null) continue;
       if (t < due) continue;
       fireTask(rt, t);

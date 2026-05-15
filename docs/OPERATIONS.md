@@ -77,6 +77,17 @@ ReadWritePaths=/opt/solrac/data
 - `TimeoutStopSec=90` — pairs with lifecycle's 60s drain budget; 30s of slack before SIGKILL.
 - `ReadWritePaths` — sqlite + WAL + PID file + workspaces all live under `data/`. Everything else is read-only or denied via `ProtectSystem=strict`.
 
+### Pin the scheduler timezone
+
+If you use scheduled tasks with `cron:` expressions that omit `tz:`, the scheduler falls back to `$TZ` (env) and then to the host's runtime tz. Production hosts often have `TZ` unset (or `UTC`) — pin it explicitly in the unit so the scheduler's clock matches your intent across reboots and host migrations:
+
+```ini
+[Service]
+Environment=TZ=America/Denver
+```
+
+Per-task `tz:` in `TASK.md` always wins over `$TZ`, so this only affects tasks that opt to inherit. Setting it also fixes the timezone-naive output of `date` and other shell tools in skill/task bodies that read the wall clock.
+
 ### Customizing paths
 
 The unit assumes:

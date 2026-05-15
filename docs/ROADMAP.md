@@ -332,7 +332,7 @@ Two distinct axes — kept separate because they have different cost-exposure sh
 
 **Status:** Shipped (Phase 1 + Phase 2). See `src/scheduler.ts` and [USAGE.md#scheduled-tasks](./USAGE.md#scheduled-tasks).
 
-Operator-authored `TASK.md` files under `$SOLRAC_TASKS_DIR/<name>/` fire on a per-task schedule (`every <dur>`, `daily_at HH:MM`, `at <ISO8601>`). Fires synthesize updates through the existing turn queue, so cost caps + allowlist + policy hooks all apply automatically. `/tasks` lists loaded tasks; `/tasks run <name>` manual-triggers. Cron expressions, timezones, and audit-only (no Telegram output) modes deferred to Phase 3.
+Operator-authored `TASK.md` files under `$SOLRAC_TASKS_DIR/<name>/` fire on a per-task schedule (5-field unix `cron:` or absolute `at:`, with optional `tz:`). Fires synthesize updates through the existing turn queue, so cost caps + allowlist + policy hooks all apply automatically. `/tasks` lists loaded tasks; `/tasks run <name>` manual-triggers. Cron grammar + tz landed in v0.5.0 (replacing the prior `every`/`daily_at` shape); multi-trigger fanout and conditional-skip modes deferred.
 
 ---
 
