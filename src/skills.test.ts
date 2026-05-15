@@ -514,6 +514,56 @@ Body.`;
 });
 
 // ---------------------------------------------------------------------------
+// parseSkillFile — auto_allow field
+// ---------------------------------------------------------------------------
+
+describe("parseSkillFile — auto_allow field", () => {
+  test("defaults to false when omitted", () => {
+    const c = `---
+name: example
+description: x
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED);
+    expect(skill.autoAllow).toBe(false);
+  });
+
+  test("accepts true", () => {
+    const c = `---
+name: example
+description: x
+auto_allow: true
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED);
+    expect(skill.autoAllow).toBe(true);
+  });
+
+  test("accepts false explicitly", () => {
+    const c = `---
+name: example
+description: x
+auto_allow: false
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED);
+    expect(skill.autoAllow).toBe(false);
+  });
+
+  test("rejects non-boolean", () => {
+    const c = `---
+name: example
+description: x
+auto_allow: "yes"
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(
+      /"auto_allow" must be a boolean/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parseSkillFile — tier inheritance from defaultTier
 // ---------------------------------------------------------------------------
 
@@ -799,6 +849,7 @@ describe("skillsToBotCommands", () => {
       tool: false,
       maxTurns: 1,
       requires: [] as ReadonlyArray<string>,
+      autoAllow: false,
     });
   }
 

@@ -343,6 +343,7 @@ tier: primary             # optional, primary|secondary|ollama, default = SOLRAC
 max_turns: 1              # optional, integer in [1,10], default 1. Model-turn budget for the skill body. Pure text-transforms want 1; agentic skills that chain tool calls (e.g. `notion_search` → `notion_create_page`) need headroom. Doubles as `maxIterations` for the Ollama tool loop.
 tool: false               # optional, default false. When true, also expose this skill as a callable MCP tool to the Ollama agent (Phase 1: requires tier: ollama).
 requires: notion          # optional, integration deps. Bare string OR array (`requires: [notion, gmail]`). When any name is missing from the loaded integrations at boot, the skill is skipped with a `skills.load_error` warn — it never appears in `/help` or Telegram autocomplete. Omit for unconditional load.
+auto_allow: false         # optional, default false. When true, every `confirm`-tier tool the skill body calls bypasses the Telegram prompt and runs directly. The skill's purpose IS the operation (e.g. `/log` → Notion write) — re-prompting on every call hurts UX. Loop detector, hard-deny classifier, and cost cap still apply.
 ---
 You are a concise summarizer. Produce exactly 3 bullets, no preamble.
 
@@ -350,7 +351,7 @@ Input:
 {{args}}
 ```
 
-Two required fields (`name`, `description`), four optional (`tier`, `max_turns`, `tool`, `requires`), plus a body. The body is a prompt template — `{{args}}` is the only placeholder and gets replaced with whatever the user typed after the command (e.g. `/summarize <text>` → `args = "<text>"`). The substitution is literal text-for-text; no escaping, no nested templating.
+Two required fields (`name`, `description`), five optional (`tier`, `max_turns`, `tool`, `requires`, `auto_allow`), plus a body. The body is a prompt template — `{{args}}` is the only placeholder and gets replaced with whatever the user typed after the command (e.g. `/summarize <text>` → `args = "<text>"`). The substitution is literal text-for-text; no escaping, no nested templating.
 
 The frontmatter parser supports a YAML *subset*: `key: scalar`, `key: [a, b, c]` string arrays, single- or double-quoted strings, integers, booleans. Multi-line strings, anchors, and nested maps are NOT supported and produce a clear error pointing at the offending line.
 
@@ -361,7 +362,7 @@ Skills run with the full tool surface their tier provides, bounded by `max_turns
 - **Claude tiers (`primary` / `secondary`)** — the body sees the same Claude Code tool preset a normal turn does (`Bash`, `Read`, `Edit`, `Write`, `WebFetch`, `WebSearch`, plus every `mcp__solrac__*` integration tool). `Agent` and `Task` stay denied at the SDK + policy layers — no sub-agents from inside a skill.
 - **Ollama tier** — when the deploy has integrations + Ollama tools enabled, the body routes through the same `runToolLoop` driver as a regular Ollama turn and sees the full MCP catalog (minus its own `skills__<self>` entry — see "Skills as tools" below). Without integrations / tools, the path falls back to a single-shot `/api/chat` round trip.
 
-Every tool call (both tiers) flows through the same three-tier policy (auto-allow / auto-deny / Telegram-confirm), the same `PreToolUse` cost-cap + loop-detector hooks, and the same `canUseTool` interactive confirm UX as a normal turn. A skill body that calls `Bash(rm -rf /)` gets denied identically — there's no skill-specific bypass.
+Every tool call (both tiers) flows through the same three-tier policy (auto-allow / auto-deny / Telegram-confirm), the same `PreToolUse` cost-cap + loop-detector hooks, and the same `canUseTool` interactive confirm UX as a normal turn. A skill body that calls `Bash(rm -rf /)` gets denied identically — there's no skill-specific bypass *except* `auto_allow: true`, which suppresses ONLY the interactive Telegram-confirm prompt (the loop detector, hard-deny classifier, and cost cap all still gate). Reach for `auto_allow` on skills whose entire purpose is a known operation — `/log` writing to Notion, an Ollama-tier skill appending to a Google Drive doc — where re-prompting on every call costs more than it protects.
 
 `max_turns` is the per-skill model-turn budget. A pure text-transform (summarize, translate) wants `max_turns: 1`. An agentic skill that chains tool calls (e.g. `/log` doing `notion_search` → `notion_create_page` → return URL) needs a few more; the bound caps runaway behavior the same way the SDK's `maxTurns` does for a regular turn. Hard ceiling is 10; the cost cap is the ultimate backstop on Claude tiers, `OLLAMA_MAX_TOOL_ITERATIONS` on Ollama.
 

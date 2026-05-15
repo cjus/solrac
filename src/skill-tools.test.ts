@@ -86,6 +86,7 @@ function fakeSkill(overrides: Partial<Skill> = {}): Skill {
     tool: true,
     maxTurns: 1,
     requires: [] as ReadonlyArray<string>,
+    autoAllow: false,
     ...overrides,
   });
 }

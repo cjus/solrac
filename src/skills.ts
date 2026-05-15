@@ -106,6 +106,12 @@ export interface Skill {
   // (unconditional load). Frontmatter key: `requires`; accepts a bare string
   // or a string array.
   readonly requires: ReadonlyArray<string>;
+  // When true, every `confirm`-tier tool the skill body calls is auto-allowed
+  // without prompting the operator. Trades safety for ergonomics — appropriate
+  // for skills whose entire purpose IS a known write (e.g. /log → notion).
+  // Loop detector + hard-deny classifier still apply; cost cap still applies.
+  // Frontmatter key: `auto_allow`. Default false.
+  readonly autoAllow: boolean;
 }
 
 export interface SkillLoadError {
@@ -360,13 +366,34 @@ export function parseSkillFile(
     requires = Object.freeze([...list]);
   }
 
+  // auto_allow — opt-in flag that auto-allows every confirm-tier tool the
+  // skill body calls. The skill's purpose IS the operation, so re-prompting on
+  // every call hurts UX. Loop detector + hard-deny classifier + cost cap still
+  // apply; only the interactive Telegram-confirm is bypassed.
+  let autoAllow = false;
+  if ("auto_allow" in f) {
+    const v = f.auto_allow;
+    if (typeof v !== "boolean") {
+      throw new Error(`${sourcePath}: "auto_allow" must be a boolean (got "${String(v)}")`);
+    }
+    autoAllow = v;
+  }
+
   // body
   if (body.trim() === "") {
     throw new Error(`${sourcePath}: body must be non-empty (no prompt template)`);
   }
 
   // Reject unknown keys so typos don't silently skip.
-  const ALLOWED = new Set(["name", "description", "tier", "tool", "max_turns", "requires"]);
+  const ALLOWED = new Set([
+    "name",
+    "description",
+    "tier",
+    "tool",
+    "max_turns",
+    "requires",
+    "auto_allow",
+  ]);
   for (const k of Object.keys(f)) {
     if (!ALLOWED.has(k)) {
       throw new Error(
@@ -384,6 +411,7 @@ export function parseSkillFile(
     tool: toolFlag,
     maxTurns,
     requires,
+    autoAllow,
   });
 }
 
