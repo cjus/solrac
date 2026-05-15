@@ -340,7 +340,9 @@ The directory path comes from `SOLRAC_SKILLS_DIR` (default `./skills`, resolved 
 name: summarize           # required, [a-z0-9_]{1,32}, must not collide with built-in commands
 description: Summarize the URL or pasted text in 3 bullets.   # required, ≤256 chars
 tier: primary             # optional, primary|secondary|ollama, default = SOLRAC_DEFAULT_ENGINE
+max_turns: 1              # optional, integer in [1,10], default 1. Model-turn budget for the skill body. Pure text-transforms want 1; agentic skills that chain tool calls (e.g. `notion_search` → `notion_create_page`) need headroom. Doubles as `maxIterations` for the Ollama tool loop.
 tool: false               # optional, default false. When true, also expose this skill as a callable MCP tool to the Ollama agent (Phase 1: requires tier: ollama).
+requires: notion          # optional, integration deps. Bare string OR array (`requires: [notion, gmail]`). When any name is missing from the loaded integrations at boot, the skill is skipped with a `skills.load_error` warn — it never appears in `/help` or Telegram autocomplete. Omit for unconditional load.
 ---
 You are a concise summarizer. Produce exactly 3 bullets, no preamble.
 
@@ -348,29 +350,34 @@ Input:
 {{args}}
 ```
 
-Three frontmatter fields, plus a body. The body is a Claude prompt — `{{args}}` is the only placeholder and gets replaced with whatever the user typed after the command (e.g. `/summarize <text>` → `args = "<text>"`). The substitution is literal text-for-text; no escaping, no nested templating.
+Two required fields (`name`, `description`), four optional (`tier`, `max_turns`, `tool`, `requires`), plus a body. The body is a prompt template — `{{args}}` is the only placeholder and gets replaced with whatever the user typed after the command (e.g. `/summarize <text>` → `args = "<text>"`). The substitution is literal text-for-text; no escaping, no nested templating.
 
 The frontmatter parser supports a YAML *subset*: `key: scalar`, `key: [a, b, c]` string arrays, single- or double-quoted strings, integers, booleans. Multi-line strings, anchors, and nested maps are NOT supported and produce a clear error pointing at the offending line.
 
 ### What skills can do
 
-Skills are tool-less in v1 — `Bash`, `Edit`, `Write`, `WebFetch`, `WebSearch`, `Agent`, `Task`, and `NotebookEdit` are explicitly disallowed; `canUseTool` denies everything else by default. Skills run a single Claude turn (`maxTurns: 1`, no `resume`) and reply with the model's text output verbatim (HTML-escaped).
+Skills run with the full tool surface their tier provides, bounded by `max_turns` (default 1):
 
-This means skills are best for:
+- **Claude tiers (`primary` / `secondary`)** — the body sees the same Claude Code tool preset a normal turn does (`Bash`, `Read`, `Edit`, `Write`, `WebFetch`, `WebSearch`, plus every `mcp__solrac__*` integration tool). `Agent` and `Task` stay denied at the SDK + policy layers — no sub-agents from inside a skill.
+- **Ollama tier** — when the deploy has integrations + Ollama tools enabled, the body routes through the same `runToolLoop` driver as a regular Ollama turn and sees the full MCP catalog (minus its own `skills__<self>` entry — see "Skills as tools" below). Without integrations / tools, the path falls back to a single-shot `/api/chat` round trip.
 
-- **Text transformations** (summarize, translate, rephrase, format).
+Every tool call (both tiers) flows through the same three-tier policy (auto-allow / auto-deny / Telegram-confirm), the same `PreToolUse` cost-cap + loop-detector hooks, and the same `canUseTool` interactive confirm UX as a normal turn. A skill body that calls `Bash(rm -rf /)` gets denied identically — there's no skill-specific bypass.
+
+`max_turns` is the per-skill model-turn budget. A pure text-transform (summarize, translate) wants `max_turns: 1`. An agentic skill that chains tool calls (e.g. `/log` doing `notion_search` → `notion_create_page` → return URL) needs a few more; the bound caps runaway behavior the same way the SDK's `maxTurns` does for a regular turn. Hard ceiling is 10; the cost cap is the ultimate backstop on Claude tiers, `OLLAMA_MAX_TOOL_ITERATIONS` on Ollama.
+
+This means skills are good for:
+
+- **Text transformations** (summarize, translate, rephrase, format) — `max_turns: 1`, no `requires:`.
+- **Integration-backed actions** (append a Notion row, send a Gmail draft, fetch a URL and summarize) — `max_turns: 3–5`, `requires: notion` (or whatever).
 - **Templated prompts** the operator wants to invoke quickly without retyping.
-- **Quick lookups** that don't require fetching anything (Claude's training data only).
-
-If you need tool use, file an issue — that's a v1.1 conversation.
 
 **Tier inherits the deploy default.** When `tier:` is omitted, the skill runs on whatever `SOLRAC_DEFAULT_ENGINE` resolves to (`ollama`, `primary`, or `secondary`). Override per-skill with an explicit `tier:` value. `tier: ollama` is rejected at load if `SOLRAC_DEFAULT_ENGINE != ollama` (PR-B removed the `>` prefix; Ollama is reachable only as the deploy default).
 
 ### Cost & caps
 
-A Claude-tier skill (`primary` or `secondary`) costs a real Claude turn. The audit row is tagged `claude:<tier>:<model>:skill:<name>` so cost rolls up under the existing per-chat hourly cap (`HOURLY_COST_CAP_USD`) and the global cap. The pre-flight cap check fires *before* the SDK call — a cap-rejected skill costs $0.
+A Claude-tier skill (`primary` or `secondary`) costs real Claude turns — up to `skill.maxTurns` of them. The audit row is tagged `claude:<tier>:<model>:skill:<name>` so cost rolls up under the existing per-chat hourly cap (`HOURLY_COST_CAP_USD`) and the global cap. The pre-flight cap check fires *before* the SDK call — a cap-rejected skill costs $0. Mid-turn cap exhaustion is caught by the `PreToolUse` hook (same path as a normal turn) and stamped into the audit row as `policy_deny:cost_cap_exceeded: …`.
 
-An Ollama-tier skill is free. The audit row is tagged `ollama:<model>:skill:<name>` with `cost_usd = 0`; the per-chat hourly cap pre-flight is skipped (a chat throttled by Claude burn shouldn't lose access to local inference). Ollama skills run a single non-streaming `/api/chat` round trip — no history, no SOLRAC.md overlay, no tool loop, no streaming stub. Tool use is unavailable on this path even if `OLLAMA_TOOLS_ENABLED=true`; skills are tool-less by design across both engines.
+An Ollama-tier skill is free. The audit row is tagged `ollama:<model>:skill:<name>` with `cost_usd = 0`; the per-chat hourly cap pre-flight is skipped (a chat throttled by Claude burn shouldn't lose access to local inference). When integrations + Ollama tools are enabled the skill body routes through the same `runToolLoop` a regular Ollama turn uses, capped at `skill.maxTurns` iterations and constrained by the shared loop detector. Without those wired (e.g. `OLLAMA_TOOLS_ENABLED=false` or no integrations loaded), the body falls back to a single non-streaming `/api/chat` round trip — no history, no SOLRAC.md overlay, no tool loop, no streaming stub. Either way, no Claude burn.
 
 ### Failure modes
 
@@ -379,6 +386,7 @@ An Ollama-tier skill is free. The audit row is tagged `ollama:<model>:skill:<nam
 - **Two skills declare the same `name`**: first-wins (filesystem sort order). Second is dropped with a warn.
 - **Skills directory doesn't exist** with `SOLRAC_SKILLS_ENABLED=true`: warn line, empty registry, boot continues.
 - **Empty body after frontmatter**: rejected (no prompt to send).
+- **`requires:` names an unloaded integration**: skill is skipped at boot with a `skills.load_error` warn line naming the missing integration(s). Skipped skills are absent from `/help` and Telegram autocomplete entirely — there's no use-time failure to confuse the user.
 
 ### Example: `briefly`
 
@@ -413,7 +421,7 @@ Phase 1 restrictions (locked-in):
 - **`tool: true` requires `tier: ollama`.** Tool-callable skills run on the local model, free. Cross-engine tool calls (Ollama agent → Sonnet skill) are deferred to Phase 2 to avoid cost surprises.
 - **Skill tools are exposed only to the Ollama agent.** The Claude SDK's tool catalog is untouched — Claude tiers can't yet call skills as tools.
 - **Tools are auto-allow.** No Telegram-confirm prompt before each call. Cost cap is the backstop (Phase 1 ollama skills are free anyway).
-- **Skills remain tool-less themselves.** The skill body cannot call other tools — recursion is structurally impossible. A test (`skill-tools.test.ts`) asserts the outgoing fetch body has no `tools` field; a regression breaks CI.
+- **Skills can call other skills (and any other MCP tool), but never themselves directly.** The skill's own `skills__<self>` entry is filtered out of the catalog the body sees, so direct recursion (`/foo` → `skills__foo`) is structurally impossible. Indirect cycles (A → `skills__B` → `skills__A`) are bounded by `skill.maxTurns` plus the shared loop detector (third identical `(tool, input)` in a turn → deny). A test (`skill-tools.test.ts`) asserts the self-filter; a regression breaks CI.
 
 Audit visibility: every tool-called skill writes its own `audit` row tagged `origin='tool_call'` and `model='ollama:<model>:skill:<name>'`. Operator-typed `/<skill>` invocations stay tagged `origin='user'`, so the two surfaces are distinguishable in the audit log:
 
@@ -423,7 +431,7 @@ sqlite3 data/solrac.sqlite "SELECT started_at, origin, model, status FROM audit 
 
 Description quality matters: the model's natural-language → tool routing depends entirely on `skill.description`. Bad descriptions → wrong tool fires or misses. Write descriptions as if you're describing a tool to a model.
 
-Latency: a tool-called skill is one extra `/api/chat` round trip mid-loop. With `OLLAMA_MAX_TOOL_ITERATIONS=8` and `OLLAMA_TIMEOUT_MS=60000`, two skill calls per turn is roughly the practical ceiling on a busy turn before timeout risk.
+Latency: a tool-called skill costs at least one extra `/api/chat` round trip mid-loop, and more if the skill body itself loops over tools (bounded by `skill.maxTurns`). With `OLLAMA_MAX_TOOL_ITERATIONS=8` and `OLLAMA_TIMEOUT_MS=60000`, two skill calls per turn is roughly the practical ceiling on a busy turn before timeout risk; setting a generous `max_turns` on the skill multiplies that. Use `max_turns: 1` for fire-and-return skills (text transforms); bump it only when the skill genuinely needs to chain calls.
 
 Example: `skills/tldr/SKILL.md` ships with `tool: true`. Type `summarize this: <long text>` to your Ollama deploy and watch the audit log — you'll see two rows: the Ollama parent turn (`origin: user`, `model: ollama:<m>`) plus the skill tool call (`origin: tool_call`, `model: ollama:<m>:skill:tldr`).
 

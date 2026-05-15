@@ -60,26 +60,50 @@
  *   - policy.ts::createCostCapGuard — `/compact` pre-flight check
  */
 
-import { query, type Options } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type CanUseTool,
+  type McpSdkServerConfigWithInstance,
+  type Options,
+  type SdkMcpToolDefinition,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { Message } from "@grammyjs/types";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { sanitizedSubprocessEnv } from "./agent.ts";
+import { LOOP_THRESHOLD, sanitizedSubprocessEnv } from "./agent.ts";
 import type { Allowlist } from "./allowlist.ts";
 import type { ChatHistoryRow, SolracDb } from "./db.ts";
+import type { IntegrationTier } from "./integrations.ts";
 import { log } from "./log.ts";
 import { mdToTelegramHtml } from "./markdown.ts";
+import { buildToolCapabilityNote } from "./ollama.ts";
+import { mcpToOllamaTools, runToolLoop } from "./ollama-tools.ts";
 import {
+  createLoopDetector,
+  createPostToolUseHook,
+  createPreToolUseHook,
   truncateAuditPrompt,
+  type ConfirmationBroker,
+  type ConfirmHandle,
   type CostCapGuard,
   type GlobalCostCapGuard,
+  type PolicyDenyEvent,
 } from "./policy.ts";
 import type { SessionStore, SessionTier } from "./session.ts";
+import { skillToolCtx } from "./skill-tools.ts";
 import {
   renderSkillTemplate,
   type Skill,
   type SkillRegistry,
 } from "./skills.ts";
+
+// Mirror of `skill-tools.ts::SKILL_TOOL_PREFIX` — duplicated rather than
+// imported to keep the cyclic surface between commands.ts and skill-tools.ts
+// minimal. `skillToolCtx` (the AsyncLocalStorage instance) is imported above;
+// it's safe because the import is only dereferenced inside functions, never
+// at module load time. If you rename `SKILL_TOOL_PREFIX` in skill-tools.ts,
+// rename it here too; `skill-tools.test.ts` covers the prefix invariant.
+const SKILL_TOOL_PREFIX = "skills__";
 import {
   nextRunAt,
   type SchedulerHandle,
@@ -303,9 +327,13 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
 // ---------------------------------------------------------------------------
 
 // Subset of OllamaRunDeps the skill path needs. Skills don't reuse runOllamaTurn
-// (no history, no SOLRAC.md overlay, no streaming stub, no tool loop) — they
-// hit `/api/chat` once with stream:false and return the model's text. Only the
-// connection params + soul are required.
+// because they don't carry history or SOLRAC.md overlays and have no streaming
+// stub — but with PR-skills-tools they DO route through the same tool loop
+// (`runToolLoop`) when tool deps are wired, so the skill body can call
+// `mcp__solrac__*` / `skills__*` tools end-to-end. When tool deps are absent
+// or `tools` is empty, `runSkillBare` falls through to the single-shot
+// /api/chat path (preserving back-compat for pure text-transform skills
+// like `tldr`).
 export interface OllamaSkillDeps {
   url: string;
   model: string;
@@ -316,6 +344,15 @@ export interface OllamaSkillDeps {
   soul: string;
   // Injectable for tests; production passes `globalThis.fetch`.
   fetch?: typeof fetch;
+  // PR-skills-tools — when all three are wired, runSkillBare routes the
+  // skill body through `runToolLoop` so the model can call MCP tools the
+  // same way `runOllamaTurnWithTools` does. The skill's own MCP tool entry
+  // (`skills__<self>`) is filtered out of the catalog at dispatch time to
+  // prevent direct recursion; indirect recursion (skill A → skills__B →
+  // skills__A) is bounded by `runToolLoop`'s `maxIterations`.
+  tools?: ReadonlyArray<SdkMcpToolDefinition<any>>;
+  toolTiers?: ReadonlyMap<string, IntegrationTier>;
+  broker?: Pick<ConfirmationBroker, "request">;
 }
 
 export interface RunCommandDeps {
@@ -356,6 +393,20 @@ export interface RunCommandDeps {
   // registry is empty or absent.
   taskRegistry?: TaskRegistry;
   triggerScheduledTask?: (name: string) => TriggerNowResult;
+  // Skills-as-agents (PR-skills-tools). Optional so legacy callers / tests
+  // that don't drive tool-using skills keep working — when omitted, skill
+  // tool calls fall through to `defaultAllowAll` (no interactive UX, no
+  // confirm prompts). Production wires both, mirroring `runAgent`.
+  createCanUseTool?: (args: {
+    chatId: number;
+    auditId: number;
+    pendingHandles: Map<string, ConfirmHandle>;
+  }) => CanUseTool;
+  // In-process MCP server hosting operator + blessed integrations. Skills
+  // see the same `mcp__solrac__<name>` surface as a normal turn when this is
+  // set; `null` means integrations are disabled and skills run without an
+  // MCP catalog (built-in SDK tools like Read/Bash still apply).
+  mcpServer?: McpSdkServerConfigWithInstance | null;
 }
 
 const COMPACT_SOURCE_LIMIT = 50;
@@ -1178,21 +1229,22 @@ async function runUnknown(
 // session-id drop), and the duplication is contained. A v1.1 refactor that
 // extracts `runOneShotClaudeTurn` is fine when a third caller arrives.
 
-const SKILL_DISALLOWED_TOOLS = [
-  "Agent",
-  "Task",
-  "Bash",
-  "Write",
-  "Edit",
-  "NotebookEdit",
-  "WebFetch",
-  "WebSearch",
-];
+// Agentic skills can use the full Claude Code tool preset; sub-agents stay
+// off at the SDK layer (belt-and-suspenders with policy.ts::SUBAGENT_DENY_TOOLS).
+const SKILL_DISALLOWED_TOOLS = ["Agent", "Task"];
 
 // Cap on the model's reply text we forward to Telegram. Telegram messages cap
 // at 4096 chars; we leave headroom for formatting overhead. If the model
 // produces more, the tail is dropped with a `…` marker.
 const SKILL_REPLY_MAX = 3500;
+
+// Fallback canUseTool when `deps.createCanUseTool` is absent (tests, dev
+// harnesses). Mirrors `agent.ts::defaultAllowAll`; logged with a `skill`
+// prefix so audit-log greps can tell the surfaces apart.
+const skillDefaultAllowAll: CanUseTool = async (toolName) => {
+  log.info("skill.tool_allow_all", { toolName });
+  return { behavior: "allow" };
+};
 
 async function runSkill(
   deps: RunCommandDeps,
@@ -1238,23 +1290,70 @@ async function runSkill(
     return;
   }
 
-  // 2. Render the prompt template and run a one-shot, tool-less turn.
+  // 2. Insert audit row up-front so the PreToolUse hook (which fires
+  //    mid-turn for every tool call) has a real auditId to reference.
+  //    Mirrors runAgent's ordering — same reason.
+  const auditId = deps.db.insertAudit({
+    chatId: msg.chat.id,
+    fromId: msg.from!.id,
+    updateId,
+    prompt: truncateAuditPrompt(msg.text ?? ""),
+    startedAt,
+    model: engineModelTag,
+  });
+
+  // 3. Render the prompt template and run the skill turn with full tool
+  //    surface (was tool-less in v1 — see docs/USAGE.md#skills).
   const prompt = renderSkillTemplate(skill.body, args);
   const cwd = join(deps.dataDir, "workspaces", String(msg.chat.id));
   await mkdir(cwd, { recursive: true });
 
+  // Per-turn state for the hook trio. Same shape as runAgent (agent.ts:273-310).
+  // `loopDetector` and `pendingHandles` are created fresh per skill invocation
+  // so prior turns can't influence loop counts or stale confirm handles.
+  const loopDetector = createLoopDetector({ threshold: LOOP_THRESHOLD });
+  const pendingHandles = new Map<string, ConfirmHandle>();
+  const policyDeny: { event: PolicyDenyEvent | null } = { event: null };
+
+  const canUseTool: CanUseTool =
+    deps.createCanUseTool?.({
+      chatId: msg.chat.id,
+      auditId,
+      pendingHandles,
+    }) ?? skillDefaultAllowAll;
+
+  const preToolUseHook = createPreToolUseHook({
+    chatId: msg.chat.id,
+    getAuditId: () => auditId,
+    costGuard: deps.costGuard,
+    globalCostGuard: deps.globalCostGuard,
+    loopDetector,
+    onPolicyDeny: (event) => {
+      policyDeny.event = event;
+    },
+  });
+  const postToolUseHook = createPostToolUseHook({ pendingHandles });
+
   const options: Options = {
     cwd,
     model: modelId,
-    maxTurns: 1,
+    maxTurns: skill.maxTurns,
     permissionMode: "default",
     tools: { type: "preset", preset: "claude_code" },
+    // Belt-and-suspenders: policy.ts also denies Agent/Task; the SDK-level
+    // disallow keeps them out of the model's tool catalog entirely so the
+    // model can't try and bounce off the policy layer.
     disallowedTools: SKILL_DISALLOWED_TOOLS,
-    canUseTool: async () => ({
-      behavior: "deny",
-      message: "tools are disabled for skills in v1",
-    }),
+    canUseTool,
     env: sanitizedSubprocessEnv(),
+    ...(deps.mcpServer && {
+      mcpServers: { solrac: deps.mcpServer },
+    }),
+    hooks: {
+      PreToolUse: [{ hooks: [preToolUseHook] }],
+      PostToolUse: [{ hooks: [postToolUseHook] }],
+      PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+    },
   };
 
   let resultText = "";
@@ -1294,17 +1393,16 @@ async function runSkill(
     });
   }
 
+  // PreToolUse-hook denies (cost cap, loop) surface as a SDK turn that often
+  // looks successful (the agent recovers gracefully from a hook deny). Promote
+  // the captured policy reason into errorMessage so the audit row + reply both
+  // tell the operator what actually happened.
+  if (policyDeny.event !== null && errorMessage === null) {
+    errorMessage = `policy_deny:${policyDeny.event.reason}: ${policyDeny.event.message}`;
+  }
+
   const trimmed = resultText.trim();
   if (errorMessage === null && trimmed === "") errorMessage = "empty_response";
-
-  const auditId = deps.db.insertAudit({
-    chatId: msg.chat.id,
-    fromId: msg.from!.id,
-    updateId,
-    prompt: truncateAuditPrompt(msg.text ?? ""),
-    startedAt,
-    model: engineModelTag,
-  });
 
   if (errorMessage !== null) {
     deps.db.updateAuditEnd({
@@ -1409,16 +1507,20 @@ function writeSkillAudit(
 // this with their own audit + reply / return-string handling.
 //
 // **RECURSION SAFETY INVARIANT** — this function MUST NOT add a `tools` field
-// to the outgoing `/api/chat` body. Skills are tool-less by design; if a
-// future "smart skills" change exposes tools here, a tool-callable skill
-// would gain the ability to call itself (or another tool-callable skill)
-// → infinite recursion. The recursion-safety test in `skill-tools.test.ts`
-// asserts the request body has no `tools` key — keep both pieces in sync.
+// to the outgoing `/api/chat` body. PR-skills-tools lifts the "tool-less"
+// constraint: when `OllamaSkillDeps` is wired with `tools/toolTiers/broker`,
+// the skill body sees the full MCP catalog MINUS its own `skills__<self>`
+// entry (recursion guard). The regression test in `skill-tools.test.ts` now
+// asserts that filter — keep both in sync.
 export interface RunSkillBareResult {
   readonly text: string;
   readonly errorMessage: string | null;
   readonly inputTokens: number | null;
   readonly outputTokens: number | null;
+  // PR-skills-tools — populated when the tool-loop path runs (else empty).
+  // Mirrors `ToolLoopResult.toolCallSummaries` so callers can persist into
+  // the audit `tool_calls` column.
+  readonly toolCallSummaries: ReadonlyArray<{ name: string; input: unknown }>;
 }
 
 export async function runSkillBare(
@@ -1426,6 +1528,18 @@ export async function runSkillBare(
   skill: Skill,
   args: string,
 ): Promise<RunSkillBareResult> {
+  // PR-skills-tools dispatch. Tool surface wired → route through the tool
+  // loop so the body can call `mcp__solrac__*` / `skills__*` exactly like a
+  // regular Ollama turn. Mirrors the same gate in `runOllamaTurn`.
+  if (
+    ollama.tools !== undefined &&
+    ollama.tools.length > 0 &&
+    ollama.toolTiers !== undefined &&
+    ollama.broker !== undefined
+  ) {
+    return runSkillBareWithTools(ollama, skill, args);
+  }
+
   const prompt = renderSkillTemplate(skill.body, args);
   const messages = [
     { role: "system", content: ollama.soul },
@@ -1505,7 +1619,101 @@ export async function runSkillBare(
     errorMessage,
     inputTokens,
     outputTokens,
+    toolCallSummaries: [],
   };
+}
+
+// ---------------------------------------------------------------------------
+// runSkillBareWithTools — PR-skills-tools tool-loop path
+// ---------------------------------------------------------------------------
+//
+// Mirrors `runOllamaTurnWithTools` (ollama.ts) but skill-shaped:
+//   - No history, no SOLRAC.md overlay, no streaming UX (skills already cap
+//     their reply by template; live rendering would muddy the operator's
+//     intent baked into the skill body).
+//   - Recursion guard: this skill's own MCP entry (`skills__<self>`) is
+//     filtered out of the catalog the body sees. Indirect recursion (A→B→A)
+//     is bounded by `runToolLoop`'s `maxIterations`.
+//   - `maxTurns` from the SKILL.md frontmatter doubles as `maxIterations`
+//     so the operator controls the budget per skill.
+//
+// Caller (`runOllamaSkill` for /<skill> typing, `skill-tools.ts` for
+// agent-driven invocations) is responsible for wrapping this in
+// `skillToolCtx.run(...)` so any nested `skills__*` calls have ALS context.
+async function runSkillBareWithTools(
+  ollama: OllamaSkillDeps,
+  skill: Skill,
+  args: string,
+): Promise<RunSkillBareResult> {
+  // These are guaranteed non-undefined by the dispatch gate above.
+  const allTools = ollama.tools!;
+  const toolTiers = ollama.toolTiers!;
+  const broker = ollama.broker!;
+
+  // Recursion guard. The skill's body must not see its own MCP entry. The
+  // model can still call OTHER skills tools; cycles longer than 1 are bounded
+  // by `maxIterations` and the loop detector.
+  const selfToolName = `${SKILL_TOOL_PREFIX}${skill.name}`;
+  const filteredTools = allTools.filter((t) => t.name !== selfToolName);
+  const toolMap = new Map(filteredTools.map((t) => [t.name, t]));
+  const toolDefs = mcpToOllamaTools(filteredTools);
+  const toolNames = filteredTools.map((t) => t.name);
+
+  const prompt = renderSkillTemplate(skill.body, args);
+  // Skills are tier-stable (`tier: ollama` for tool-callable skills, per
+  // skills.ts Phase 1 restriction). Build the capability note as the default-
+  // engine variant — accurate when the skill body runs on the deploy's main
+  // Ollama model, which is always the case today.
+  const capabilityNote = buildToolCapabilityNote(toolNames, true);
+
+  const initialMessages = [
+    { role: "system" as const, content: `${ollama.soul}\n\n${capabilityNote}` },
+    { role: "user" as const, content: prompt },
+  ];
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ollama.timeoutMs);
+  const loopDetector = createLoopDetector({ threshold: LOOP_THRESHOLD });
+
+  try {
+    const result = await runToolLoop(
+      {
+        fetch: ollama.fetch,
+        url: ollama.url,
+        model: ollama.model,
+        signal: ac.signal,
+        tools: toolMap,
+        toolTiers,
+        toolDefs,
+        broker,
+        loopDetector,
+        maxIterations: skill.maxTurns,
+        // Skill audit row is owned by the caller (runOllamaSkill or
+        // skill-tools.ts::buildOneSkillTool); pass 0 here. The audit
+        // correlation in `log.info("ollama.tool_loop_start", ...)` is
+        // best-effort for skills.
+        auditId: 0,
+        // chatId is only used for log correlation inside runToolLoop. The
+        // ALS context (skillToolCtx) carries the real chatId for any
+        // nested skill calls.
+        chatId: 0,
+      },
+      { initialMessages },
+    );
+    const text = result.assistantText.trim();
+    let errorMessage = result.errorMessage;
+    if (errorMessage === null && text === "") errorMessage = "empty_response";
+    return {
+      text,
+      errorMessage,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      toolCallSummaries: result.toolCallSummaries,
+    };
+  } finally {
+    clearTimeout(timer);
+    ac.abort();
+  }
 }
 
 // Ollama-tier skill: one-shot `/api/chat` (stream:false), no history, no tool
@@ -1546,9 +1754,9 @@ async function runOllamaSkill(
 
   const ollama = deps.ollamaSkillDeps;
   const engineModelTag = `ollama:${ollama.model}:skill:${skill.name}`;
-  const { text: trimmed, errorMessage, inputTokens, outputTokens } =
-    await runSkillBare(ollama, skill, args);
-
+  // Insert audit row BEFORE running so the ALS context can carry the real
+  // parentAuditId — nested `skills__*` calls record it in their own
+  // `origin='tool_call'` rows for the cross-skill audit story.
   const auditId = deps.db.insertAudit({
     chatId: msg.chat.id,
     fromId: msg.from!.id,
@@ -1558,11 +1766,29 @@ async function runOllamaSkill(
     model: engineModelTag,
   });
 
+  // Wrap in `skillToolCtx.run(...)` so the body — when it reaches the
+  // tool-loop path — can call `skills__other` and have those handlers
+  // see (chatId, fromId, updateId, parentAuditId) via ALS. Cheap to wrap
+  // unconditionally; no-op when the body never reaches a tool.
+  const { text: trimmed, errorMessage, inputTokens, outputTokens, toolCallSummaries } =
+    await skillToolCtx.run(
+      {
+        chatId: msg.chat.id,
+        fromId: msg.from!.id,
+        updateId,
+        parentAuditId: auditId,
+      },
+      () => runSkillBare(ollama, skill, args),
+    );
+
+  const toolCallsJson =
+    toolCallSummaries.length > 0 ? JSON.stringify(toolCallSummaries) : null;
+
   if (errorMessage !== null) {
     deps.db.updateAuditEnd({
       id: auditId,
       response: null,
-      toolCalls: null,
+      toolCalls: toolCallsJson,
       inputTokens,
       outputTokens,
       cacheCreationInputTokens: null,
@@ -1585,7 +1811,7 @@ async function runOllamaSkill(
   deps.db.updateAuditEnd({
     id: auditId,
     response: snippet(trimmed, 200),
-    toolCalls: null,
+    toolCalls: toolCallsJson,
     inputTokens,
     outputTokens,
     cacheCreationInputTokens: null,

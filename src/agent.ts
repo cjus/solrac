@@ -106,7 +106,10 @@ import type { SessionStore, SessionTier } from "./session.ts";
 import { mdToTelegramHtml } from "./markdown.ts";
 import { htmlEscapeText, type TelegramClient } from "./telegram.ts";
 
-const LOOP_THRESHOLD = 3;
+// Exported so the skill runner in commands.ts uses the same threshold as
+// runAgent — diverging values would make loop-detection behavior depend on
+// invocation surface, which is surprising.
+export const LOOP_THRESHOLD = 3;
 
 const TELEGRAM_TEXT_MAX = 3800;
 const EDIT_THROTTLE_MS = 1500;

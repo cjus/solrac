@@ -180,7 +180,9 @@ export function buildOllamaCapabilityNote(opts: OllamaCapabilityNoteOpts): strin
  * Backwards-shaped helper for the tools-on path. Defers to
  * `buildOllamaCapabilityNote` so the §3c matrix is the single source of truth.
  */
-function buildToolCapabilityNote(
+// Exported so the skill tool-loop runner in commands.ts can build the same
+// capability note for skill bodies without duplicating the matrix.
+export function buildToolCapabilityNote(
   toolNames: ReadonlyArray<string>,
   isDefaultEngine: boolean,
 ): string {

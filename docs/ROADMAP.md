@@ -316,9 +316,13 @@ Trade-off: every token in systemPrompt ships on every turn. If the registry is 5
 
 **Status:** Phase 1 shipped (Ollama-only). See `src/skill-tools.ts` and [USAGE.md#skills-as-tools-phase-1-ollama-only](./USAGE.md#skills-as-tools-phase-1-ollama-only).
 
-A `SKILL.md` with `tool: true` frontmatter is exposed to the Ollama agent's tool catalog as `mcp__solrac__skills__<name>`. The model decides when to call from natural language; the description is `skill.description`; the schema is `{ args: string }`. Auto-allow tier; cost cap is the backstop. Phase 1 restricted to `tier: ollama` skills (free) to sidestep the cost-escalation question. Audit row tagged `origin='tool_call'`.
+Two distinct axes — kept separate because they have different cost-exposure shapes:
 
-**Phase 2 (deferred).** Expose to Claude tiers via the existing `solrac` MCP server. Lift the `tier: ollama` restriction; add per-skill cost cap; consider `confirm`-tier gating on Claude-backed tool calls so a runaway Ollama agent can't burn $$$ silently.
+1. **Skills *using* tools (shipped on both tiers).** A skill body — Claude or Ollama — runs with the same tool surface a regular turn does (Claude Code preset on Claude; integrations MCP catalog on Ollama). Bounded by per-skill `max_turns` frontmatter (1–10, default 1) and the same three-tier policy + cost cap + loop detector. Pure text-transform skills stay cheap with `max_turns: 1`; agentic skills (`/log` chaining `notion_search` → `notion_create_page`) declare what they need.
+
+2. **Skills *callable as* tools by the agent (Phase 1: Ollama-only).** A `SKILL.md` with `tool: true` frontmatter is exposed to the Ollama agent's tool catalog as `mcp__solrac__skills__<name>`. The model decides when to call from natural language; the description is `skill.description`; the schema is `{ args: string }`. Auto-allow tier; cost cap is the backstop. Phase 1 restricted to `tier: ollama` skills (free) to sidestep the cost-escalation question (a misbehaving Ollama agent calling a `tier: primary` skill 100× would burn real $$$). Audit row tagged `origin='tool_call'`.
+
+**Phase 2 (deferred) — axis 2 expansion.** Expose tool-callable skills to Claude tiers via the existing `solrac` MCP server. Lift the `tier: ollama` restriction on `tool: true`; add a per-skill `max_cost_usd` cap separate from the chat-level cap; consider `confirm`-tier gating on Claude-backed tool-callable skills so the operator approves each cross-engine escalation.
 
 **Phase 3 (deferred).** Streamed skill output (currently the agent waits for the full skill reply before continuing); per-skill telemetry surface in `/status` or a dedicated `/skills` slash command.
 
