@@ -67,6 +67,13 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { log } from "./log.ts";
 
+// Upper bound on the stringified `audit.tool_calls` blob. Defends against
+// runaway local-engine turns where a hallucinating small model can emit
+// 100KB+ JSON args repeated across the 8-iteration cap. Truncation marker
+// is intentionally non-JSON so consumers don't mistake a truncated row
+// for a valid empty-array payload.
+export const AUDIT_TOOL_CALLS_MAX_LEN = 65536;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -149,14 +156,15 @@ export interface AuditInsert {
   startedAt: number;
   // Identifies which engine handled the turn. Used by cross-engine queries
   // (recentChatTurns / outOfBandForEngine) to compute the current engine's
-  // cutoff and exclude its own rows. Format (PLAN Step 12):
+  // cutoff and exclude its own rows. Three-segment format:
   //   - 'claude:primary:<modelId>'   — Claude primary tier (`!` or no prefix)
   //   - 'claude:secondary:<modelId>' — Claude secondary tier (`@`)
-  //   - 'ollama:<modelId>'           — Ollama (`>`)
+  //   - 'local:<backend>:<modelId>'  — local engine (Ollama or LMStudio)
   //   - 'system'                     — denial / queue-full rows (no engine ran)
   // Pre-Step-12 rows tagged 'claude' are migrated to
-  // 'claude:secondary:claude-opus-4-7' on first boot; agent.ts always passes
-  // the full string explicitly.
+  // 'claude:secondary:claude-opus-4-7' on first boot. Legacy `ollama:<modelId>`
+  // rows are migrated to `local:ollama:<modelId>` (see Phase 3 migration
+  // below). New code always writes the full three-segment string.
   model: string;
   // Scheduler — distinguishes user-typed from scheduler-fired turns.
   // Defaults to 'user' when omitted (matches legacy rows). 'tool_call' is
@@ -232,18 +240,18 @@ export interface SolracDb {
   // (generalized in Step 12).
   //
   // `sinceMs` (default 0) filters out rows with `started_at <= sinceMs`.
-  // Ollama callers pass `sessions.getOllamaCutoff(chatId) ?? 0` so a
-  // `/clear ollama` cutoff truncates the visible history. Other callers
+  // Local-engine callers pass `sessions.getLocalCutoff(chatId) ?? 0` so a
+  // `/clear local` cutoff truncates the visible history. Other callers
   // (web client) leave it at 0 — the audit log is still the source of
   // truth for operator-facing views.
   recentChatTurns: (chatId: number, limit: number, sinceMs?: number) => ChatHistoryRow[];
   // Returns successful turns from OTHER engines that happened AFTER this
   // engine's most recent successful turn. `currentEnginePrefix` is a SQL LIKE
   // pattern naming this engine (e.g. 'claude:primary:%', 'claude:secondary:%',
-  // 'ollama:%'). The Claude tier runners use this to inject "out-of-band"
-  // context (other-tier Claude turns + Ollama turns) on top of their own SDK
-  // session resume. Window naturally narrows on the next turn for this engine
-  // because its cutoff `MAX(started_at)` has advanced. PLAN Step 12.
+  // 'local:%'). The Claude tier runners use this to inject "out-of-band"
+  // context (other-tier Claude turns + local-engine turns) on top of their own
+  // SDK session resume. Window naturally narrows on the next turn for this
+  // engine because its cutoff `MAX(started_at)` has advanced.
   //
   // INVARIANT: `currentEnginePrefix` MUST be constructed from a typed enum
   // (e.g. `\`claude:${SessionTier}:%\``), never from user-provided text. The
@@ -252,29 +260,33 @@ export interface SolracDb {
   // could silently match too few or too many rows. The current call sites
   // (agent.ts, ollama.ts) construct this safely; new callers must too.
   //
-  // `ollamaCutoffMs` (default 0) hides Ollama rows with `started_at <=
+  // `localCutoffMs` (default 0) hides local-engine rows with `started_at <=
   // cutoff` from the bridge — implements the source-of-truth semantics of
-  // `/clear ollama` for Claude tiers (the cleared turns disappear from
-  // Sonnet/Opus's bridge too, not just from Ollama's own history).
+  // `/clear local` for Claude tiers (the cleared turns disappear from
+  // Sonnet/Opus's bridge too, not just from the local engine's own history).
+  // Dual-pattern: matches both `local:%` (post-migration) and `ollama:%`
+  // (legacy, pre-migration). The legacy clause is removed in a follow-up
+  // release after the migration has propagated.
   outOfBandForEngine: (
     chatId: number,
     currentEnginePrefix: string,
     limit: number,
-    ollamaCutoffMs?: number,
+    localCutoffMs?: number,
   ) => ChatHistoryRow[];
-  // Cheap existence probe: any successful Ollama turn for this chat with
-  // `started_at > sinceMs`? Used by `/clear ollama` to render an honest
+  // Cheap existence probe: any successful local-engine turn for this chat
+  // with `started_at > sinceMs`? Used by `/clear local` to render an honest
   // "Already clean" reply when the cutoff is already at or past the most
-  // recent turn. O(1) via `idx_audit_chat_model_started`.
-  hasOllamaTurnsSince: (chatId: number, sinceMs: number) => boolean;
+  // recent turn. O(1) via `idx_audit_chat_model_started`. Dual-pattern:
+  // matches both `local:%` and legacy `ollama:%`.
+  hasLocalTurnsSince: (chatId: number, sinceMs: number) => boolean;
   // PNX-167 — count of successful turns for a chat scoped to a single engine.
   // Used by `/status` to surface "12 turns on primary in this chat." Same
   // index path as `outOfBandForEngine` (`idx_audit_chat_model_started`).
   countChatTurnsForEngine: (chatId: number, enginePrefix: string) => number;
-  // PR-B — time-windowed variant. Counts successful turns for chat+engine
-  // started at or after `sinceMs`. Used by `/status` to surface "ollama
-  // turns: N (last 24h)" so the inversion-default chat shows its activity
-  // even when no Claude session state exists.
+  // Time-windowed variant. Counts successful turns for chat+engine started
+  // at or after `sinceMs`. Used by `/status` to surface "local turns: N
+  // (last 24h)" so the default-engine chat shows its activity even when no
+  // Claude session state exists.
   countChatTurnsForEngineSince: (
     chatId: number,
     enginePrefix: string,
@@ -420,33 +432,45 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
     db.run("ALTER TABLE sessions ADD COLUMN secondary_summary_at INTEGER");
     log.info("db.migrated", { migration: "sessions.secondary_summary_at_added" });
   }
-  // `/clear ollama` cutoff — millisecond timestamp at which the operator
-  // wiped this chat's Ollama context. `recentChatTurns` (Ollama's own history
-  // reconstruction) AND `outOfBandForEngine` (Claude's cross-engine bridge)
-  // both filter Ollama rows with `started_at <= cutoff`. NULL = never cleared.
-  // Ollama is stateless so there's no SDK session to drop; the cutoff IS the
-  // session boundary. Additive + nullable so existing rows survive.
-  if (!sessionCols.some((c) => c.name === "ollama_cutoff_ms")) {
-    db.run("ALTER TABLE sessions ADD COLUMN ollama_cutoff_ms INTEGER");
-    log.info("db.migrated", { migration: "sessions.ollama_cutoff_ms_added" });
+  // Phase 3 (Local engine abstraction) — migration order is LOAD-BEARING:
+  //   (1) audit-row retag FIRST: `ollama:<modelId>` → `local:ollama:<modelId>`
+  //   (2) sessions column rename SECOND: `ollama_cutoff_ms` → `local_cutoff_ms`
+  // If the process crashes between steps, dual-pattern reads in
+  // `outOfBandForEngine` + `hasLocalTurnsSince` still match legacy `ollama:%`
+  // rows, so step (1) being idempotent on retry is enough.
+  //
+  // Rollback SQL (commented for operator reference — NOT executed):
+  //   UPDATE audit SET model = substr(model, 7) WHERE model LIKE 'local:ollama:%';
+  //   ALTER TABLE sessions RENAME COLUMN local_cutoff_ms TO ollama_cutoff_ms;
+  // Caveat: rolling back after operating in mixed mode leaves `local:lmstudio:%`
+  // rows orphaned (no inverse target). Document in RUNBOOK breaking-changes.
+  const ollamaRetagged = db
+    .prepare(
+      "UPDATE audit SET model = 'local:ollama:' || substr(model, 8) WHERE model LIKE 'ollama:%'",
+    )
+    .run();
+  if (ollamaRetagged.changes > 0) {
+    log.info("db.migrated", {
+      migration: "audit.ollama_retagged_to_local",
+      rowsChanged: ollamaRetagged.changes,
+    });
+  }
+  // Sessions column rename: `ollama_cutoff_ms` → `local_cutoff_ms`. Uses
+  // SQLite's ALTER TABLE ... RENAME COLUMN (3.25+; Bun ships 3.45+ since
+  // 1.0). If somehow the legacy column is missing AND the new one is too,
+  // ADD the new column for a fresh install. Both branches idempotent.
+  const hasLegacyCutoff = sessionCols.some((c) => c.name === "ollama_cutoff_ms");
+  const hasLocalCutoff = sessionCols.some((c) => c.name === "local_cutoff_ms");
+  if (hasLegacyCutoff && !hasLocalCutoff) {
+    db.run("ALTER TABLE sessions RENAME COLUMN ollama_cutoff_ms TO local_cutoff_ms");
+    log.info("db.migrated", { migration: "sessions.ollama_cutoff_ms_renamed_to_local" });
+  } else if (!hasLegacyCutoff && !hasLocalCutoff) {
+    db.run("ALTER TABLE sessions ADD COLUMN local_cutoff_ms INTEGER");
+    log.info("db.migrated", { migration: "sessions.local_cutoff_ms_added" });
   }
   // PLAN Step 12 — retag legacy `audit.model='claude'` rows. They ran on the
   // then-default SOLRAC_MODEL=claude-opus-4-7, which is now the secondary
-  // tier. Cross-tier out-of-band queries key off the prefix
-  // `claude:secondary:%` so legacy rows must adopt the same shape to avoid
-  // showing up as "out of band" to themselves. Predicate-idempotent: after
-  // first boot, no row matches `model = 'claude'` so subsequent UPDATEs change
-  // zero rows.
-  //
-  // Implicit invariant: `'claude'` is RESERVED as the legacy tag. Any row
-  // inserted post-migration with `model = 'claude'` (e.g. via a manual
-  // recovery script or a future bug) will be silently retagged on the next
-  // boot. New code must use the three-segment format
-  // (`claude:primary:<id>` / `claude:secondary:<id>`); see `AuditInsert`.
-  // The full-table scan on every boot is a tiny operator cost (the index on
-  // `(chat_id, model, started_at)` lets SQLite do a partial scan) and using
-  // a meta-key gate would couple migration state to a separate table — not
-  // worth the complication for a row count that's bounded by data age.
+  // tier. Predicate-idempotent: after first boot, no row matches.
   const legacyTagged = db
     .prepare("UPDATE audit SET model = 'claude:secondary:claude-opus-4-7' WHERE model = 'claude'")
     .run();
@@ -506,7 +530,7 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   // order. Each row carries its own `model` tag so the consumer can render an
   // origin label.
   // `started_at > ?` floor (default 0 from caller) implements the
-  // `/clear ollama` cutoff. Strict `>` matches the back-to-back-/clear
+  // `/clear local` cutoff. Strict `>` matches the back-to-back-/clear
   // semantics in commands.ts: setting cutoff to `Date.now()` immediately
   // hides every existing turn including any inserted in the same ms.
   const stRecentChat = db.prepare(
@@ -517,34 +541,33 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
       "ORDER BY started_at DESC LIMIT ?",
   );
   // Out-of-band turns for any engine. Caller passes their own engine's prefix
-  // (e.g. 'claude:primary:%' or 'ollama:%'). Returns rows from OTHER engines
+  // (e.g. 'claude:primary:%' or 'local:%'). Returns rows from OTHER engines
   // (NOT LIKE the prefix) whose `started_at` is greater than the most recent
   // successful turn of THIS engine. Used by both Claude tiers to bridge
   // context across engine boundaries; once injected, the next turn for this
   // engine naturally sees an empty window because the cutoff has advanced.
-  // Excludes 'system' rows (denials/queue-full) and Ollama uses this query
-  // too — the symmetry means Ollama's own history reconstruction can layer
-  // on top if needed (today it uses `recentChatTurns` directly).
-  // `(model NOT LIKE 'ollama:%' OR started_at > ?)` honors the ollama
-  // cutoff for the cross-engine bridge (decision B in PLAN). When the caller
-  // passes 0 (no cutoff set) the clause is a no-op. When set, Ollama turns
-  // pre-cutoff stay invisible to Claude tiers too — the user said /clear
-  // means /clear, not "/clear-but-only-from-its-own-history".
+  // Excludes 'system' rows (denials/queue-full).
+  //
+  // The cutoff clause matches BOTH `local:%` (post-migration) AND `ollama:%`
+  // (legacy, pre-migration) so a partial migration / rollback still hides
+  // pre-cutoff local-engine rows. The legacy clause is removed in a
+  // follow-up release once the migration has propagated.
   const stOutOfBandOther = db.prepare(
     "SELECT prompt, response, model FROM audit " +
       "WHERE chat_id = ? AND model NOT LIKE ? AND status = 'ok' " +
       "AND prompt IS NOT NULL AND response IS NOT NULL " +
-      "AND (model NOT LIKE 'ollama:%' OR started_at > ?) " +
+      "AND ((model NOT LIKE 'local:%' AND model NOT LIKE 'ollama:%') OR started_at > ?) " +
       "AND started_at > COALESCE(" +
       "  (SELECT MAX(started_at) FROM audit WHERE chat_id = ? AND model LIKE ? AND status = 'ok'), " +
       "  0" +
       ") " +
       "ORDER BY started_at ASC LIMIT ?",
   );
-  // Existence probe used by `/clear ollama` for the "Already clean" reply.
-  const stHasOllamaSince = db.prepare(
+  // Existence probe used by `/clear local` for the "Already clean" reply.
+  // Dual-pattern: matches both `local:%` and legacy `ollama:%`.
+  const stHasLocalSince = db.prepare(
     "SELECT 1 FROM audit " +
-      "WHERE chat_id = ? AND model LIKE 'ollama:%' AND status = 'ok' " +
+      "WHERE chat_id = ? AND (model LIKE 'local:%' OR model LIKE 'ollama:%') AND status = 'ok' " +
       "AND prompt IS NOT NULL AND response IS NOT NULL " +
       "AND started_at > ? LIMIT 1",
   );
@@ -558,9 +581,9 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
     "SELECT COUNT(*) AS n FROM audit " +
       "WHERE chat_id = ? AND model LIKE ? AND status = 'ok'",
   );
-  // PR-B — time-windowed engine count. Powers the "ollama turns: N (last
-  // 24h)" line in `/status`; with the inversion most chats no longer have
-  // Claude session-state to surface, but Ollama turns can still be tallied
+  // Time-windowed engine count. Powers the "local turns: N (last 24h)"
+  // line in `/status`; with the local default most chats no longer have
+  // Claude session-state to surface, but local turns can still be tallied
   // for at-a-glance activity. Same `idx_audit_chat_model_started` index path
   // as `stCountChatForEngine`.
   const stCountChatForEngineSince = db.prepare(
@@ -663,9 +686,14 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
       return id;
     },
     updateAuditEnd(row) {
+      const toolCalls =
+        row.toolCalls !== null && row.toolCalls.length > AUDIT_TOOL_CALLS_MAX_LEN
+          ? row.toolCalls.slice(0, AUDIT_TOOL_CALLS_MAX_LEN) +
+            `…[truncated: ${AUDIT_TOOL_CALLS_MAX_LEN}/${row.toolCalls.length} bytes shown]`
+          : row.toolCalls;
       stUpdateEnd.run(
         row.response,
-        row.toolCalls,
+        toolCalls,
         row.inputTokens,
         row.outputTokens,
         row.cacheCreationInputTokens,
@@ -700,25 +728,25 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
       // chat-style messages array.
       return rows.reverse();
     },
-    outOfBandForEngine(chatId, currentEnginePrefix, limit, ollamaCutoffMs = 0) {
+    outOfBandForEngine(chatId, currentEnginePrefix, limit, localCutoffMs = 0) {
       // Already ordered ASC. Args:
       //   1: chatId (outer SELECT scope)
       //   2: currentEnginePrefix (NOT LIKE — exclude this engine's own rows)
-      //   3: ollamaCutoffMs (the decision-B clause; 0 = no cutoff)
+      //   3: localCutoffMs (cross-engine cutoff; 0 = no cutoff)
       //   4: chatId (correlated subquery scope)
       //   5: currentEnginePrefix (subquery LIKE — find this engine's cutoff)
       //   6: limit
       return stOutOfBandOther.all(
         chatId,
         currentEnginePrefix,
-        ollamaCutoffMs,
+        localCutoffMs,
         chatId,
         currentEnginePrefix,
         limit,
       ) as ChatHistoryRow[];
     },
-    hasOllamaTurnsSince(chatId, sinceMs) {
-      return stHasOllamaSince.get(chatId, sinceMs) !== null;
+    hasLocalTurnsSince(chatId, sinceMs) {
+      return stHasLocalSince.get(chatId, sinceMs) !== null;
     },
     countChatTurnsForEngine(chatId, enginePrefix) {
       const row = stCountChatForEngine.get(chatId, enginePrefix) as { n: number } | null;

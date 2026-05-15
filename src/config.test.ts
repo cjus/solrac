@@ -1,36 +1,13 @@
 /**
  * @fileoverview Unit tests for `loadConfig` validation paths.
- * @proves Required-vars enforcement, OLLAMA_URL scheme guard, and the
- *         OLLAMA_ENABLED → OLLAMA_MODEL contract all fail loud at boot.
+ * @proves Required-vars enforcement, LOCAL_URL scheme guard, the
+ *         LOCAL_ENABLED → LOCAL_MODEL/LOCAL_BACKEND contract, and the
+ *         hard-cutover rejection of legacy `OLLAMA_*` env vars all fail loud
+ *         at boot.
  *
  * `config.ts` is the boot-time gatekeeper. A bad env value here should
  * surface as an actionable startup error, not a confusing runtime failure
- * thirty seconds in. The OLLAMA_URL guard in particular was added in
- * response to the Round-2 review: pre-fix, `OLLAMA_URL=localhost:11434`
- * (missing scheme) booted happily and only failed at the first `>` turn
- * with "ollama unreachable: localhost:11434".
- *
- * Scenarios covered:
- *
- *   required vars:
- *     - Missing required vars throw with the FULL list, not just the first.
- *
- *   OLLAMA_URL:
- *     - Default (unset) returns http://localhost:11434.
- *     - Trailing slash stripped.
- *     - Missing scheme throws (e.g. "localhost:11434" parses as scheme
- *       "localhost:" which is not http/https).
- *     - ftp:// scheme throws.
- *     - Garbage non-URL throws with "not a valid URL".
- *     - https:// passes.
- *
- *   OLLAMA_ENABLED:
- *     - true requires OLLAMA_MODEL, throws when unset.
- *     - false ignores OLLAMA_MODEL.
- *
- * Not covered (intentional):
- *   - Every numeric env coercion (parsePositiveNumber/Int internals — covered
- *     informally by the existing flood smoke and live boots).
+ * thirty seconds in.
  *
  * Cross-references:
  *   - config.ts — implementation
@@ -41,12 +18,9 @@ import { describe, expect, test } from "bun:test";
 import { loadConfig } from "./config.ts";
 
 // Pin `SOLRAC_DEFAULT_ENGINE=primary` for the shared base so tests not
-// specifically about the inversion don't have to also configure Ollama.
-// The new default since PR-B is `ollama`, which requires `OLLAMA_ENABLED=true`
+// specifically about the inversion don't have to also configure the local
+// engine. The new default is `local`, which requires `LOCAL_ENABLED=true`
 // — covered by the dedicated default-engine test block below.
-// Pin SOLRAC_HOME to a deterministic absolute path so path-config assertions
-// don't depend on whatever cwd `bun test` runs from. The dir doesn't need to
-// exist — loadConfig only joins/resolves strings, never touches the fs.
 const TEST_HOME = "/tmp/solrac-config-test-home";
 const baseEnv: NodeJS.ProcessEnv = {
   ANTHROPIC_API_KEY: "sk-ant-test",
@@ -70,88 +44,187 @@ describe("loadConfig — required vars", () => {
   });
 });
 
-describe("loadConfig — OLLAMA_URL", () => {
-  test("default is http://localhost:11434", () => {
+describe("loadConfig — legacy OLLAMA_* env vars rejected", () => {
+  test("any OLLAMA_* env var throws at boot with rename hint", () => {
+    expect(() => loadConfig({ ...baseEnv, OLLAMA_ENABLED: "true" })).toThrow(
+      /Legacy OLLAMA_\* env vars are no longer supported.*OLLAMA_ENABLED.*Rename to LOCAL_\*/s,
+    );
+  });
+
+  test("multiple legacy keys are all listed, sorted", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        OLLAMA_URL: "http://x",
+        OLLAMA_MODEL: "y",
+        OLLAMA_ENABLED: "true",
+      }),
+    ).toThrow(/OLLAMA_ENABLED, OLLAMA_MODEL, OLLAMA_URL/);
+  });
+});
+
+describe("loadConfig — LOCAL_URL", () => {
+  test("default (local disabled) is http://localhost:11434", () => {
     const cfg = loadConfig({ ...baseEnv });
-    expect(cfg.ollamaUrl).toBe("http://localhost:11434");
+    expect(cfg.localUrl).toBe("http://localhost:11434");
   });
 
   test("strips a trailing slash", () => {
-    const cfg = loadConfig({ ...baseEnv, OLLAMA_URL: "http://example.com:8080/" });
-    expect(cfg.ollamaUrl).toBe("http://example.com:8080");
+    const cfg = loadConfig({ ...baseEnv, LOCAL_URL: "http://example.com:8080/" });
+    expect(cfg.localUrl).toBe("http://example.com:8080");
   });
 
   test("https:// is accepted", () => {
-    const cfg = loadConfig({ ...baseEnv, OLLAMA_URL: "https://ollama.example.com" });
-    expect(cfg.ollamaUrl).toBe("https://ollama.example.com");
+    const cfg = loadConfig({ ...baseEnv, LOCAL_URL: "https://local.example.com" });
+    expect(cfg.localUrl).toBe("https://local.example.com");
   });
 
   test("missing scheme (host:port) throws", () => {
-    // "localhost:11434" parses as a URL with scheme "localhost:" — not http/https.
-    expect(() => loadConfig({ ...baseEnv, OLLAMA_URL: "localhost:11434" })).toThrow(
-      /OLLAMA_URL must use http:\/\/ or https:\/\//,
+    expect(() => loadConfig({ ...baseEnv, LOCAL_URL: "localhost:11434" })).toThrow(
+      /LOCAL_URL must use http:\/\/ or https:\/\//,
     );
   });
 
   test("ftp:// scheme throws", () => {
-    expect(() => loadConfig({ ...baseEnv, OLLAMA_URL: "ftp://nope" })).toThrow(
-      /OLLAMA_URL must use http:\/\/ or https:\/\//,
+    expect(() => loadConfig({ ...baseEnv, LOCAL_URL: "ftp://nope" })).toThrow(
+      /LOCAL_URL must use http:\/\/ or https:\/\//,
     );
   });
 
   test("malformed URL throws with 'not a valid URL'", () => {
-    expect(() => loadConfig({ ...baseEnv, OLLAMA_URL: "::::not a url::::" })).toThrow(
-      /OLLAMA_URL is not a valid URL/,
-    );
-  });
-});
-
-describe("loadConfig — OLLAMA_ENABLED contract", () => {
-  test("OLLAMA_ENABLED=true requires OLLAMA_MODEL", () => {
-    expect(() => loadConfig({ ...baseEnv, OLLAMA_ENABLED: "true" })).toThrow(
-      /OLLAMA_MODEL is required when OLLAMA_ENABLED=true/,
+    expect(() => loadConfig({ ...baseEnv, LOCAL_URL: "::::not a url::::" })).toThrow(
+      /LOCAL_URL is not a valid URL/,
     );
   });
 
-  test("OLLAMA_ENABLED=false ignores OLLAMA_MODEL absence", () => {
-    const cfg = loadConfig({ ...baseEnv, OLLAMA_ENABLED: "false" });
-    expect(cfg.ollamaEnabled).toBe(false);
-    expect(cfg.ollamaModel).toBeNull();
-  });
-
-  test("OLLAMA_ENABLED=true with OLLAMA_MODEL set passes", () => {
+  test("backend-aware default: LOCAL_BACKEND=lmstudio → :1234", () => {
     const cfg = loadConfig({
       ...baseEnv,
-      OLLAMA_ENABLED: "true",
-      OLLAMA_MODEL: "llama3.2",
+      SOLRAC_DEFAULT_ENGINE: "local",
+      LOCAL_ENABLED: "true",
+      LOCAL_BACKEND: "lmstudio",
+      LOCAL_MODEL: "qwen2.5-7b",
     });
-    expect(cfg.ollamaEnabled).toBe(true);
-    expect(cfg.ollamaModel).toBe("llama3.2");
+    expect(cfg.localUrl).toBe("http://localhost:1234");
+  });
+
+  test("backend-aware default: LOCAL_BACKEND=ollama → :11434", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      SOLRAC_DEFAULT_ENGINE: "local",
+      LOCAL_ENABLED: "true",
+      LOCAL_BACKEND: "ollama",
+      LOCAL_MODEL: "gemma4:e4b",
+    });
+    expect(cfg.localUrl).toBe("http://localhost:11434");
+  });
+
+  test("explicit LOCAL_URL wins over backend-aware default", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      SOLRAC_DEFAULT_ENGINE: "local",
+      LOCAL_ENABLED: "true",
+      LOCAL_BACKEND: "lmstudio",
+      LOCAL_MODEL: "qwen2.5-7b",
+      LOCAL_URL: "http://gpu.lan:9999",
+    });
+    expect(cfg.localUrl).toBe("http://gpu.lan:9999");
   });
 });
 
-describe("loadConfig — OLLAMA_TOOLS_ENABLED contract", () => {
-  // Tools-on requires Ollama to be the default engine since PR-B; bake that
-  // into a local helper so each test stays focused on the tool-flag contract.
+describe("loadConfig — LOCAL_BACKEND contract", () => {
+  test("LOCAL_ENABLED=true without LOCAL_BACKEND throws", () => {
+    expect(() =>
+      loadConfig({ ...baseEnv, LOCAL_ENABLED: "true", LOCAL_MODEL: "x" }),
+    ).toThrow(/LOCAL_BACKEND is required when LOCAL_ENABLED=true/);
+  });
+
+  test("invalid LOCAL_BACKEND value throws", () => {
+    expect(() =>
+      loadConfig({ ...baseEnv, LOCAL_ENABLED: "true", LOCAL_BACKEND: "vllm", LOCAL_MODEL: "x" }),
+    ).toThrow(/LOCAL_BACKEND must be "ollama" or "lmstudio"/);
+  });
+
+  test("LOCAL_BACKEND=ollama accepted", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      SOLRAC_DEFAULT_ENGINE: "local",
+      LOCAL_ENABLED: "true",
+      LOCAL_BACKEND: "ollama",
+      LOCAL_MODEL: "gemma4:e4b",
+    });
+    expect(cfg.localBackend).toBe("ollama");
+  });
+
+  test("LOCAL_BACKEND=lmstudio accepted", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      SOLRAC_DEFAULT_ENGINE: "local",
+      LOCAL_ENABLED: "true",
+      LOCAL_BACKEND: "lmstudio",
+      LOCAL_MODEL: "qwen2.5-7b",
+    });
+    expect(cfg.localBackend).toBe("lmstudio");
+  });
+
+  test("LOCAL_BACKEND parsed even when LOCAL_ENABLED=false (harmless preconfig)", () => {
+    const cfg = loadConfig({ ...baseEnv, LOCAL_BACKEND: "lmstudio" });
+    expect(cfg.localEnabled).toBe(false);
+    expect(cfg.localBackend).toBe("lmstudio");
+  });
+});
+
+describe("loadConfig — LOCAL_ENABLED contract", () => {
+  test("LOCAL_ENABLED=true requires LOCAL_MODEL", () => {
+    expect(() =>
+      loadConfig({ ...baseEnv, LOCAL_ENABLED: "true", LOCAL_BACKEND: "ollama" }),
+    ).toThrow(/LOCAL_MODEL is required when LOCAL_ENABLED=true/);
+  });
+
+  test("LOCAL_ENABLED=false ignores LOCAL_MODEL absence", () => {
+    const cfg = loadConfig({ ...baseEnv, LOCAL_ENABLED: "false" });
+    expect(cfg.localEnabled).toBe(false);
+    expect(cfg.localModel).toBeNull();
+    expect(cfg.localBackend).toBeNull();
+  });
+
+  test("LOCAL_ENABLED=true with backend + model passes", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      SOLRAC_DEFAULT_ENGINE: "local",
+      LOCAL_ENABLED: "true",
+      LOCAL_BACKEND: "ollama",
+      LOCAL_MODEL: "llama3.2",
+    });
+    expect(cfg.localEnabled).toBe(true);
+    expect(cfg.localBackend).toBe("ollama");
+    expect(cfg.localModel).toBe("llama3.2");
+  });
+});
+
+describe("loadConfig — LOCAL_TOOLS_ENABLED contract", () => {
+  // Tools-on requires the local engine to be the default; bake that into a
+  // local helper so each test stays focused on the tool-flag contract.
   const toolsOnEnv: NodeJS.ProcessEnv = {
     ...baseEnv,
-    SOLRAC_DEFAULT_ENGINE: "ollama",
-    OLLAMA_ENABLED: "true",
-    OLLAMA_MODEL: "gemma4:e4b",
+    SOLRAC_DEFAULT_ENGINE: "local",
+    LOCAL_ENABLED: "true",
+    LOCAL_BACKEND: "ollama",
+    LOCAL_MODEL: "gemma4:e4b",
   };
 
   test("default: tools off, max iterations 8, timeout 60s", () => {
     const cfg = loadConfig({ ...baseEnv });
-    expect(cfg.ollamaToolsEnabled).toBe(false);
-    expect(cfg.ollamaMaxToolIterations).toBe(8);
-    expect(cfg.ollamaTimeoutMs).toBe(60_000);
+    expect(cfg.localToolsEnabled).toBe(false);
+    expect(cfg.localMaxToolIterations).toBe(8);
+    expect(cfg.localTimeoutMs).toBe(60_000);
   });
 
   test("tools on without integrations throws actionable error", () => {
     expect(() =>
       loadConfig({
         ...toolsOnEnv,
-        OLLAMA_TOOLS_ENABLED: "true",
+        LOCAL_TOOLS_ENABLED: "true",
       }),
     ).toThrow(/SOLRAC_INTEGRATIONS_ENABLED=true/);
   });
@@ -159,111 +232,120 @@ describe("loadConfig — OLLAMA_TOOLS_ENABLED contract", () => {
   test("tools on + integrations on passes; bumps default timeout to 120s", () => {
     const cfg = loadConfig({
       ...toolsOnEnv,
-      OLLAMA_TOOLS_ENABLED: "true",
+      LOCAL_TOOLS_ENABLED: "true",
       SOLRAC_INTEGRATIONS_ENABLED: "true",
     });
-    expect(cfg.ollamaToolsEnabled).toBe(true);
+    expect(cfg.localToolsEnabled).toBe(true);
     expect(cfg.integrationsEnabled).toBe(true);
-    expect(cfg.ollamaTimeoutMs).toBe(120_000);
+    expect(cfg.localTimeoutMs).toBe(120_000);
   });
 
-  test("explicit OLLAMA_TIMEOUT_MS wins over the tools-on default bump", () => {
+  test("explicit LOCAL_TIMEOUT_MS wins over the tools-on default bump", () => {
     const cfg = loadConfig({
       ...toolsOnEnv,
-      OLLAMA_TOOLS_ENABLED: "true",
+      LOCAL_TOOLS_ENABLED: "true",
       SOLRAC_INTEGRATIONS_ENABLED: "true",
-      OLLAMA_TIMEOUT_MS: "45000",
+      LOCAL_TIMEOUT_MS: "45000",
     });
-    expect(cfg.ollamaTimeoutMs).toBe(45_000);
+    expect(cfg.localTimeoutMs).toBe(45_000);
   });
 
-  test("OLLAMA_MAX_TOOL_ITERATIONS override accepted", () => {
+  test("LOCAL_MAX_TOOL_ITERATIONS override accepted", () => {
     const cfg = loadConfig({
       ...toolsOnEnv,
-      OLLAMA_TOOLS_ENABLED: "true",
+      LOCAL_TOOLS_ENABLED: "true",
       SOLRAC_INTEGRATIONS_ENABLED: "true",
-      OLLAMA_MAX_TOOL_ITERATIONS: "12",
+      LOCAL_MAX_TOOL_ITERATIONS: "12",
     });
-    expect(cfg.ollamaMaxToolIterations).toBe(12);
+    expect(cfg.localMaxToolIterations).toBe(12);
   });
 });
 
 describe("loadConfig — SOLRAC_DEFAULT_ENGINE", () => {
-  // Required-vars triple, but no SOLRAC_DEFAULT_ENGINE → default is "ollama".
+  // Required-vars triple, no SOLRAC_DEFAULT_ENGINE → default is "local".
   const minimalEnv: NodeJS.ProcessEnv = {
     ANTHROPIC_API_KEY: "sk-ant-test",
     TELEGRAM_BOT_TOKEN: "fake-tg-token",
     ALLOWLIST_BOOTSTRAP: "100",
   };
 
-  test("default is 'ollama' (PR-B inversion); requires OLLAMA_ENABLED", () => {
+  test("default is 'local'; requires LOCAL_ENABLED", () => {
     expect(() => loadConfig({ ...minimalEnv })).toThrow(
-      /SOLRAC_DEFAULT_ENGINE=ollama requires OLLAMA_ENABLED=true/,
+      /SOLRAC_DEFAULT_ENGINE=local requires LOCAL_ENABLED=true/,
     );
   });
 
-  test("default 'ollama' with OLLAMA_ENABLED+OLLAMA_MODEL passes", () => {
+  test("default 'local' with LOCAL_ENABLED+LOCAL_BACKEND+LOCAL_MODEL passes", () => {
     const cfg = loadConfig({
       ...minimalEnv,
-      OLLAMA_ENABLED: "true",
-      OLLAMA_MODEL: "gemma4:e4b",
+      LOCAL_ENABLED: "true",
+      LOCAL_BACKEND: "ollama",
+      LOCAL_MODEL: "gemma4:e4b",
     });
-    expect(cfg.defaultEngine).toBe("ollama");
+    expect(cfg.defaultEngine).toBe("local");
     expect(cfg.defaultEngineExplicit).toBe(false);
   });
 
-  test("explicit SOLRAC_DEFAULT_ENGINE=primary passes without Ollama", () => {
+  test("explicit SOLRAC_DEFAULT_ENGINE=primary passes without local engine", () => {
     const cfg = loadConfig({ ...minimalEnv, SOLRAC_DEFAULT_ENGINE: "primary" });
     expect(cfg.defaultEngine).toBe("primary");
     expect(cfg.defaultEngineExplicit).toBe(true);
-    expect(cfg.ollamaEnabled).toBe(false);
+    expect(cfg.localEnabled).toBe(false);
   });
 
-  test("explicit SOLRAC_DEFAULT_ENGINE=secondary passes without Ollama", () => {
+  test("explicit SOLRAC_DEFAULT_ENGINE=secondary passes without local engine", () => {
     const cfg = loadConfig({ ...minimalEnv, SOLRAC_DEFAULT_ENGINE: "secondary" });
     expect(cfg.defaultEngine).toBe("secondary");
+  });
+
+  test("SOLRAC_DEFAULT_ENGINE=ollama hard-rejected with rename hint", () => {
+    expect(() => loadConfig({ ...minimalEnv, SOLRAC_DEFAULT_ENGINE: "ollama" })).toThrow(
+      /SOLRAC_DEFAULT_ENGINE=ollama is no longer accepted.*LOCAL_BACKEND=ollama/s,
+    );
   });
 
   test("invalid value throws with the allowed-set hint", () => {
     expect(() =>
       loadConfig({ ...minimalEnv, SOLRAC_DEFAULT_ENGINE: "claude" }),
-    ).toThrow(/SOLRAC_DEFAULT_ENGINE must be "ollama", "primary", or "secondary"/);
+    ).toThrow(/SOLRAC_DEFAULT_ENGINE must be "local", "primary", or "secondary"/);
   });
 
-  test("default!=ollama with OLLAMA_TOOLS_ENABLED=true is unreachable; throws", () => {
+  test("default!=local with LOCAL_TOOLS_ENABLED=true is unreachable; throws", () => {
     expect(() =>
       loadConfig({
         ...minimalEnv,
         SOLRAC_DEFAULT_ENGINE: "primary",
-        OLLAMA_TOOLS_ENABLED: "true",
+        LOCAL_TOOLS_ENABLED: "true",
         SOLRAC_INTEGRATIONS_ENABLED: "true",
       }),
     ).toThrow(/unreachable/);
   });
 
-  test("default=ollama + tools-on + integrations-on passes", () => {
+  test("default=local + tools-on + integrations-on passes", () => {
     const cfg = loadConfig({
       ...minimalEnv,
-      OLLAMA_ENABLED: "true",
-      OLLAMA_MODEL: "gemma4:e4b",
-      OLLAMA_TOOLS_ENABLED: "true",
+      LOCAL_ENABLED: "true",
+      LOCAL_BACKEND: "ollama",
+      LOCAL_MODEL: "gemma4:e4b",
+      LOCAL_TOOLS_ENABLED: "true",
       SOLRAC_INTEGRATIONS_ENABLED: "true",
     });
-    expect(cfg.defaultEngine).toBe("ollama");
-    expect(cfg.ollamaToolsEnabled).toBe(true);
+    expect(cfg.defaultEngine).toBe("local");
+    expect(cfg.localToolsEnabled).toBe(true);
   });
 
-  test("blank SOLRAC_DEFAULT_ENGINE treated as unset (defaults to ollama)", () => {
+  test("blank SOLRAC_DEFAULT_ENGINE treated as unset (defaults to local)", () => {
     expect(() => loadConfig({ ...minimalEnv, SOLRAC_DEFAULT_ENGINE: "  " })).toThrow(
-      /SOLRAC_DEFAULT_ENGINE=ollama requires OLLAMA_ENABLED=true/,
+      /SOLRAC_DEFAULT_ENGINE=local requires LOCAL_ENABLED=true/,
     );
     const cfg = loadConfig({
       ...minimalEnv,
       SOLRAC_DEFAULT_ENGINE: "  ",
-      OLLAMA_ENABLED: "true",
-      OLLAMA_MODEL: "gemma4:e4b",
+      LOCAL_ENABLED: "true",
+      LOCAL_BACKEND: "ollama",
+      LOCAL_MODEL: "gemma4:e4b",
     });
-    expect(cfg.defaultEngine).toBe("ollama");
+    expect(cfg.defaultEngine).toBe("local");
     expect(cfg.defaultEngineExplicit).toBe(false);
   });
 });

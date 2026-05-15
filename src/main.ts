@@ -77,7 +77,7 @@ import {
   BOT_COMMAND_REGISTRY,
   parseCommand,
   runCommand,
-  type OllamaSkillDeps,
+  type LocalSkillDeps,
   type RunCommandDeps,
 } from "./commands.ts";
 import { loadConfig, type Config } from "./config.ts";
@@ -91,7 +91,11 @@ import {
 } from "./instance.ts";
 import { installShutdown } from "./lifecycle.ts";
 import { log } from "./log.ts";
-import { runOllamaTurn, type OllamaRunDeps } from "./ollama.ts";
+import { runLocalTurn, type LocalRunDeps } from "./local.ts";
+import {
+  createLocalDriver,
+  type LocalDriver,
+} from "./local-driver.ts";
 import { acquirePidFile, startPolling } from "./poll.ts";
 import {
   createConfirmationBroker,
@@ -167,11 +171,10 @@ interface RunTurnDeps {
     auditId: number;
     pendingHandles: Map<string, ConfirmHandle>;
   }) => CanUseTool;
-  // PLAN Step 11: present iff `OLLAMA_ENABLED=true`. When set, `>`-prefixed
-  // messages route to runOllamaTurn instead of runAgent. Both paths share the
-  // queue, mutex, semaphore, and tracker drain — dispatch happens inside the
-  // queued worker.
-  ollamaDeps: OllamaRunDeps | null;
+  // Present iff `LOCAL_ENABLED=true`. When set, no-prefix messages route to
+  // runLocalTurn instead of runAgent. Both paths share the queue, mutex,
+  // semaphore, and tracker drain — dispatch happens inside the queued worker.
+  localDeps: LocalRunDeps | null;
   // PNX-167 — slash command surface. `commandDeps` carries the dispatcher's
   // dependencies (allowlist, queue snapshot, startedAt, etc.) so the
   // command path stays self-contained. `botUsername` is the cached lowercase
@@ -187,7 +190,7 @@ interface RunTurnDeps {
   // Phase 2 — in-process MCP server hosting operator + blessed integrations.
   // `null` when integrations are disabled or zero tools loaded; otherwise the
   // value created by `createSdkMcpServer` and threaded into `runAgent`'s
-  // `options.mcpServers`. Claude tiers only — Ollama path ignores this.
+  // `options.mcpServers`. Claude tiers only — local path ignores this.
   mcpServer: McpSdkServerConfigWithInstance | null;
 }
 
@@ -248,29 +251,39 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
 
     const parsed = parseEnginePrefix(msg.text, deps.config.defaultEngine);
 
-    if (parsed.engine === "ollama") {
-      if (!deps.ollamaDeps) {
+    if (parsed.engine === "local") {
+      if (!deps.localDeps) {
         // Defensive: shouldn't fire in practice — boot validation requires
-        // `OLLAMA_ENABLED=true` whenever `defaultEngine === "ollama"`. Kept as
+        // `LOCAL_ENABLED=true` whenever `defaultEngine === "local"`. Kept as
         // a safety net so a misconfigured deploy ack-replies rather than
         // hangs on the no-deps path.
         await deps.tg
-          .sendMessage(msg.chat.id, "ollama disabled in this deployment")
-          .catch((err) => log.warn("ollama.disabled_ack_failed", { error: (err as Error).message }));
-        log.info("turn.done", { update_id: update.update_id, chat_id: msg.chat.id, route: "ollama_disabled" });
+          .sendMessage(msg.chat.id, "local engine disabled in this deployment")
+          .catch((err) =>
+            log.warn("local.disabled_ack_failed", { error: (err as Error).message }),
+          );
+        log.info("turn.done", {
+          update_id: update.update_id,
+          chat_id: msg.chat.id,
+          route: "local_disabled",
+        });
         return;
       }
-      // No-prefix Ollama: empty body is unreachable on Telegram (the platform
-      // rejects empty messages) and the web UI guards against it. Send the
-      // user's text straight to the runner.
-      await runOllamaTurn(deps.ollamaDeps, {
+      // Empty body is unreachable on Telegram (the platform rejects empty
+      // messages) and the web UI guards against it. Send the user's text
+      // straight to the runner.
+      await runLocalTurn(deps.localDeps, {
         chatId: msg.chat.id,
         fromId: msg.from.id,
         updateId: scheduledCtx ? null : update.update_id,
         prompt: parsed.prompt,
         scheduledTaskName: scheduledCtx?.name ?? null,
       });
-      log.info("turn.done", { update_id: update.update_id, chat_id: msg.chat.id, route: "ollama" });
+      log.info("turn.done", {
+        update_id: update.update_id,
+        chat_id: msg.chat.id,
+        route: "local",
+      });
       return;
     }
 
@@ -314,7 +327,7 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
         instanceMdPath: deps.instanceMdPath,
         // PR-B — `true` only when the operator pinned a Claude tier as
         // default (Claude-only deploys). Drives the capability-note tone.
-        isDefaultEngine: deps.config.defaultEngine !== "ollama",
+        isDefaultEngine: deps.config.defaultEngine !== "local",
         primaryModel: deps.primaryModel,
         secondaryModel: deps.secondaryModel,
         costGuard: deps.costGuard,
@@ -391,7 +404,7 @@ function gateAndAuditDenied(
     prompt: promptText,
     startedAt: now,
     // Denials predate engine selection; tag as 'system' so the row is
-    // distinguishable from real claude/ollama: rows in audit dumps.
+    // distinguishable from real claude/local: rows in audit dumps.
     model: "system",
   });
   db.updateAuditEnd({
@@ -469,54 +482,52 @@ export function auditQueueFull(update: Update, db: SolracDb, tg: TelegramClient,
   }
 }
 
-// PR-B — operator-readable label for the web UI's default-engine pill. The
-// pill itself ships with the empty `data-prefix=""`, but the title attr is
-// substituted at serve time (see `web.ts::renderIndexHtml`) so the user
-// hovers over a label matching the deploy.
-function defaultEngineLabel(engine: "ollama" | "primary" | "secondary"): string {
-  if (engine === "ollama") return "ollama";
+// Operator-readable label for the web UI's default-engine pill. The pill
+// itself ships with the empty `data-prefix=""`, but the title attr is
+// substituted at serve time so the user hovers over a label matching the
+// deploy. Local-engine deploys carry the backend name in parentheses so
+// the operator sees which backend served the turn at a glance.
+function defaultEngineLabel(
+  engine: "local" | "primary" | "secondary",
+  localBackend: "ollama" | "lmstudio" | null,
+): string {
+  if (engine === "local") return `local (${localBackend ?? "?"})`;
   if (engine === "primary") return "primary Claude (Sonnet)";
   return "secondary Claude (Opus)";
 }
 
-// PR-B — boot-time Ollama health probe. Non-fatal: any failure is logged
+// Boot-time local-engine health probe. Non-fatal: any failure is logged
 // (warn) so the operator sees the misconfiguration but the process keeps
 // running. Daemon may come up after Solrac under systemd; the next user
-// turn will succeed once the daemon is reachable.
-async function probeOllamaHealth(url: string, model: string): Promise<void> {
+// turn will succeed once the daemon is reachable. Delegates the probe to
+// the driver so each backend hits its own probe URL (`/api/tags` for Ollama,
+// `/v1/models` for LMStudio).
+async function probeLocalHealth(driver: LocalDriver, model: string): Promise<void> {
+  const backend = driver.backend;
   try {
-    const res = await fetch(`${url}/api/tags`, {
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!res.ok) {
-      log.warn("ollama.boot_health_failed", {
-        url,
-        status: res.status,
-        hint: "ensure the Ollama daemon is running (e.g., `ollama serve`)",
-      });
+    const result = await driver.probe(model, AbortSignal.timeout(5_000));
+    if (!result.ok) {
+      if (result.modelMissing) {
+        log.warn("local.boot_health_model_missing", {
+          backend,
+          model,
+          hint: result.reason,
+        });
+      } else {
+        log.warn("local.boot_health_failed", {
+          backend,
+          model,
+          hint: result.reason,
+        });
+      }
       return;
     }
-    const body = (await res.json().catch(() => ({}))) as {
-      models?: Array<{ name?: unknown }>;
-    };
-    const models = Array.isArray(body.models)
-      ? body.models.map((m) => (typeof m.name === "string" ? m.name : "")).filter(Boolean)
-      : [];
-    if (!models.includes(model)) {
-      log.warn("ollama.boot_health_model_missing", {
-        url,
-        model,
-        availableModels: models,
-        hint: `pull the model: \`ollama pull ${model}\``,
-      });
-      return;
-    }
-    log.info("ollama.boot_health_ok", { url, model });
+    log.info("local.boot_health_ok", { backend, model });
   } catch (err) {
-    log.warn("ollama.boot_health_failed", {
-      url,
+    log.warn("local.boot_health_failed", {
+      backend,
+      model,
       error: (err as Error).message,
-      hint: "ensure the Ollama daemon is running (e.g., `ollama serve`)",
     });
   }
 }
@@ -542,20 +553,20 @@ async function main(): Promise<void> {
     maxConcurrentTurns: config.maxConcurrentTurns,
     hourlyCostCapUsd: config.hourlyCostCapUsd,
     globalHourlyCostCapUsd: config.globalHourlyCostCapUsd,
-    ollamaEnabled: config.ollamaEnabled,
-    ollamaModel: config.ollamaModel,
-    ollamaUrl: config.ollamaUrl,
+    localEnabled: config.localEnabled,
+    localBackend: config.localBackend,
+    localModel: config.localModel,
+    localUrl: config.localUrl,
   });
-  // PR-B — one-release-cycle silent-flip guard. Operators upgrading from a
-  // pre-PR-B build without setting `SOLRAC_DEFAULT_ENGINE` would see no-prefix
-  // messages start hitting Ollama. Boot validation throws if Ollama isn't
-  // enabled, so we never silently route to a broken backend — but we still
-  // warn so the diff in posture is visible. Remove this branch in the next
-  // minor release.
+  // One-release-cycle silent-flip guard. Operators upgrading without setting
+  // `SOLRAC_DEFAULT_ENGINE` would see no-prefix messages start hitting the
+  // local engine. Boot validation throws if the local engine isn't enabled,
+  // so we never silently route to a broken backend — but we still warn so
+  // the diff in posture is visible. Remove this branch in the next minor.
   if (!config.defaultEngineExplicit) {
     log.warn("solrac.default_engine_implicit", {
       value: config.defaultEngine,
-      hint: "set SOLRAC_DEFAULT_ENGINE explicitly to silence; default flipped from primary to ollama in PR-B",
+      hint: "set SOLRAC_DEFAULT_ENGINE explicitly to silence",
     });
   }
 
@@ -597,12 +608,12 @@ async function main(): Promise<void> {
     // and `$SOLRAC_INTEGRATIONS_DIR` (operator-owned) are scanned. First-dir-
     // wins on tool-name collisions so a stale operator copy can't shadow a
     // blessed integration. Tools registered here surface to Claude tiers as
-    // `mcp__solrac__<name>`. Ollama path does NOT see integrations on the
-    // tools-off branch — see ollama.ts.
+    // `mcp__solrac__<name>`. Local path does NOT see integrations on the
+    // tools-off branch — see local.ts.
     let integrationsMcpServer: McpSdkServerConfigWithInstance | null = null;
     let integrationToolTiers: ReadonlyMap<string, "auto" | "confirm"> = new Map();
     let integrationConfirmFormatters: ReadonlyMap<string, ConfirmFormatter> = new Map();
-    // PR-A — capture the tools array so the Ollama tools-on path can reuse
+    // Capture the tools array so the local tools-on path can reuse
     // the same in-process integration handlers. Stays empty (and the array
     // reference is shared as `EMPTY_INTEGRATIONS_TOOLS`) when integrations
     // are off so downstream `Array.isArray + length>0` checks work uniformly.
@@ -642,22 +653,30 @@ async function main(): Promise<void> {
       }
     }
 
-    // Skill-side Ollama deps (one-shot, no tool loop, no streaming). Built
-    // from config directly (not derived from `ollamaDeps` below) so it's
-    // available for `buildSkillTools` before the main `ollamaDeps` is
-    // assembled. Both consumers see the same connection params.
-    const ollamaSkillDeps: OllamaSkillDeps | null =
-      config.ollamaEnabled && config.ollamaModel
+    // Local-engine driver — backend selected per `LOCAL_BACKEND`. Built once
+    // at boot and shared by every consumer (run path, skill path, scheduler).
+    // `null` when the local engine is disabled.
+    const localDriver: LocalDriver | null =
+      config.localEnabled && config.localBackend && config.localModel
+        ? createLocalDriver(config.localBackend, { url: config.localUrl })
+        : null;
+
+    // Skill-side local deps (one-shot, no tool loop, no streaming). Built
+    // from config directly (not derived from `localDeps` below) so it's
+    // available for `buildSkillTools` before the main `localDeps` is
+    // assembled. Both consumers see the same driver instance.
+    const localSkillDeps: LocalSkillDeps | null =
+      localDriver && config.localModel
         ? {
-            url: config.ollamaUrl,
-            model: config.ollamaModel,
-            timeoutMs: config.ollamaTimeoutMs,
+            driver: localDriver,
+            model: config.localModel,
+            timeoutMs: config.localTimeoutMs,
             soul,
           }
         : null;
 
-    // Skill registry — load before assembling the Ollama tool surface so
-    // tool-eligible skills (`tool: true && tier: ollama`) can be merged into
+    // Skill registry — load before assembling the local tool surface so
+    // tool-eligible skills (`tool: true && tier: local`) can be merged into
     // `integrationTools` and surface to the local model alongside built-in
     // integrations. Disabled by default (`SOLRAC_SKILLS_ENABLED=false`);
     // fail-soft: a malformed SKILL.md degrades that single skill, not boot.
@@ -675,13 +694,13 @@ async function main(): Promise<void> {
         })()
       : EMPTY_SKILL_REGISTRY;
 
-    // Tool-eligible skills become MCP tools the Ollama agent can call by name.
+    // Tool-eligible skills become MCP tools the local agent can call by name.
     // All skill tools auto-allow (locked decision; cost cap is the backstop —
-    // and Phase 1 ollama-tier skills are free anyway). Names are added to
+    // and local-tier skills are free anyway). Names are added to
     // `integrationToolTiers` so the policy classifier sees the same map.
     const skillTools = buildSkillTools(skillRegistry, {
       db,
-      ollamaSkillDeps,
+      localSkillDeps,
     });
     if (skillTools.length > 0) {
       const merged = new Map(integrationToolTiers);
@@ -691,12 +710,12 @@ async function main(): Promise<void> {
       log.info("skills.tools_loaded", { count: skillTools.length });
     }
 
-    // PR-A — boot warning: tools enabled but no integrations actually loaded.
+    // Boot warning: tools enabled but no integrations actually loaded.
     // Operator probably forgot to drop something into `integrationsDir`, or
     // a typo broke every module. Fail-soft (start anyway) but make the
     // misconfiguration loud in the boot log.
-    if (config.ollamaToolsEnabled && integrationTools.length === 0) {
-      log.warn("ollama.tools_enabled_but_zero_loaded", {
+    if (config.localToolsEnabled && integrationTools.length === 0) {
+      log.warn("local.tools_enabled_but_zero_loaded", {
         integrationsDir: config.integrationsDir,
         hint: "set SOLRAC_INTEGRATIONS_DIR or add modules under integrations-builtin/",
       });
@@ -733,70 +752,67 @@ async function main(): Promise<void> {
         pendingHandles,
       });
     };
-    // PLAN Step 11: Ollama deps are constructed once iff the feature is on.
-    // When off, dispatch in makeRunTurn falls through to a "disabled" reply.
+    // Local-engine deps are constructed once iff the feature is on. When
+    // off, dispatch in makeRunTurn falls through to a "disabled" reply.
     //
-    // PR-A — tool-loop wiring. When BOTH `ollamaToolsEnabled=true` AND we
-    // actually loaded integration tools, surface the tools surface + tier
-    // map + broker into the deps so `runOllamaTurn` dispatches through the
-    // tool-loop driver. When tools are off (or zero loaded), the same deps
-    // shape carries `toolEnabled: false` and the single-shot path runs as
-    // before.
-    const ollamaToolsActive =
-      config.ollamaToolsEnabled && integrationTools.length > 0;
-    const ollamaIsDefault = config.defaultEngine === "ollama";
-    const ollamaDeps: OllamaRunDeps | null =
-      config.ollamaEnabled && config.ollamaModel
+    // Tool-loop wiring: when BOTH `localToolsEnabled=true` AND we actually
+    // loaded integration tools, surface the tools + tier map + broker into
+    // the deps so `runLocalTurn` dispatches through the tool-loop driver.
+    // When tools are off (or zero loaded), the same deps shape carries
+    // `toolEnabled: false` and the single-shot path runs.
+    const localToolsActive =
+      config.localToolsEnabled && integrationTools.length > 0;
+    const localIsDefault = config.defaultEngine === "local";
+    const localDeps: LocalRunDeps | null =
+      localDriver && config.localModel
         ? {
             tg,
             db,
             sessions,
-            url: config.ollamaUrl,
-            model: config.ollamaModel,
-            timeoutMs: config.ollamaTimeoutMs,
-            historyLimit: config.ollamaHistoryLimit,
+            driver: localDriver,
+            model: config.localModel,
+            timeoutMs: config.localTimeoutMs,
+            historyLimit: config.localHistoryLimit,
             soul,
             instanceMdPath: solracMdPath,
-            isDefaultEngine: ollamaIsDefault,
-            toolEnabled: ollamaToolsActive,
-            tools: ollamaToolsActive ? integrationTools : undefined,
-            toolTiers: ollamaToolsActive ? integrationToolTiers : undefined,
-            broker: ollamaToolsActive ? broker : undefined,
-            maxToolIterations: config.ollamaMaxToolIterations,
+            isDefaultEngine: localIsDefault,
+            toolEnabled: localToolsActive,
+            tools: localToolsActive ? integrationTools : undefined,
+            toolTiers: localToolsActive ? integrationToolTiers : undefined,
+            broker: localToolsActive ? broker : undefined,
+            maxToolIterations: config.localMaxToolIterations,
           }
         : null;
-    if (ollamaDeps) {
-      log.info("ollama.boot", {
-        url: config.ollamaUrl,
-        model: config.ollamaModel,
-        isDefaultEngine: ollamaIsDefault,
-        toolsEnabled: ollamaToolsActive,
-        toolCount: ollamaToolsActive ? integrationTools.length : 0,
-        maxToolIterations: ollamaToolsActive
-          ? config.ollamaMaxToolIterations
+    if (localDeps && localDriver) {
+      log.info("local.boot", {
+        backend: localDriver.backend,
+        url: config.localUrl,
+        model: config.localModel,
+        isDefaultEngine: localIsDefault,
+        toolsEnabled: localToolsActive,
+        toolCount: localToolsActive ? integrationTools.length : 0,
+        maxToolIterations: localToolsActive
+          ? config.localMaxToolIterations
           : null,
-        timeoutMs: config.ollamaTimeoutMs,
+        timeoutMs: config.localTimeoutMs,
       });
     }
-    // PR-skills-tools — attach the tool surface to ollamaSkillDeps AFTER
-    // integrationTools/skillTools are merged and the broker is built. The
-    // `buildSkillTools` closure earlier captures ollamaSkillDeps by
-    // reference, so mutating the same object reaches every captured site.
-    // Telegram broker is wired here; the web transport rewrites the broker
-    // field in webCommandDeps below for browser-routed confirm prompts.
-    if (ollamaSkillDeps && ollamaToolsActive) {
-      ollamaSkillDeps.tools = integrationTools;
-      ollamaSkillDeps.toolTiers = integrationToolTiers;
-      ollamaSkillDeps.broker = broker;
+    // Attach the tool surface to localSkillDeps AFTER integrationTools/
+    // skillTools are merged and the broker is built. `buildSkillTools` above
+    // captures localSkillDeps by reference, so mutating the same object
+    // reaches every captured site.
+    if (localSkillDeps && localToolsActive) {
+      localSkillDeps.tools = integrationTools;
+      localSkillDeps.toolTiers = integrationToolTiers;
+      localSkillDeps.broker = broker;
     }
-    // PR-B — Ollama is the recommended default; probe the daemon at boot so
-    // operators see a misconfiguration immediately (vs. on first user turn).
-    // Non-fatal: a slow-starting daemon may not be ready yet under systemd
-    // (After=ollama.service ordering helps but doesn't guarantee readiness),
-    // and crashing Solrac because of a transient probe failure is worse than
-    // logging it.
-    if (ollamaIsDefault && ollamaDeps && config.ollamaModel) {
-      void probeOllamaHealth(config.ollamaUrl, config.ollamaModel);
+    // The local engine is the recommended default; probe the backend at boot
+    // so operators see a misconfiguration immediately (vs. on first user
+    // turn). Non-fatal: a slow-starting daemon may not be ready yet under
+    // systemd, and crashing Solrac because of a transient probe failure is
+    // worse than logging it.
+    if (localIsDefault && localDeps && localDriver && config.localModel) {
+      void probeLocalHealth(localDriver, config.localModel);
     }
     // PNX-167 — boot-time bot identity for `/cmd@<bot>` group-chat targeting.
     // Failure is non-fatal: we proceed with `botUsername=null`, which causes
@@ -862,9 +878,9 @@ async function main(): Promise<void> {
       hourlyCostCapUsd: config.hourlyCostCapUsd,
       globalHourlyCostCapUsd: config.globalHourlyCostCapUsd,
       skillRegistry,
-      ollamaSkillDeps,
+      localSkillDeps,
       defaultEngine: config.defaultEngine,
-      ollamaToolsEnabled: config.ollamaToolsEnabled,
+      localToolsEnabled: config.localToolsEnabled,
       taskRegistry,
       triggerScheduledTask: (name) =>
         schedulerRef
@@ -881,17 +897,17 @@ async function main(): Promise<void> {
     // events flow through one subscriber set.
     const webClient: WebClient | null = tgWebClient;
     let webCommandDeps: RunCommandDeps | null = null;
-    let webOllamaDeps: OllamaRunDeps | null = null;
+    let webLocalDeps: LocalRunDeps | null = null;
     if (webClient) {
       // Web-routed /<skill> invocations: rewrite the broker so confirm
       // prompts ride the SSE bus rather than Telegram (mirrors the
-      // webOllamaDeps swap below). `tools` and `toolTiers` are unchanged —
+      // webLocalDeps swap below). `tools` and `toolTiers` are unchanged —
       // only the broker differs per transport.
-      const webOllamaSkillDeps: OllamaSkillDeps | null = commandDeps.ollamaSkillDeps
+      const webLocalSkillDeps: LocalSkillDeps | null = commandDeps.localSkillDeps
         ? {
-            ...commandDeps.ollamaSkillDeps,
+            ...commandDeps.localSkillDeps,
             broker:
-              commandDeps.ollamaSkillDeps.broker !== undefined
+              commandDeps.localSkillDeps.broker !== undefined
                 ? webBroker!
                 : undefined,
           }
@@ -899,17 +915,18 @@ async function main(): Promise<void> {
       webCommandDeps = {
         ...commandDeps,
         tg: webClient,
-        ollamaSkillDeps: webOllamaSkillDeps,
+        localSkillDeps: webLocalSkillDeps,
       };
-      // Ollama-on-web path needs the web broker (not the Telegram broker)
-      // so confirm prompts ride the SSE bus to the operator's browser
-      // session, not their Telegram chat. `tg` swap alone wasn't enough
-      // once the tools-on path started consulting `broker` for confirm UX.
-      webOllamaDeps = ollamaDeps
+      // Local-engine-on-web path needs the web broker (not the Telegram
+      // broker) so confirm prompts ride the SSE bus to the operator's
+      // browser session, not their Telegram chat. `tg` swap alone wasn't
+      // enough once the tools-on path started consulting `broker` for
+      // confirm UX.
+      webLocalDeps = localDeps
         ? {
-            ...ollamaDeps,
+            ...localDeps,
             tg: webClient,
-            broker: ollamaDeps.broker !== undefined ? webBroker! : undefined,
+            broker: localDeps.broker !== undefined ? webBroker! : undefined,
           }
         : null;
     }
@@ -926,7 +943,7 @@ async function main(): Promise<void> {
       costGuard,
       globalCostGuard,
       createCanUseTool,
-      ollamaDeps,
+      localDeps,
       commandDeps,
       botUsername,
       skillRegistry,
@@ -945,7 +962,7 @@ async function main(): Promise<void> {
           costGuard,
           globalCostGuard,
           createCanUseTool,
-          ollamaDeps: webOllamaDeps,
+          localDeps: webLocalDeps,
           commandDeps: webCommandDeps!,
           botUsername: null,
           skillRegistry,
@@ -988,7 +1005,7 @@ async function main(): Promise<void> {
         token: config.webToken,
         webChatId: config.webChatId,
         webClient,
-        defaultEngineLabel: defaultEngineLabel(config.defaultEngine),
+        defaultEngineLabel: defaultEngineLabel(config.defaultEngine, config.localBackend),
         onMessage: (text) => {
           const id = nextWebUpdateId++;
           const update: Update = {

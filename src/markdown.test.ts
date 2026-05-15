@@ -5,7 +5,7 @@
  *         lists/headers/tables flatten without producing `<ul>`, `<ol>`,
  *         `<h1>`, `<table>` etc., and unsafe link schemes are dropped.
  *
- * Why this exists: agent.ts and ollama.ts now feed responses through
+ * Why this exists: agent.ts and local.ts now feed responses through
  * `mdToTelegramHtml`. Telegram's HTML parse_mode rejects unsupported tags
  * with a 400 — so a regression here breaks every Telegram message. Goldens
  * are tight on the exact tag shapes that Telegram accepts.

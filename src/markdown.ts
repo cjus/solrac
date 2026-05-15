@@ -1,6 +1,6 @@
 /**
  * @fileoverview Markdown → Telegram-safe HTML converter.
- * @purpose Render Claude/Ollama responses (which are markdown) into the small
+ * @purpose Render Claude/local-engine responses (which are markdown) into the small
  *          HTML subset that Telegram's `parse_mode: "HTML"` actually accepts.
  *
  * Telegram HTML mode supports only:
@@ -31,7 +31,7 @@
  * outputs render consistently across transports.
  *
  * Position in the dependency graph:
- *   telegram (htmlEscape only) → markdown → consumed by agent + ollama
+ *   telegram (htmlEscape only) → markdown → consumed by agent + local
  *
  * Exports:
  *   - `mdToTelegramHtml(md)` — pure function, no I/O.

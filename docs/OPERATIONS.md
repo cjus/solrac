@@ -357,17 +357,18 @@ Canonical event names:
 - `agent.edit_final_failed` — final edit failed
 - `agent.error` — SDK threw
 - `agent.loop_detected` — PreToolUse hook saw 3rd identical call
-- `agent.oob_ollama_injected` — cross-engine bridge injected N Ollama turns into the user prompt (only fires when there are out-of-band Ollama exchanges since the last successful Claude turn)
+- `agent.oob_local_injected` — cross-engine bridge injected N local-engine turns into the user prompt (only fires when there are out-of-band local exchanges since the last successful Claude turn)
 - `agent.done` — per-turn summary (cost, turns, isError)
 
-### Ollama (default engine path)
-- `ollama.stub_send_failed` — couldn't send the 🦙 stub
-- `ollama.bad_frame` — NDJSON parse failure on a stream chunk (logged, line skipped, stream continues)
-- `ollama.fetch_failed` — fetch to `OLLAMA_URL` threw (unreachable, abort/timeout, etc.)
-- `ollama.edit_throttled` / `ollama.edit_final_failed` — Telegram edit failures
-- `ollama.final_send_failed` — final fallback send (when the stub creation itself failed earlier)
-- `ollama.disabled_ack_failed` / `ollama.usage_ack_failed` — couldn't reply with the disabled / usage hint
-- `ollama.done` — per-turn summary (model, elapsedSec, inputTokens, outputTokens, isError)
+### Local engine (default engine path)
+- `local.stub_send_failed` — couldn't send the 💻 stub
+- `local.bad_frame` — wire-format parse failure on a stream chunk (NDJSON for Ollama, SSE for LMStudio; logged, line skipped, stream continues)
+- `local.fetch_failed` — fetch to `LOCAL_URL` threw (unreachable, abort/timeout, etc.)
+- `local.edit_throttled` / `local.edit_final_failed` — Telegram edit failures
+- `local.final_send_failed` — final fallback send (when the stub creation itself failed earlier)
+- `local.disabled_ack_failed` / `local.usage_ack_failed` — couldn't reply with the disabled / usage hint
+- `local.boot_health_failed` — backend health probe failed at boot (`/api/tags` for Ollama, `/v1/models` for LMStudio); non-fatal warn — daemon may come up after Solrac under systemd
+- `local.done` — per-turn summary (backend, model, elapsedSec, inputTokens, outputTokens, isError)
 
 ### Policy
 - `policy.auto_allow` — classifier returned allow
@@ -402,13 +403,13 @@ Canonical event names:
 ### Skills
 - `skills.loaded` — boot summary `{ dir, count, errors }`. `count` is the registry size.
 - `skills.load_error` — one entry per malformed `SKILL.md` (parser rejection or name collision); fail-soft, boot continues.
-- `skills.tools_loaded` — `{ count }` of `tool: true && tier: ollama` skills exposed to the Ollama tool catalog. Absent line = 0 tool-eligible skills.
+- `skills.tools_loaded` — `{ count }` of `tool: true && tier: local` skills exposed to the local agent's tool catalog. Absent line = 0 tool-eligible skills.
 - `skill.done` — per slash-command invocation summary `{ skill, tier, costUsd, replyLength, ... }`.
-- `skill.error` / `skill.ollama_error` — slash-command path failure (Claude SDK error, Ollama unreachable, timeout, etc.).
+- `skill.error` / `skill.local_error` — slash-command path failure (Claude SDK error, local backend unreachable, timeout, etc.).
 - `skill_tools.done` — agent-driven (tool call) skill invocation completed `{ skill, tier, parentAuditId, replyLength }`.
 - `skill_tools.error` — tool-call path failure; the audit row is written and a structured error envelope returns to the agent.
 - `skill_tools.no_context` — the handler ran outside `skillToolCtx.run(...)`; means a future refactor broke the loop driver wrap. Investigate.
-- `skill_tools.ollama_unconfigured` — boot warn: tool-eligible skills exist but Ollama isn't configured; tools weren't registered.
+- `skill_tools.local_unconfigured` — boot warn: tool-eligible skills exist but the local engine isn't configured; tools weren't registered.
 
 ### Scheduler
 - `scheduler.tasks_loaded` — `{ dir, count, errors }` at boot, mirrors skills.
@@ -460,9 +461,9 @@ ORDER BY spent DESC;
 
 ### Engine breakdown for a chat
 
-`audit.model` distinguishes engines: `'claude:primary:<modelId>'` / `'claude:secondary:<modelId>'` for the SDK paths (`@`/`!` prefixes), `'ollama:<name>'` for the local Ollama path (no-prefix when `SOLRAC_DEFAULT_ENGINE=ollama`), `'system'` for queue-full / denial rows that predate engine selection.
+`audit.model` distinguishes engines: `'claude:primary:<modelId>'` / `'claude:secondary:<modelId>'` for the SDK paths (`@`/`!` prefixes), `'local:<backend>:<modelId>'` for the local engine path (no-prefix when `SOLRAC_DEFAULT_ENGINE=local`; `<backend>` ∈ `ollama` / `lmstudio`), `'system'` for queue-full / denial rows that predate engine selection. Legacy `'ollama:<modelId>'` rows are retagged in-place to `'local:ollama:<modelId>'` on first boot of the local-engine release; queries that need to span the pre/post migration window can `LIKE` either prefix.
 
-**Note on `spend24hUsd` and `/stats`:** Anthropic burn only. Ollama turns are $0 and don't appear in spend metrics. To count Ollama activity, query `audit.model LIKE 'ollama:%'` directly.
+**Note on `spend24hUsd` and `/stats`:** Anthropic burn only. Local-engine turns are $0 and don't appear in spend metrics. To count local activity, query `audit.model LIKE 'local:%'` directly (add `OR model LIKE 'ollama:%'` if you operate alongside un-migrated mirrors for the one-release dual-pattern window).
 
 ```sql
 SELECT model, COUNT(*) AS turns,
@@ -476,14 +477,14 @@ GROUP BY model
 ORDER BY turns DESC;
 ```
 
-### Recent Ollama turns (across all chats)
+### Recent local-engine turns (across all chats)
 
 ```sql
 SELECT id, chat_id, datetime(started_at/1000, 'unixepoch') AS started,
        model, status, input_tokens, output_tokens,
        SUBSTR(prompt, 1, 60) AS prompt_head
 FROM audit
-WHERE model LIKE 'ollama:%'
+WHERE model LIKE 'local:%' OR model LIKE 'ollama:%'   -- second clause covers legacy rows for one release
 ORDER BY id DESC
 LIMIT 20;
 ```
@@ -611,7 +612,7 @@ ORDER BY last_run_at DESC;
 
 ### Skill invocations (slash + agent-driven)
 
-Operator-typed `/<skill>` and Ollama-agent tool calls share the same `model` tag (`<engine>:<model>:skill:<name>`); the `origin` column distinguishes them.
+Operator-typed `/<skill>` and local-agent tool calls share the same `model` tag (`<engine>:<model>:skill:<name>`); the `origin` column distinguishes them.
 
 ```sql
 -- All skill activity in the last 24h, both surfaces

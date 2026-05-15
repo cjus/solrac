@@ -34,10 +34,10 @@ name: morning-digest                # required; [a-z0-9_]{1,32}
 description: One-line description.  # required; ≤256 chars
 schedule: daily_at 09:00            # required; one of "every <dur>", "daily_at HH:MM", "at <ISO8601>"
 chat_id: 123456789                  # optional; defaults to operator's first allowlist entry
-engine: ollama                      # optional; primary | secondary | ollama; defaults to SOLRAC_DEFAULT_ENGINE
+engine: local                       # optional; primary | secondary | local; defaults to SOLRAC_DEFAULT_ENGINE
 catch_up: true                      # optional; default: true for periodic, false for one-off
 enabled: true                       # optional; default: true
-max_cost_usd: 0.10                  # optional; per-task hourly cap (Claude tiers only — silently ignored for ollama)
+max_cost_usd: 0.10                  # optional; per-task hourly cap (Claude tiers only — silently ignored for local)
 boot_catch_up_jitter_s: 30          # optional; default: 0; staggers boot fires by random(0, N) seconds
 ---
 
@@ -46,7 +46,7 @@ Prompt body goes here. The body is sent to the configured engine on every fire.
 
 ### Schedule grammar
 
-- `every <N><unit>` — interval from `last_run_at`. Units: `s`, `m`, `h`, `d`. **Minimum 5 minutes for Claude tiers** (cost-runaway guard); minimum 1 minute for Ollama.
+- `every <N><unit>` — interval from `last_run_at`. Units: `s`, `m`, `h`, `d`. **Minimum 5 minutes for Claude tiers** (cost-runaway guard); minimum 1 minute for the local engine.
 - `daily_at HH:MM` — anchored daily fire in **UTC**. The fire happens once per UTC day at the anchor time; if Solrac was down at the anchor and `catch_up` is true, it fires once on next boot.
 - `at <ISO8601>` — single fire at an absolute time. Must include a timezone (`Z` or `+HH:MM`); naive strings are rejected.
 
@@ -58,9 +58,10 @@ Prompt body goes here. The body is sent to the configured engine on every fire.
 
 ### Engine
 
-- Defaults to `config.defaultEngine` (whatever `SOLRAC_DEFAULT_ENGINE` resolves to). On a deploy where `SOLRAC_DEFAULT_ENGINE=ollama`, omitting `engine:` runs free on local inference.
+- Defaults to `config.defaultEngine` (whatever `SOLRAC_DEFAULT_ENGINE` resolves to). On a deploy where `SOLRAC_DEFAULT_ENGINE=local` (the default), omitting `engine:` runs free on local inference.
 - Explicit `engine: primary` or `engine: secondary` escalates to a Claude tier — same shape as a user typing `@` or `!` in chat. The cost rolls into the per-chat hourly cap.
-- `engine: ollama` is rejected at parse if `SOLRAC_DEFAULT_ENGINE` isn't `ollama` (PR-B removed the `>` prefix; Ollama is reachable only as the deploy default).
+- `engine: local` is rejected at parse if `SOLRAC_DEFAULT_ENGINE` isn't `local` (there is no escape prefix; the local engine is reachable only as the deploy default).
+- Legacy `engine: ollama` is **hard-rejected at parse** with a rename hint. Replace with `engine: local`; the backend is picked at the deploy level via `LOCAL_BACKEND`.
 
 ### `chat_id`
 

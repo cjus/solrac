@@ -14,7 +14,7 @@ This is the longest doc — section it by need. The "Module map" and "End-to-end
 6. [SQLite schema](#sqlite-schema)
 7. [Three-tier permission policy](#three-tier-permission-policy)
 8. [Engine routing (prefix table)](#engine-routing)
-9. [Ollama local-model routing](#ollama-routing)
+9. [Local-model routing](#local-routing)
 10. [Threat model and defenses](#threat-model-and-defenses)
 11. [DB-pollution defenses](#db-pollution-defenses)
 12. [Tricky seams](#tricky-seams)
@@ -64,14 +64,17 @@ src/
 ├── integrations.ts   — operator-authored TS modules + blessed built-ins;
 │                       returns SDK MCP tool definitions + tier map
 ├── agent.ts          — wires Claude Agent SDK; runs one turn
-├── ollama.ts         — local-model runner; single-shot + tool-loop dispatcher
-├── ollama-tools.ts   — Ollama tool-loop driver (mcpToOllamaTools, runToolLoop,
+├── local.ts          — local-engine runner; single-shot + tool-loop dispatcher
+│                       (consumes driver events from local-driver.ts)
+├── local-driver.ts   — backend driver abstraction; createOllamaDriver (NDJSON)
+│                       + createLmstudioDriver (SSE); emits LocalChatEvent union
+├── local-tools.ts    — local-engine tool-loop driver (mcpToLocalTools, runToolLoop,
 │                       executeToolCall — policy + broker per call)
 │
 ├── commands.ts       — slash command parser + dispatcher
 │                       (/clear, /compact, /context, /help, /status, /tasks)
 ├── skills.ts         — load SKILL.md files; expose as /<name> commands
-├── skill-tools.ts    — bridge tool:true skills to the Ollama tool catalog as
+├── skill-tools.ts    — bridge tool:true skills to the local tool catalog as
 │                       skills__<name>; AsyncLocalStorage for per-turn context
 ├── scheduler.ts      — load TASK.md files; fire on schedule via the queue
 │
@@ -103,9 +106,10 @@ markdown           →  telegram (htmlEscape only)
 policy             →  db + telegram + log + config
 integrations       →  log
 agent              →  session + policy + telegram + log + markdown + instance
-ollama-tools       →  policy + log + telegram (types) + integrations
-ollama             →  session + policy + telegram + log + markdown +
-                      ollama-tools + skill-tools + integrations + instance
+local-driver       →  log
+local-tools        →  policy + log + telegram (types) + integrations + local-driver
+local              →  session + policy + telegram + log + markdown +
+                      local-driver + local-tools + skill-tools + integrations + instance
 poll               →  telegram + db + log
 skills             →  log + telegram (types)
 commands           →  agent + policy + db + telegram + skills + scheduler
@@ -156,7 +160,7 @@ Tracing a single user message through the system:
    │     ├── kind="ignore"       → group-chat command for another bot; drop
    │     ├── kind="run"          → runCommand(deps, msg, cmd, update_id)
    │     │     ├── /clear        → sessions.clearAll() per Claude tier AND/OR
-   │     │     │                   sessions.setOllamaCutoff() for `ollama` (sets
+   │     │     │                   sessions.setLocalCutoff() for `local` (sets
    │     │     │                   per-chat ms cutoff); audit (model='system')
    │     │     ├── /compact      → runCompactTurn() → setSummary + clearSessionId
    │     │     ├── /context      → render token breakdown; audit
@@ -167,13 +171,13 @@ Tracing a single user message through the system:
    │     └── kind="passthrough"  → fall through to engine routing below
    │
 6b. main.ts::makeRunTurn → engine routing → agent.ts::runAgent
-   ├── parseEnginePrefix(msg.text)        (primary | secondary | ollama)
+   ├── parseEnginePrefix(msg.text)        (primary | secondary | local)
    ├── mkdir workspaces/<chatId>/
    ├── db.insertAudit (status=in_progress)
    ├── tg.sendMessage("🤔 thinking…")        (the stub)
    ├── read sessions.getSummary(chatId, engine) IFF prevSessionId === null
-   ├── read sessions.getOllamaCutoff(chatId)         (decision B for /clear ollama)
-   ├── read db.outOfBandForEngine(chatId, prefix, 6, ollamaCutoff)
+   ├── read sessions.getLocalCutoff(chatId)          (decision B for /clear local)
+   ├── read db.outOfBandForEngine(chatId, prefix, 6, localCutoff)
    ├── if summary || OOB → buildAugmentedPrompt(summary, oobTurns, prompt)
    ├── build createPolicyHook (canUseTool)
    ├── build createPreToolUseHook (cost cap + loop)
@@ -232,7 +236,7 @@ For `queue_full`: `INSERT INTO audit … status='error', error_message='queue_fu
 
 **Summary lifecycle and the no-duplication invariant.** A pending summary lives in `sessions.<tier>_summary` until consumed. On the next user turn for that tier, `runAgent` reads the summary **only if `prevSessionId === null`** — a resumed session already carries the full conversation, so injecting a summary on top would duplicate context. After the turn succeeds, `clearSummary` runs alongside `setSessionId`. If the turn errors, the summary is left intact for retry. The XOR (session-id-set ⊻ summary-pending) is enforced at the read site so any future write-side bug that leaves both populated still does the right thing.
 
-**Cache telemetry.** `audit.cache_creation_input_tokens` and `audit.cache_read_input_tokens` are captured for every Anthropic turn (Ollama and system rows store NULL). Without these, `/context`'s "estimated next-turn replay" would dramatically under-report on resumed sessions where most input is `cache_read`.
+**Cache telemetry.** `audit.cache_creation_input_tokens` and `audit.cache_read_input_tokens` are captured for every Anthropic turn (local-engine and system rows store NULL). Without these, `/context`'s "estimated next-turn replay" would dramatically under-report on resumed sessions where most input is `cache_read`.
 
 **Group chat.** `parseCommand` only runs when an `@<bot>` suffix matches the cached `botUsername` (lowercased, from boot-time `getMe`). If `getMe` failed at boot, the parser fails closed: plain commands work, any `@bot` suffix is rejected.
 
@@ -250,9 +254,9 @@ For `queue_full`: `INSERT INTO audit … status='error', error_message='queue_fu
 **Frontmatter schema (2 required + 4 optional).**
 - `name` — required, matches `[a-z0-9_]{1,32}`, must NOT collide with built-in names (rejected at load time).
 - `description` — required, ≤256 chars (used in `setMyCommands` payload + `/help` rendering, and as the tool description when `tool: true`).
-- `tier` — optional, `primary` | `secondary` | `ollama`. Defaults to `SOLRAC_DEFAULT_ENGINE` so an Ollama-default deploy gets free skills automatically. Explicit `tier: ollama` is rejected when the deploy default isn't ollama (PR-B removed the `>` prefix).
-- `max_turns` — optional, integer in `[1, 10]`, default `1`. Model-turn budget for the skill body. Doubles as the SDK `maxTurns` on Claude tiers and as `runToolLoop`'s `maxIterations` on the Ollama tier — the operator gets one knob that constrains both paths uniformly.
-- `tool` — optional boolean, default false. When true, exposes the skill as a callable MCP tool to the Ollama agent (Phase 1 restriction: `tool: true` requires `tier: ollama`).
+- `tier` — optional, `primary` | `secondary` | `local`. Defaults to `SOLRAC_DEFAULT_ENGINE` so a local-default deploy gets free skills automatically. Explicit `tier: local` is rejected when the deploy default isn't `local` (there is no escape prefix). Legacy `tier: ollama` is hard-rejected at parse with a rename hint.
+- `max_turns` — optional, integer in `[1, 10]`, default `1`. Model-turn budget for the skill body. Doubles as the SDK `maxTurns` on Claude tiers and as `runToolLoop`'s `maxIterations` on the local tier — the operator gets one knob that constrains both paths uniformly.
+- `tool` — optional boolean, default false. When true, exposes the skill as a callable MCP tool to the local agent (Phase 1 restriction: `tool: true` requires `tier: local`).
 - `requires` — optional, bare string or string array (entries match `[a-z][a-z0-9_-]{0,31}`). Integration dependencies. When any name is absent from `loadedIntegrationNames` at boot, the loader skips the skill with a non-fatal `skills.load_error` and the registry never sees it. `/help` and Telegram autocomplete are filtered by the same registry, so the operator never gets advertised a skill that would fail at use-time. Empty / omitted → unconditional load (preserves back-compat for pre-`requires:` skills).
 
 The body is a prompt template; `{{args}}` is the only placeholder and is replaced literally with the user's text after the command name (or with the agent-supplied `args` argument when called as a tool). The frontmatter parser is a homemade YAML subset in `skills.ts` — handles `key: scalar`, `key: [a, b, c]`, quoted strings, integers, booleans. Adding `js-yaml` for a 6-key schema was disproportionate.
@@ -260,23 +264,23 @@ The body is a prompt template; `{{args}}` is the only placeholder and is replace
 **Skill execution.** The path forks on `tier`:
 
 - **Claude tiers (`primary` / `secondary`).** `runSkill` in `commands.ts`. Pre-flight cost cap (chat + global; cap-rejected skills cost $0), then `query()` with `maxTurns: skill.maxTurns`, no `resume` (fresh isolated turn), `tools: { type: "preset", preset: "claude_code" }`, `disallowedTools: ["Agent","Task"]` (sub-agents off; belt-and-suspenders with `policy.ts::SUBAGENT_DENY_TOOLS`). The interactive `canUseTool` factory + `PreToolUse` / `PostToolUse` / `PostToolUseFailure` hooks come from `deps.createCanUseTool` / `policy.ts` — same instances `runAgent` uses, so cost cap, loop detector, and the Telegram-confirm UX behave identically inside a skill. When integrations are loaded, `deps.mcpServer` is wired so the body sees `mcp__solrac__<name>` tools too. Audit row tagged `claude:<tier>:<model>:skill:<name>`; mid-turn cap or loop denials get promoted into `error_message` as `policy_deny:<reason>: …`.
-- **Ollama tier.** `runOllamaSkill` (and the bare `runSkillBare` helper) in `commands.ts`. The helper dispatches on whether `OllamaSkillDeps` has `tools + toolTiers + broker` wired:
-  - **Tools wired** → `runSkillBareWithTools` routes the body through the same `runToolLoop` driver that `runOllamaTurnWithTools` uses. `maxIterations = skill.maxTurns`, fresh loop detector, full `mcp__solrac__*` + `skills__*` catalog with the skill's own `skills__<self>` entry filtered out (recursion guard — see below). No history, no SOLRAC.md overlay, no streaming stub.
-  - **Tools absent** → fall through to a single-shot `/api/chat` (`stream: false`). Preserves pure text-transform skills (no `requires:`, `max_turns: 1`) at minimum latency.
-  Either way: audit row tagged `ollama:<model>:skill:<name>` with `cost_usd: 0`. Pre-flight Claude cap is skipped (a chat throttled by Claude burn shouldn't lose access to free local inference).
+- **Local tier.** `runLocalSkill` (and the bare `runSkillBare` helper) in `commands.ts`. The helper dispatches on whether `LocalSkillDeps` has `tools + toolTiers + broker` wired:
+  - **Tools wired** → `runSkillBareWithTools` routes the body through the same `runToolLoop` driver that `runLocalTurnWithTools` uses. `maxIterations = skill.maxTurns`, fresh loop detector, full `mcp__solrac__*` + `skills__*` catalog with the skill's own `skills__<self>` entry filtered out (recursion guard — see below). No history, no SOLRAC.md overlay, no streaming stub.
+  - **Tools absent** → fall through to a single-shot backend round trip (`stream: false`; NDJSON `/api/chat` for Ollama, SSE `/v1/chat/completions` for LMStudio). Preserves pure text-transform skills (no `requires:`, `max_turns: 1`) at minimum latency.
+  Either way: audit row tagged `local:<backend>:<model>:skill:<name>` with `cost_usd: 0`. Pre-flight Claude cap is skipped (a chat throttled by Claude burn shouldn't lose access to free local inference).
 
-Reply for both: model output verbatim, HTML-escaped, truncated to ≈3,500 chars (Telegram per-message ceiling minus headroom). The Ollama path's `runOllamaSkill` wraps the call in `skillToolCtx.run({chatId, fromId, updateId, parentAuditId}, ...)` so any nested `skills__*` invocation inherits the chat context for its own audit row.
+Reply for both: model output verbatim, HTML-escaped, truncated to ≈3,500 chars (Telegram per-message ceiling minus headroom). The local path's `runLocalSkill` wraps the call in `skillToolCtx.run({chatId, fromId, updateId, parentAuditId}, ...)` so any nested `skills__*` invocation inherits the chat context for its own audit row.
 
-**Skills as tools (Phase 1: Ollama-only).** Distinct axis from "skills using tools" above — *that* is shipped on both tiers. *This* is whether the Ollama agent can call a skill **by name** as a tool entry in its catalog. A skill with `tool: true` is exposed as a callable MCP tool to the Ollama agent (`skill-tools.ts::buildSkillTools`). The model sees it in its tool catalog as `mcp__solrac__skills__<name>` (wire format on Ollama: `skills__<name>`) with the operator-authored description. Tool dispatch:
+**Skills as tools (Phase 1: local engine only).** Distinct axis from "skills using tools" above — *that* is shipped on both tiers. *This* is whether the local agent can call a skill **by name** as a tool entry in its catalog. A skill with `tool: true` is exposed as a callable MCP tool to the local agent (`skill-tools.ts::buildSkillTools`). The model sees it in its tool catalog as `mcp__solrac__skills__<name>` (wire format on the local engine: `skills__<name>`) with the operator-authored description. Tool dispatch:
 
-1. **Catalog merge.** At boot, eligible skills (`tool: true && tier: ollama`) become `SdkMcpToolDefinition` entries with input schema `{ args: string }`. They're merged into `integrationTools` and `integrationToolTiers` (all `auto`-allow) before `ollamaDeps` is constructed.
-2. **Per-turn context propagation.** `runOllamaTurnWithTools` wraps the loop in `skillToolCtx.run({chatId, fromId, updateId, parentAuditId}, () => runToolLoop(...))`. The skill handler reads the store via `AsyncLocalStorage.getStore()` — needed because the SDK tool-handler signature `(args, extra) => ...` leaves no slot for chat context, and concurrent turns require race-free context (the queue runs N chats in parallel). ALS is the standard Node primitive for this.
-3. **Handler.** Reads ALS context, calls `runSkillBare`, writes a fresh audit row with `origin='tool_call'` so operators can distinguish agent-driven invocations from operator-typed `/<skill>` calls (`origin='user'`). Returns the model's text as the tool result; the parent Ollama turn composes its final user-facing reply on top.
-4. **Permission tier.** Auto-allow. Cost cap is the backstop (Phase 1 ollama skills are free; Phase 2 unlocks Claude-tier skills with a per-skill cost cap).
+1. **Catalog merge.** At boot, eligible skills (`tool: true && tier: local`) become `SdkMcpToolDefinition` entries with input schema `{ args: string }`. They're merged into `integrationTools` and `integrationToolTiers` (all `auto`-allow) before `localDeps` is constructed.
+2. **Per-turn context propagation.** `runLocalTurnWithTools` wraps the loop in `skillToolCtx.run({chatId, fromId, updateId, parentAuditId}, () => runToolLoop(...))`. The skill handler reads the store via `AsyncLocalStorage.getStore()` — needed because the SDK tool-handler signature `(args, extra) => ...` leaves no slot for chat context, and concurrent turns require race-free context (the queue runs N chats in parallel). ALS is the standard Node primitive for this.
+3. **Handler.** Reads ALS context, calls `runSkillBare`, writes a fresh audit row with `origin='tool_call'` so operators can distinguish agent-driven invocations from operator-typed `/<skill>` calls (`origin='user'`). Returns the model's text as the tool result; the parent local turn composes its final user-facing reply on top.
+4. **Permission tier.** Auto-allow. Cost cap is the backstop (Phase 1 local-tier skills are free; Phase 2 unlocks Claude-tier skills with a per-skill cost cap).
 
 **Recursion safety (load-bearing).** A skill body must not be able to call itself. Direct recursion is prevented by filtering the skill's own `skills__<self>` entry out of the MCP catalog `runSkillBareWithTools` hands to `runToolLoop` (see `commands.ts::runSkillBareWithTools`). Indirect recursion (A → `skills__B` → `skills__A`) is bounded by two backstops in series: `skill.maxTurns` caps the tool-loop iterations for each invocation, and the shared loop detector (`policy.ts::createLoopDetector`, fresh per invocation, threshold 3 identical `(tool, input)` calls) trips before a deep cycle materializes. `skill-tools.test.ts` asserts the self-filter; a regression breaks CI before production.
 
-**Phase 2 deferred.** Cross-engine tool calls (Ollama agent → Sonnet skill) would land via the same SDK MCP server already used for integrations. Phase 1's ollama-tier restriction sidesteps the cost-escalation question (a misbehaving Ollama agent calling a `tier: primary` skill 100× would burn real $$$). When Phase 2 lands, expect a per-skill cost cap and a `confirm`-tier option for Claude-backed tool calls.
+**Phase 2 deferred.** Cross-engine tool calls (local agent → Sonnet skill) would land via the same SDK MCP server already used for integrations. Phase 1's local-tier restriction sidesteps the cost-escalation question (a misbehaving local agent calling a `tier: primary` skill 100× would burn real $$$). When Phase 2 lands, expect a per-skill cost cap and a `confirm`-tier option for Claude-backed tool calls.
 
 ### Scheduled tasks — operator-authored cron prompts
 
@@ -287,13 +291,13 @@ Reply for both: model output verbatim, HTML-escaped, truncated to ≈3,500 chars
 2. **Schedule grammar** — 5-field unix cron via `cron:` or absolute one-off via `at:` (mutually exclusive). `tz:` is per-task with `$TZ`-env / host fallback. `cron-parser@5.5.0` (exact-pinned) handles tz + DST semantics (spring-forward skipped, fall-back single fire). Pure `validateCronExpr(expr, tz)` and pure `nextRunAt(task, lastRunAt, now)`. Predefined cron aliases (`@daily`, `@hourly`) are rejected at parse to keep the grammar one-shape; 4-field and 6-field expressions are pre-rejected before the parser sees them.
 3. **Tick driver** — single shared `setInterval(60_000)` scans the registry, compares `nextRunAt(...)` to now, fires due tasks via the existing `queue.enqueue`. Boot fire runs the first tick immediately so jitter=0 catch-up tasks don't wait 60s. **Fresh tasks (never-run) do NOT boot-fire under cron** — cron is anchored, not stateful; a fresh deploy at 14:00 with `0 9 * * *` waits until tomorrow 09:00. Catch-up after restart still works: when `last_run_at` is set and the next cron fire after it is in the past, the task fires ONCE at boot.
 
-**Synthetic-update construction.** The driver builds a `Update` with negative `update_id` (avoids any chance of colliding with Telegram's positive offset space — `handled_updates.update_id` IS PRIMARY KEY, so a synthetic id colliding with a future poll offset would silently dedupe a real user message). Scheduler fires NEVER write to `handled_updates`. The synthesized message carries an `__solrac_scheduled` field with `{name, maxCostUsd}` that `main.ts::makeRunTurn` extracts and propagates into the runner's `AgentRunInput.scheduledTaskName` / `OllamaRunInput.scheduledTaskName`. The audit row gets `origin='scheduled'` + `task_name=<name>`; cost cap, allowlist gate, and policy hooks all apply uniformly to user-typed and scheduled paths.
+**Synthetic-update construction.** The driver builds a `Update` with negative `update_id` (avoids any chance of colliding with Telegram's positive offset space — `handled_updates.update_id` IS PRIMARY KEY, so a synthetic id colliding with a future poll offset would silently dedupe a real user message). Scheduler fires NEVER write to `handled_updates`. The synthesized message carries an `__solrac_scheduled` field with `{name, maxCostUsd}` that `main.ts::makeRunTurn` extracts and propagates into the runner's `AgentRunInput.scheduledTaskName` / `LocalRunInput.scheduledTaskName`. The audit row gets `origin='scheduled'` + `task_name=<name>`; cost cap, allowlist gate, and policy hooks all apply uniformly to user-typed and scheduled paths.
 
-**Engine-prefix mapping.** When a task's `engine` differs from `config.defaultEngine`, the scheduler prepends the matching prefix (`@` for primary, `!` for secondary) onto the message text. The existing `parseEnginePrefix` in `main.ts` then routes to the right runner, so the scheduler reuses one engine-routing path instead of building its own. `engine: ollama` is rejected at parse on Claude-default deploys (PR-B removed the `>` prefix; Ollama is reachable only as the deploy default).
+**Engine-prefix mapping.** When a task's `engine` differs from `config.defaultEngine`, the scheduler prepends the matching prefix (`@` for primary, `!` for secondary) onto the message text. The existing `parseEnginePrefix` in `main.ts` then routes to the right runner, so the scheduler reuses one engine-routing path instead of building its own. `engine: local` is rejected at parse on Claude-default deploys (there is no escape prefix; the local engine is reachable only as the deploy default). Legacy `engine: ollama` is hard-rejected at parse with a rename hint.
 
 **Catch-up policy.** `cron` defaults to `catch_up: true`; if `last_run_at` is set and the next cron fire after it is in the past at boot, the task fires ONCE (NOT N times for N missed slots). Never-run tasks (no `last_run_at`) do not boot-fire — cron is anchored, not stateful. `at` defaults to `catch_up: false`; an `at <past>` task is marked `one_off_consumed=1` without firing. `boot_catch_up_jitter_s` smears boot fires across a random window so 12 daily tasks don't all hit the model at once.
 
-**Per-task `max_cost_usd`** (Claude tiers only, silently ignored on Ollama). Pre-flight check: if `SUM(cost_usd)` for THIS task in past 1 hour ≥ cap, the fire is skipped and a denial audit row is written with `error_message = "task_cost_cap: …"`. The cap is **inter-fire**: a single fire's cost is never aborted mid-turn (cost only arrives at end-of-turn from the SDK).
+**Per-task `max_cost_usd`** (Claude tiers only, silently ignored on the local engine). Pre-flight check: if `SUM(cost_usd)` for THIS task in past 1 hour ≥ cap, the fire is skipped and a denial audit row is written with `error_message = "task_cost_cap: …"`. The cap is **inter-fire**: a single fire's cost is never aborted mid-turn (cost only arrives at end-of-turn from the SDK).
 
 **Shutdown.** `lifecycle.ts::installShutdown` calls `scheduler.stop()` BEFORE `pollAbort.abort()` so no new fires land mid-drain. In-flight task turns ride the existing `TurnTracker` through drain.
 
@@ -415,14 +419,14 @@ Tools surface to the model as `mcp__solrac__<name>`. The full picture:
   - `gmail` — multi-account Gmail via OAuth2 (11 tools). Self-gates on `googleapis` + per-alias token files in `~/.solrac/gmail/`.
   - `notion` — single-token Notion API (10 tools: 6 reads `auto`, 4 writes `confirm`, with `notion_archive_page` requiring an explicit body `confirm: true` field). Self-gates on `@notionhq/client` (shipped) + `NOTION_API_KEY` + a 3s `/v1/users/me` boot probe. The token is scrubbed from the SDK subprocess via `agent.ts::sanitizedSubprocessEnv` so an auto-allowed `Bash(echo …)` cannot exfiltrate it.
 
-### Ollama scope
+### Local-engine scope
 
-`runOllamaTurn` in `ollama.ts` branches on `OLLAMA_TOOLS_ENABLED`:
+`runLocalTurn` in `local.ts` branches on `LOCAL_TOOLS_ENABLED`. The wire-format work lives in `local-driver.ts`'s `LocalDriver` interface — `createOllamaDriver` (NDJSON `/api/chat`) and `createLmstudioDriver` (SSE `/v1/chat/completions`, with `parallel_tool_calls: false` Gemma-4 workaround + tool-call arg-delta accumulation + `[DONE]` terminator handling). Both drivers emit a uniform `LocalChatEvent` union (`{ kind: "text" | "tool_call" | "done" | "error", ... }`); `local.ts` and `local-tools.ts` are wire-format-agnostic above that line.
 
-- **Tools off (default for Claude-only deploys):** single-shot streaming via `/api/chat`. No tools exposed; `audit.tool_calls` is `null`. The capability note (`ollama.ts::buildOllamaCapabilityNote`) tells the model it has no tools and nudges users toward `@`/`!` for tool-shaped requests.
-- **Tools on (recommended for the Ollama-default deploy; precondition: `SOLRAC_INTEGRATIONS_ENABLED=true`):** multi-round tool loop in `src/ollama-tools.ts::runToolLoop`. The local model receives the same `mcp__solrac__*` integration tools the Claude tiers see, with per-call gating reused from `policy.ts` (`classifyToolWithIntegrations`, the `LoopDetector`, the `ConfirmationBroker`). `OLLAMA_MAX_TOOL_ITERATIONS` (default 8) backstops a single shared `AbortSignal` covering every fetch in the turn. `audit.tool_calls` records the executed calls. The capability note advertises the loaded tool names so the model knows what it can call.
+- **Tools off (default for Claude-only deploys):** single-shot streaming through the driver. No tools exposed; `audit.tool_calls` is `null`. The capability note (`local.ts::buildLocalCapabilityNote`) tells the model it has no tools and nudges users toward `@`/`!` for tool-shaped requests.
+- **Tools on (recommended for the local-default deploy; precondition: `SOLRAC_INTEGRATIONS_ENABLED=true`):** multi-round tool loop in `src/local-tools.ts::runToolLoop`. The local model receives the same `mcp__solrac__*` integration tools the Claude tiers see, with per-call gating reused from `policy.ts` (`classifyToolWithIntegrations`, the `LoopDetector`, the `ConfirmationBroker`). `LOCAL_MAX_TOOL_ITERATIONS` (default 8) backstops a single shared `AbortSignal` covering every fetch in the turn. `audit.tool_calls` records the executed calls. The capability note advertises the loaded tool names so the model knows what it can call.
 
-Both paths share the audit row format, the streaming stub UX, the cost-cap-doesn't-apply rule (`cost_usd = 0`), the cross-engine context bridge, and the `disallowedTools` belt-and-suspenders (`OLLAMA_DENY_TOOLS` mirrors `agent.ts`'s SDK-level `disallowedTools: ["Agent","Task"]`). Reliability of Ollama tool-calling varies sharply by model — `gemma4:e4b` is the recommended baseline.
+Both paths share the audit row format, the streaming stub UX, the cost-cap-doesn't-apply rule (`cost_usd = 0`), the cross-engine context bridge, and the `disallowedTools` belt-and-suspenders (`LOCAL_DENY_TOOLS` mirrors `agent.ts`'s SDK-level `disallowedTools: ["Agent","Task"]`). Reliability of local-engine tool-calling varies sharply by model — `gemma4:e4b` (Ollama) is the recommended baseline; LMStudio additionally needs the driver's identical-`(name, args)` dedup to work around Gemma-4's duplicate-tool-call quirk (lmstudio-bug-tracker #1756).
 
 ---
 
@@ -683,7 +687,7 @@ Global is checked first because if the host is over its absolute budget, every c
 
 **v1 limitation:** both caps measure Anthropic API spend only. Tools that call paid third-party APIs (e.g. a `replicate` CLI) aren't measured; auto-deny rules in the classifier are the v1 mitigation. See [`ROADMAP.md` OQ#5 — cost surprises beyond Anthropic](./ROADMAP.md#oq5-cost-surprises-beyond-anthropic).
 
-**Ollama tool calls are NOT gated by either cost cap.** Ollama is free; the cap exists to bound Anthropic spend. The `OLLAMA_MAX_TOOL_ITERATIONS` ceiling and the per-turn loop detector are the runaway-loop defenses for the local path. Confirm-tier tools still go through the same `ConfirmationBroker` regardless of engine.
+**Local-engine tool calls are NOT gated by either cost cap.** The local engine is free; the cap exists to bound Anthropic spend. The `LOCAL_MAX_TOOL_ITERATIONS` ceiling and the per-turn loop detector are the runaway-loop defenses for the local path. Confirm-tier tools still go through the same `ConfirmationBroker` regardless of engine.
 
 ---
 
@@ -691,31 +695,33 @@ Global is checked first because if the host is over its absolute budget, every c
 
 ## Engine routing (prefix table)
 
-The first non-whitespace character of `msg.text` picks the engine; with no prefix, `SOLRAC_DEFAULT_ENGINE` (default `ollama`) decides. The default routes no-prefix messages to the local Ollama path, so Anthropic burn happens only on a deliberate `@` (Sonnet) or `!` (Opus).
+The first non-whitespace character of `msg.text` picks the engine; with no prefix, `SOLRAC_DEFAULT_ENGINE` (default `local`) decides. The default routes no-prefix messages to the local-engine path, so Anthropic burn happens only on a deliberate `@` (Sonnet) or `!` (Opus). The local backend is picked at deploy time via `LOCAL_BACKEND` (`ollama` | `lmstudio`); the engine layer is backend-agnostic.
 
 | Prefix | Engine label | Model | Tools | Audit `model` value |
 |--------|--------------|-------|-------|---------------------|
-| (none) | depends on `SOLRAC_DEFAULT_ENGINE` (`ollama` by default) | `OLLAMA_MODEL` for default-Ollama; otherwise the matching tier model | integrations only on Ollama (when `OLLAMA_TOOLS_ENABLED=true`); `claude_code` preset + integrations on Claude | matches the resolved engine |
+| (none) | depends on `SOLRAC_DEFAULT_ENGINE` (`local` by default) | `LOCAL_MODEL` on `LOCAL_BACKEND` for default-local; otherwise the matching tier model | integrations only on the local engine (when `LOCAL_TOOLS_ENABLED=true`); `claude_code` preset + integrations on Claude | matches the resolved engine |
 | `@` | `primary` (Claude) — escalation | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | `claude_code` preset + integrations | `claude:primary:<modelId>` |
 | `!` | `secondary` (Claude) — heaviest | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | `claude_code` preset + integrations | `claude:secondary:<modelId>` |
 
-There is no `>`-style escape prefix. A leading `>` is literal user text routed via no-prefix → `defaultEngine`. The local Ollama path is reached only when it is the default engine.
+There is no `>`-style escape prefix. A leading `>` is literal user text routed via no-prefix → `defaultEngine`. The local-engine path is reached only when it is the default engine.
 
 `policy.ts::parseEnginePrefix(text, defaultEngine)` returns `{ engine, explicit, prompt }`. `explicit` is true only when an actual prefix character (`@` or `!`) was consumed; `main.ts` uses it to render usage hints on empty explicit-prefix payloads.
 
-**Design rationale.** *Claude only when explicitly requested.* Anthropic burn happens on a deliberate `@` or `!`; everything else stays local and free. The integration surface (operator-authored + blessed `mcp__solrac__*` tools) is shared across all three engines — Ollama gets it via `OLLAMA_TOOLS_ENABLED=true`, both Claude tiers get it via the `claude_code` preset.
+**Design rationale.** *Claude only when explicitly requested.* Anthropic burn happens on a deliberate `@` or `!`; everything else stays local and free. The integration surface (operator-authored + blessed `mcp__solrac__*` tools) is shared across all three engines — the local engine gets it via `LOCAL_TOOLS_ENABLED=true`, both Claude tiers get it via the `claude_code` preset.
 
 **Boot validation enforces reachability:**
 
-- `defaultEngine === "ollama" && !ollamaEnabled` → throw (the default would error every turn).
-- `defaultEngine !== "ollama" && ollamaToolsEnabled` → throw (Ollama runs only as the default; tools-on without it being the default would load tool schemas no engine can call).
+- `defaultEngine === "local" && !localEnabled` → throw (the default would error every turn).
+- `defaultEngine !== "local" && localToolsEnabled` → throw (the local engine runs only as the default; tools-on without it being the default would load tool schemas no engine can call).
+- `localEnabled === true && (!localBackend || !localModel)` → throw (the backend driver can't be constructed).
+- `SOLRAC_DEFAULT_ENGINE=ollama` (legacy) → throw with a rename hint pointing at `local` + `LOCAL_BACKEND=ollama`. Same for every legacy `OLLAMA_*` env var.
 
-When `defaultEngine === "ollama"`, boot fires a one-shot `GET /api/tags` health probe; failures are logged (`ollama.boot_health_failed`) but non-fatal — daemon may come up after Solrac under systemd, and we don't want to crash the unit on a transient.
+When `defaultEngine === "local"`, boot fires a one-shot backend health probe via `driver.probe()` (`/api/tags` for Ollama, `/v1/models` for LMStudio); failures are logged (`local.boot_health_failed`) but non-fatal — the backend may come up after Solrac under systemd, and we don't want to crash the unit on a transient.
 
 ```
 poll → gate → throttle → queue.enqueue
                           └─ runTurn (queued)
-                              ├─ engine === 'ollama'    → runOllamaTurn
+                              ├─ engine === 'local'     → runLocalTurn
                               └─ 'primary' | 'secondary' → runAgent({engine, ...})
 ```
 
@@ -727,7 +733,7 @@ Both Claude tiers share the SDK preset, tools, hooks, MCP, `disallowedTools`, an
 
 ### Cross-engine context bridge
 
-The architectural challenge of multi-engine routing: each engine's "view" of the chat history differs. Claude tiers resume via SDK session; Ollama is stateless. If a user mixes engines in one chat, each engine's narrow history would diverge from the user's mental model of "single thread."
+The architectural challenge of multi-engine routing: each engine's "view" of the chat history differs. Claude tiers resume via SDK session; the local engine is stateless. If a user mixes engines in one chat, each engine's narrow history would diverge from the user's mental model of "single thread."
 
 Solution — `db.outOfBandForEngine(chatId, currentEnginePrefix, limit)`:
 
@@ -742,13 +748,13 @@ WHERE chat_id = ? AND model NOT LIKE ? AND status = 'ok'
 ORDER BY started_at ASC LIMIT ?
 ```
 
-Caller passes its own engine's prefix (e.g. `'claude:primary:%'`, `'ollama:%'`). Returns turns from OTHER engines whose `started_at` exceeds this engine's most recent successful turn — i.e. exchanges this engine missed. Both Claude tiers prepend those rows to the user prompt as a self-describing context block before calling the SDK; Ollama uses the simpler `recentChatTurns` (which sees every engine without filtering) since it rebuilds its full history every turn anyway.
+Caller passes its own engine's prefix (e.g. `'claude:primary:%'`, `'local:%'`). Returns turns from OTHER engines whose `started_at` exceeds this engine's most recent successful turn — i.e. exchanges this engine missed. Both Claude tiers prepend those rows to the user prompt as a self-describing context block before calling the SDK; the local engine uses the simpler `recentChatTurns` (which sees every engine without filtering) since it rebuilds its full history every turn anyway. **Dual-pattern reads:** `outOfBandForEngine` and `hasLocalTurnsSince` match BOTH `local:%` and legacy `ollama:%` for one release so a partial migration doesn't lose history; the legacy clause is removed in a follow-up release.
 
 ```
 [Out-of-band context: the user had the following exchange(s) in this chat with another engine since I last spoke...]
 
 User: tell me about MATLAB
-Other engine (ollama:gemma4:e4b): MATLAB is a paid software...
+Other engine (local:ollama:gemma4:e4b): MATLAB is a paid software...
 
 [End of out-of-band context. The user's current message:]
 
@@ -761,73 +767,92 @@ Default `OUT_OF_BAND_LIMIT=6` (in `agent.ts`) bounds the per-turn token cost: 25
 
 ### Audit `model` format
 
-Three-segment shape (`engine:tier:modelId`) keeps tier identity stable across model-id bumps. A future env bump from `claude-sonnet-4-6` to `claude-sonnet-4-8` doesn't fragment primary's history — the `LIKE 'claude:primary:%'` pattern still matches.
+Three-segment shape (`engine:tier-or-backend:modelId`) keeps tier identity stable across model-id bumps. A future env bump from `claude-sonnet-4-6` to `claude-sonnet-4-8` doesn't fragment primary's history — the `LIKE 'claude:primary:%'` pattern still matches. A future backend swap (Ollama → LMStudio) doesn't fragment the local engine's history either — `LIKE 'local:%'` matches both.
 
 | Source | Format | Example |
 |--------|--------|---------|
 | Claude primary | `claude:primary:<modelId>` | `claude:primary:claude-sonnet-4-6` |
 | Claude secondary | `claude:secondary:<modelId>` | `claude:secondary:claude-opus-4-7` |
-| Ollama | `ollama:<modelId>` | `ollama:llama3.2` |
+| Local engine | `local:<backend>:<modelId>` (`<backend>` ∈ `ollama` / `lmstudio`) | `local:ollama:gemma4:e4b`, `local:lmstudio:qwen2.5-7b` |
 | Denial / queue-full | `system` | `system` |
 | Legacy (single-tier era) | `claude` | retagged at first boot to `claude:secondary:claude-opus-4-7` |
+| Legacy (pre-`local` rename) | `ollama:<modelId>` | retagged in place at first boot to `local:ollama:<modelId>` |
 
-The retag migration is an idempotent `UPDATE audit SET model = 'claude:secondary:claude-opus-4-7' WHERE model = 'claude'` in `db.ts::openDb`. Pre-tier rows ran on the then-default `SOLRAC_MODEL=claude-opus-4-7`, which is now the secondary tier; retagging keeps cross-tier OOB queries honest about historical turns.
+The two retag migrations are idempotent and live in `db.ts::openDb`:
+
+```sql
+-- Local-engine retag (runs FIRST so dual-pattern reads work even if a crash interrupts before the column rename below)
+UPDATE audit SET model = 'local:ollama:' || substr(model, 8) WHERE model LIKE 'ollama:%';
+
+-- Single-tier-era retag (older migration; still idempotent)
+UPDATE audit SET model = 'claude:secondary:claude-opus-4-7' WHERE model = 'claude';
+```
+
+Pre-tier rows ran on the then-default `SOLRAC_MODEL=claude-opus-4-7`, which is now the secondary tier; retagging keeps cross-tier OOB queries honest about historical turns. Pre-`local`-rename rows from the Ollama-only era are retagged so the new three-segment shape applies uniformly. The `sessions.ollama_cutoff_ms` column is renamed to `sessions.local_cutoff_ms` in the same boot migration; the audit retag runs BEFORE the column rename so a mid-migration crash still leaves audit queries (dual-pattern reads) working.
 
 ---
 
-<a id="ollama-routing"></a>
+<a id="local-routing"></a>
+<a id="ollama-routing"></a><!-- legacy anchor preserved for inbound links -->
 
-## Ollama local-model routing
+## Local-model routing
 
-Ollama is the default engine in the recommended config (`SOLRAC_DEFAULT_ENGINE=ollama`). No-prefix messages route here; Claude tiers are reached via explicit `@` / `!`. There is no `>`-style escape prefix — Ollama runs only as the default, so an extra prefix character would be redundant.
+The local engine is the default in the recommended config (`SOLRAC_DEFAULT_ENGINE=local`). No-prefix messages route here; Claude tiers are reached via explicit `@` / `!`. There is no `>`-style escape prefix — the local engine runs only as the default, so an extra prefix character would be redundant.
 
-Motivation: (1) most casual chat doesn't need Claude's reasoning, so the free local path becomes the workhorse; (2) when `OLLAMA_TOOLS_ENABLED=true`, the local model can call the same `mcp__solrac__*` integrations Claude does — the operator's tool surface is what makes default-Ollama useful for tool-driven work.
+Backend selection sits one layer below the engine. `LOCAL_BACKEND` (`ollama` | `lmstudio`) picks the wire driver in `local-driver.ts`:
+- `ollama` — NDJSON `/api/chat`, probe `/api/tags`; default port 11434.
+- `lmstudio` — SSE `/v1/chat/completions` (with `parallel_tool_calls: false` Gemma-4 workaround + tool-call argument-delta accumulation + `[DONE]` terminator + optional trailing `usage` chunk), probe `/v1/models`; default port 1234.
+
+The `LocalDriver.streamChat` interface emits a uniform `LocalChatEvent` union (`{ kind: "text" | "tool_call" | "done" | "error", ... }`); everything above the driver layer (`local.ts`, `local-tools.ts`, `skill-tools.ts`) is wire-format-agnostic. Adding a third backend (vLLM, llama.cpp) means writing one more `create<Backend>Driver` and registering it in the factory.
+
+Motivation: (1) most casual chat doesn't need Claude's reasoning, so the free local path becomes the workhorse; (2) when `LOCAL_TOOLS_ENABLED=true`, the local model can call the same `mcp__solrac__*` integrations Claude does — the operator's tool surface is what makes default-local useful for tool-driven work.
 
 ### What's the same as Claude
 
 - **Allowlist + denial throttle**: gate happens before queue, every engine falls through the same gate.
-- **Audit row**: same `audit` table; the `model` column distinguishes engines (`ollama:llama3.2` vs `claude:primary:claude-sonnet-4-6` vs `claude:secondary:claude-opus-4-7` etc — see [engine routing](#engine-routing) for the full format).
-- **Per-chat workspace**: not used — the Ollama path has no shell/filesystem tools (no `claude_code` preset). With `OLLAMA_TOOLS_ENABLED=true`, integration tools execute as in-process TS handlers and don't need a working directory.
-- **Streaming UX**: 🦙 stub → throttled `editMessageText` (same `EDIT_THROTTLE_MS = 1500` constant) → final edit with footer. The no-op-edit guard applies; the footer (`<i>✅ ollama:<model> · Ns</i>`) is load-bearing for the same reason.
+- **Audit row**: same `audit` table; the `model` column distinguishes engines (`local:ollama:gemma4:e4b` vs `local:lmstudio:qwen2.5-7b` vs `claude:primary:claude-sonnet-4-6` etc — see [engine routing](#engine-routing) for the full format).
+- **Per-chat workspace**: not used — the local-engine path has no shell/filesystem tools (no `claude_code` preset). With `LOCAL_TOOLS_ENABLED=true`, integration tools execute as in-process TS handlers and don't need a working directory.
+- **Streaming UX**: 💻 stub → throttled `editMessageText` (same `EDIT_THROTTLE_MS = 1500` constant) → final edit with footer. The no-op-edit guard applies; the footer (`<i>✅ local:<backend>:<model> · Ns</i>`) is load-bearing for the same reason.
 
 ### What's different
 
-- **No `canUseTool` / `PreToolUse` SDK hooks**: the SDK isn't in the loop. With `OLLAMA_TOOLS_ENABLED=true`, the same gates run inside `runToolLoop` (cost cap doesn't apply since cost is zero, but `LoopDetector` and `ConfirmationBroker` do). With tools off, no gates run at all — there are no tool calls to gate.
-- **No `SessionStore` resume**: Ollama's `/api/chat` is stateless per call. Conversation continuity comes from history reconstruction, not session IDs.
-- **No `claude_code` system-prompt preset**: Ollama doesn't know it. The first `system` message is `${soul}\n\n${capabilityNote}` — the operator-editable `SOUL.md` text plus a one-line engine-specific clause built by `ollama.ts::buildOllamaCapabilityNote` (which adapts based on whether tools are on, and whether Ollama is the default engine vs. an explicit escalation target). When `SOLRAC.md` is present and activated, its content ships as a second `system` message wrapped in `<solrac-md>` (a separate turn rather than concatenated, since local models lack RLHF on instruction hierarchy).
-- **`cost_usd = 0`** in audit rows. Cost-cap queries sum over all rows so Ollama doesn't pollute the cap window — the per-chat and global cost caps are unaffected.
-- **`agent_session_id = null`** and **`tool_calls = null`** in audit rows.
+- **No `canUseTool` / `PreToolUse` SDK hooks**: the SDK isn't in the loop. With `LOCAL_TOOLS_ENABLED=true`, the same gates run inside `runToolLoop` (cost cap doesn't apply since cost is zero, but `LoopDetector` and `ConfirmationBroker` do). With tools off, no gates run at all — there are no tool calls to gate.
+- **No `SessionStore` resume**: the backend chat endpoint is stateless per call (both Ollama and LMStudio). Conversation continuity comes from history reconstruction, not session IDs.
+- **No `claude_code` system-prompt preset**: local backends don't know it. The first `system` message is `${soul}\n\n${capabilityNote}` — the operator-editable `SOUL.md` text plus a one-line engine-specific clause built by `local.ts::buildLocalCapabilityNote` (which adapts based on whether tools are on, and whether the local engine is the default vs. an explicit escalation target). When `SOLRAC.md` is present and activated, its content ships as a second `system` message wrapped in `<solrac-md>` (a separate turn rather than concatenated, since local models lack RLHF on instruction hierarchy).
+- **`cost_usd = 0`** in audit rows. Cost-cap queries sum over all rows so the local engine doesn't pollute the cap window — the per-chat and global cost caps are unaffected.
+- **`agent_session_id = null`** and **`tool_calls = null`** in audit rows when tools are off.
 
 ### Stateful conversation history
 
-`db.recentChatTurns(chatId, limit)` returns the last N successful turns for this chat **regardless of which engine produced them**, in chronological order. The query carries no `model` filter — the `prompt IS NOT NULL AND response IS NOT NULL` predicate already excludes denial / queue-full rows, and successful turns from any engine flow through. The `model` field on each row tags origin so the consumer can render an origin label.
+`db.recentChatTurns(chatId, limit)` returns the last N successful turns for this chat **regardless of which engine produced them**, in chronological order. The query carries no `model` filter — the `prompt IS NOT NULL AND response IS NOT NULL` predicate already excludes denial / queue-full rows, and successful turns from any engine flow through. The `model` field on each row tags origin so the consumer can render an origin label. The query honors `sessions.local_cutoff_ms` so `/clear local` genuinely wipes the local-engine view of the chat without touching the audit log.
 
-For the Claude tiers' reverse direction (Claude follow-up to a prior Ollama or other-tier exchange), the SDK session resume only knows about same-tier turns. The cross-engine bridge (`db.outOfBandForEngine`) is documented under [Engine routing](#engine-routing) — same pattern, parameterized on the calling engine's prefix.
+For the Claude tiers' reverse direction (Claude follow-up to a prior local or other-tier exchange), the SDK session resume only knows about same-tier turns. The cross-engine bridge (`db.outOfBandForEngine`) is documented under [Engine routing](#engine-routing) — same pattern, parameterized on the calling engine's prefix; honors the same `local_cutoff_ms` so a `/clear local` hides legacy and post-rename rows symmetrically across engines.
 
-Default `OLLAMA_HISTORY_LIMIT=6` = 3 round-trips. At 256-char truncated prompts × 6 turns, worst-case context is ~3k tokens — fine for any modern Ollama default. The Claude-side out-of-band cap (`OUT_OF_BAND_LIMIT` in `agent.ts`) is also 6, so the per-turn token cost is bounded.
+Default `LOCAL_HISTORY_LIMIT=6` = 3 round-trips. At 256-char truncated prompts × 6 turns, worst-case context is ~3k tokens — fine for any modern local default. The Claude-side out-of-band cap (`OUT_OF_BAND_LIMIT` in `agent.ts`) is also 6, so the per-turn token cost is bounded.
 
-`recentChatTurns` is keyed by the `idx_audit_chat_model_started` composite index. Pre-multi-engine databases get the `model` column added via `ALTER TABLE` at first boot; legacy rows tagged `'claude'` are retagged to `'claude:secondary:claude-opus-4-7'` (see retag migration in [engine routing](#engine-routing)). Both migrations are idempotent (`PRAGMA table_info` / `WHERE model='claude'` guards).
+`recentChatTurns` is keyed by the `idx_audit_chat_model_started` composite index. Pre-multi-engine databases get the `model` column added via `ALTER TABLE` at first boot; legacy rows tagged `'claude'` are retagged to `'claude:secondary:claude-opus-4-7'`, and legacy `'ollama:<model>'` rows are retagged in-place to `'local:ollama:<model>'` (see retag migration in [engine routing](#engine-routing)). All migrations are idempotent (`PRAGMA table_info` / `WHERE model='claude'` / `WHERE model LIKE 'ollama:%'` guards).
 
 ### Error handling
 
 | Condition | Render | Audit |
 |-----------|--------|-------|
-| Ollama unreachable | `❌ ollama unreachable: <url>` | `status='error', error_message='ollama unreachable: ...'` |
-| Model not pulled | `❌ ollama model not found: <model> — pull with \`ollama pull <model>\` on the host` | `status='error', error_message='...'` |
-| Stream timeout (`OLLAMA_TIMEOUT_MS`) | `❌ ollama timed out after Ns` | `status='error'` |
-| Other HTTP failure | `❌ ollama error: <status> <body-slice>` | `status='error'` |
+| Local backend unreachable | `❌ local unreachable: <url>` | `status='error', error_message='local unreachable: ...'` |
+| Model not pulled / loaded | `❌ local model not found: <model> — pull with \`ollama pull <model>\` (Ollama) or load via LMStudio` | `status='error', error_message='...'` |
+| Stream timeout (`LOCAL_TIMEOUT_MS`) | `❌ local timed out after Ns` | `status='error'` |
+| Other HTTP failure | `❌ local error: <status> <body-slice>` | `status='error'` |
 
 ### Empty-prompt + misconfiguration paths
 
 - `@` or `!` alone (or with only whitespace after) → renders a one-line usage hint naming the target tier; no audit row, no enqueue.
-- `SOLRAC_DEFAULT_ENGINE=ollama` with `OLLAMA_ENABLED=false` is rejected at **boot** (`config.ts` throws), not per-turn — the daemon-down case lands as `❌ ollama unreachable: <url>` per the [Error handling](#error-handling) table when `OLLAMA_ENABLED=true` but the daemon is down.
+- `SOLRAC_DEFAULT_ENGINE=local` with `LOCAL_ENABLED=false` is rejected at **boot** (`config.ts` throws), not per-turn — the daemon-down case lands as `❌ local unreachable: <url>` per the [Error handling](#error-handling) table when `LOCAL_ENABLED=true` but the backend is down.
+- `SOLRAC_DEFAULT_ENGINE=ollama` (legacy) is rejected at boot with a rename hint pointing at `SOLRAC_DEFAULT_ENGINE=local` + `LOCAL_BACKEND=ollama`.
 
 ### Limitations / open questions
 
-- **OQ-A**: history is per-chat across all Ollama models. If we later add `>llama3.2 ...` vs `>qwen2.5 ...` model selection, the query needs `AND model = ?`.
+- **OQ-A**: history is per-chat across all local models. If we later add `>gemma3 ...` vs `>qwen2.5 ...` model selection, the query needs `AND model = ?`.
 - **OQ-B**: history is capped by *count*, not tokens. A 2k-context model will silently truncate.
-- **OQ-C**: per-Ollama concurrency cap. Today Ollama shares the global `MAX_CONCURRENT_TURNS=4` semaphore with Claude. Local inference is GPU-bound; 4 simultaneous Ollama streams thrash a single GPU. Add a separate `MAX_CONCURRENT_OLLAMA_TURNS` semaphore in front of the Ollama path if measured.
-- **OQ-D**: no inference-budget cap. Ollama is free, but a flooder could pin the GPU. Allowlist gates strangers.
+- **OQ-C**: per-local-engine concurrency cap. Today the local engine shares the global `MAX_CONCURRENT_TURNS=4` semaphore with Claude. Local inference is GPU-bound; 4 simultaneous local streams thrash a single GPU. Add a separate `MAX_CONCURRENT_LOCAL_TURNS` semaphore in front of the local path if measured.
+- **OQ-D**: no inference-budget cap. The local engine is free, but a flooder could pin the GPU. Allowlist gates strangers.
 
 ---
 
@@ -850,7 +875,7 @@ The threat surface for v1:
 | Two pollers race | PID file + 409-on-conflict fast exit | `poll.ts::acquirePidFile` + `TelegramConflictError` |
 | `/stats` leaks ops data | Bearer auth + constant-time compare | `server.ts::authorizeBearer` |
 
-Each defense has unit tests; live smokes live under `test/smokes/` (`npm run smoke:flood`, `npm run smoke:ollama`, `npm run smoke:integrations`).
+Each defense has unit tests; live smokes live under `test/smokes/` (`npm run smoke:flood`, `LOCAL_BACKEND=<ollama|lmstudio> npm run smoke:local`, `npm run smoke:integrations`).
 
 ### Allowlist gates on `from.id`, not `chat.id`
 
@@ -1116,7 +1141,7 @@ Off by default. Enabled via `SOLRAC_WEB_ENABLED=true` plus a token. Brings a bro
 
 ### How it preserves the existing path
 
-`agent.ts` and `ollama.ts` already accept any `TelegramClient`. main.ts builds a parallel `WebClient`, a parallel `commandDeps` (with `tg = webClient`), a parallel `OllamaRunDeps`, and a parallel `ConfirmationBroker` (also pointed at `webClient`). The single turn queue's `runTurn` dispatches to the web variants when the synthetic `webChatId` is on the update; otherwise the Telegram path runs unchanged.
+`agent.ts` and `local.ts` already accept any `TelegramClient`. main.ts builds a parallel `WebClient`, a parallel `commandDeps` (with `tg = webClient`), a parallel `LocalRunDeps`, and a parallel `ConfirmationBroker` (also pointed at `webClient`). The single turn queue's `runTurn` dispatches to the web variants when the synthetic `webChatId` is on the update; otherwise the Telegram path runs unchanged.
 
 ```
 Browser ──HTTP──▶ web.ts (Bun.serve, separate port)
@@ -1130,7 +1155,7 @@ Browser ──HTTP──▶ web.ts (Bun.serve, separate port)
    │                  │ runTurn dispatches by chatId → webRunTurn / tgRunTurn
    ◀──events────  WebClient (TelegramClient impl)
                        │
-                       └─▶ runAgent / runOllamaTurn (tg = webClient)
+                       └─▶ runAgent / runLocalTurn (tg = webClient)
                               audit row written, cost cap, policy hooks — all unchanged
 ```
 
@@ -1138,7 +1163,7 @@ Browser ──HTTP──▶ web.ts (Bun.serve, separate port)
 
 Telegram's HTML parse_mode supports a small subset (`<b> <i> <s> <a> <code> <pre> <blockquote>`). `agent.ts:495` previously emitted `htmlEscapeText(text)` on Claude's body, which preserved markdown syntax as literal characters in Telegram. The fix:
 
-- `agent.ts` and `ollama.ts` now run the response body through `mdToTelegramHtml(text)` for Telegram (proper bold, italic, code blocks; lists flattened to `• item`; headers to `<b>`; tables to ASCII inside `<pre>`).
+- `agent.ts` and `local.ts` now run the response body through `mdToTelegramHtml(text)` for Telegram (proper bold, italic, code blocks; lists flattened to `• item`; headers to `<b>`; tables to ASCII inside `<pre>`).
 - `SendMessageOpts` and `EditMessageTextOpts` carry an optional `markdownSource: string` sidecar. The real Telegram client (`telegram.ts:205-215`) destructures-and-drops it before `tgCall` — never hits the wire.
 - `WebClient` reads `markdownSource` preferentially; consumer (browser) renders it with `marked` + `sanitizeHtml`. If absent, the html-fallback (already sanitized at the SSE boundary) is used.
 

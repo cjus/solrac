@@ -37,7 +37,7 @@
  *   (the task's configured target chat), and `text` containing an explicit
  *   engine prefix when the task's `engine` differs from `config.defaultEngine`.
  *   A `__solrac_scheduled` field on the message carries the task identifier
- *   and the optional `max_cost_usd` cap; the runners (agent.ts, ollama.ts)
+ *   and the optional `max_cost_usd` cap; the runners (agent.ts, local.ts)
  *   read this off the message via main.ts::makeRunTurn and propagate it into
  *   the audit row (`origin='scheduled'`, `task_name=<name>`).
  *
@@ -79,8 +79,8 @@
  *   - `audit.update_id` is set to NULL for scheduled fires (column is plain
  *     INTEGER, no UNIQUE / no JOIN, so NULL is safe — verified via grep on
  *     `db.ts` and the rest of `src/`).
- *   - Engine `ollama` is rejected at parse when `config.defaultEngine !==
- *     "ollama"` because PR-B removed the `>` prefix; Ollama is reachable
+ *   - Engine `local` is rejected at parse when `config.defaultEngine !==
+ *     "local"`; the local engine is reachable
  *     only as the deploy default.
  *   - The tick loop is driven by ONE shared `setInterval(60_000)`. Boot fire
  *     runs the first tick immediately so tasks with `bootFireAt <= now`
@@ -98,7 +98,7 @@
  *   - `max_cost_usd` is a pre-flight check (sum of THIS task's costs in past
  *     1 hour ≥ cap → skip and write a denial row). It does NOT abort an
  *     in-flight turn; cost only arrives at end-of-turn from the SDK.
- *     Silently ignored for `engine: ollama` (free).
+ *     Silently ignored for `engine: local` (free).
  *
  * Cross-references:
  *   - PLAN.md — design source
@@ -123,7 +123,7 @@ import type { BotCommand } from "./telegram.ts";
 // Types
 // ---------------------------------------------------------------------------
 
-export type TaskEngine = "primary" | "secondary" | "ollama";
+export type TaskEngine = "primary" | "secondary" | "local";
 
 export type ScheduleSpec =
   | { kind: "cron"; expr: string }
@@ -185,11 +185,11 @@ const NAME_RE = /^[a-z0-9_]{1,32}$/;
 const MAX_DESCRIPTION_LEN = 256;
 const FRONTMATTER_DELIM = "---";
 
-// 5-min minimum for Claude tiers (cost runaway guard). Ollama is free so the
-// floor is 1 minute, but a 1-min Ollama task still pins the GPU — operator's
-// problem, document in examples.
+// 5-min minimum for Claude tiers (cost runaway guard). The local engine is
+// free so the floor is 1 minute, but a 1-min local task still pins the GPU —
+// operator's problem, document in examples.
 const MIN_CLAUDE_INTERVAL_MS = 5 * 60 * 1000;
-const MIN_OLLAMA_INTERVAL_MS = 1 * 60 * 1000;
+const MIN_LOCAL_INTERVAL_MS = 1 * 60 * 1000;
 
 // Per-task hourly cap pre-flight window. Matches the per-chat cap shape.
 const HOURLY_WINDOW_MS = 60 * 60 * 1000;
@@ -513,18 +513,25 @@ export function parseTaskFile(
     }
   }
 
-  // engine — defaults to deploy default. When explicit `ollama`, refuse if
-  // the deploy default isn't ollama (PR-B removed the `>` prefix).
-  let engine: TaskEngine = opts.defaultEngine === "ollama" ? "ollama" : opts.defaultEngine;
+  // engine — defaults to deploy default. When explicit `local`, refuse if
+  // the deploy default isn't local. Legacy `engine: ollama` is hard-rejected
+  // with a rename hint.
+  let engine: TaskEngine = opts.defaultEngine === "local" ? "local" : opts.defaultEngine;
   if ("engine" in f) {
     const engineVal = f.engine;
-    if (engineVal !== "primary" && engineVal !== "secondary" && engineVal !== "ollama") {
-      throw new Error(`${sourcePath}: "engine" must be primary | secondary | ollama (got "${String(engineVal)}")`);
-    }
-    if (engineVal === "ollama" && opts.defaultEngine !== "ollama") {
+    if (engineVal === "ollama") {
       throw new Error(
-        `${sourcePath}: "engine: ollama" is unreachable when SOLRAC_DEFAULT_ENGINE != ollama ` +
-          `(PR-B removed the > prefix). Set SOLRAC_DEFAULT_ENGINE=ollama or use engine: primary/secondary`,
+        `${sourcePath}: "engine: ollama" is no longer accepted — replace with "engine: local" ` +
+          `(the local engine now supports multiple backends via LOCAL_BACKEND)`,
+      );
+    }
+    if (engineVal !== "primary" && engineVal !== "secondary" && engineVal !== "local") {
+      throw new Error(`${sourcePath}: "engine" must be primary | secondary | local (got "${String(engineVal)}")`);
+    }
+    if (engineVal === "local" && opts.defaultEngine !== "local") {
+      throw new Error(
+        `${sourcePath}: "engine: local" is unreachable when SOLRAC_DEFAULT_ENGINE != local. ` +
+          `Set SOLRAC_DEFAULT_ENGINE=local or use engine: primary/secondary`,
       );
     }
     engine = engineVal;
@@ -535,7 +542,7 @@ export function parseTaskFile(
   // pathological `* * * * *` on Claude tiers at load time with a clear error.
   // `at` tasks are one-off; no interval to police.
   if (spec.kind === "cron") {
-    const minMs = engine === "ollama" ? MIN_OLLAMA_INTERVAL_MS : MIN_CLAUDE_INTERVAL_MS;
+    const minMs = engine === "local" ? MIN_LOCAL_INTERVAL_MS : MIN_CLAUDE_INTERVAL_MS;
     const iter = CronExpressionParser.parse(spec.expr, {
       tz,
       currentDate: new Date(0),
@@ -580,14 +587,14 @@ export function parseTaskFile(
     enabled = v;
   }
 
-  // max_cost_usd — optional positive number; ignored for ollama
+  // max_cost_usd — optional positive number; ignored for local engine
   let maxCostUsd: number | null = null;
   if ("max_cost_usd" in f) {
     const v = f.max_cost_usd;
     if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
       throw new Error(`${sourcePath}: "max_cost_usd" must be a positive number`);
     }
-    maxCostUsd = engine === "ollama" ? null : v;
+    maxCostUsd = engine === "local" ? null : v;
   }
 
   // boot_catch_up_jitter_s — optional non-negative integer
@@ -719,7 +726,7 @@ function buildEnginePrefix(taskEngine: TaskEngine, defaultEngine: DefaultEngine)
   if (taskEngine === defaultEngine) return "";
   if (taskEngine === "primary") return "@";
   if (taskEngine === "secondary") return "!";
-  // ollama with non-ollama default is rejected at parse — unreachable here.
+  // local with non-local default is rejected at parse — unreachable here.
   throw new Error(`unreachable: engine=${taskEngine} default=${defaultEngine}`);
 }
 
@@ -884,8 +891,8 @@ export function startScheduler(deps: SchedulerDeps): SchedulerHandle {
     const task = rt.task;
 
     // Per-task hourly cost cap — pre-flight check. Skip and write a denial
-    // audit row when the cap fires. `null` cap (unset OR ollama) → no-op.
-    if (task.maxCostUsd !== null && task.engine !== "ollama") {
+    // audit row when the cap fires. `null` cap (unset OR local) → no-op.
+    if (task.maxCostUsd !== null && task.engine !== "local") {
       const spent = deps.db.sumTaskCostSince(task.name, fireAt - HOURLY_WINDOW_MS);
       if (spent >= task.maxCostUsd) {
         const chatId = task.chatId ?? deps.defaultChatId;

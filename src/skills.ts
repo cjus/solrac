@@ -79,7 +79,7 @@ import type { BotCommand } from "./telegram.ts";
 // Types
 // ---------------------------------------------------------------------------
 
-export type SkillTier = "primary" | "secondary" | "ollama";
+export type SkillTier = "primary" | "secondary" | "local";
 
 export interface Skill {
   readonly name: string;
@@ -87,12 +87,12 @@ export interface Skill {
   readonly tier: SkillTier;
   readonly body: string;
   readonly sourcePath: string;
-  // PNX-167.x — when true, the skill is exposed as a callable MCP tool to the
-  // Ollama agent (in addition to its existing /<name> slash invocation). The
-  // model decides when to call based on `description`; the handler runs the
-  // skill body and returns its text as the tool result. Phase 1 restriction:
-  // `tool: true` requires `tier: "ollama"` (free-only — avoids cross-engine
-  // cost surprises from agent-driven invocations).
+  // When true, the skill is exposed as a callable MCP tool to the local
+  // agent (in addition to its existing /<name> slash invocation). The model
+  // decides when to call based on `description`; the handler runs the skill
+  // body and returns its text as the tool result. `tool: true` requires
+  // `tier: "local"` (free-only — avoids cross-engine cost surprises from
+  // agent-driven invocations).
   readonly tool: boolean;
   // Max model turns when running this skill's body. Pure text-transform skills
   // (no tool calls) want 1; agentic skills that chain tool calls (e.g. a
@@ -287,38 +287,44 @@ export function parseSkillFile(
       `${sourcePath}: "description" must be ≤${MAX_DESCRIPTION_LEN} chars (got ${descVal.length})`,
     );
   }
-  // tier — defaults to deploy's default engine. When explicit `ollama`, refuse
-  // if the deploy default isn't ollama (PR-B removed the `>` prefix; mirrors
-  // scheduler.ts engine handling).
+  // tier — defaults to deploy's default engine. When explicit `local`, refuse
+  // if the deploy default isn't local. Legacy `tier: ollama` is hard-rejected
+  // with a rename hint.
   let tier: SkillTier = defaultTier;
   if ("tier" in f) {
     const tierVal = f.tier;
-    if (tierVal !== "primary" && tierVal !== "secondary" && tierVal !== "ollama") {
-      throw new Error(`${sourcePath}: "tier" must be primary | secondary | ollama (got "${String(tierVal)}")`);
-    }
-    if (tierVal === "ollama" && defaultTier !== "ollama") {
+    if (tierVal === "ollama") {
       throw new Error(
-        `${sourcePath}: "tier: ollama" is unreachable when SOLRAC_DEFAULT_ENGINE != ollama ` +
-          `(PR-B removed the > prefix). Set SOLRAC_DEFAULT_ENGINE=ollama or use tier: primary/secondary`,
+        `${sourcePath}: "tier: ollama" is no longer accepted — replace with "tier: local" ` +
+          `(the local engine now supports multiple backends via LOCAL_BACKEND)`,
+      );
+    }
+    if (tierVal !== "primary" && tierVal !== "secondary" && tierVal !== "local") {
+      throw new Error(`${sourcePath}: "tier" must be primary | secondary | local (got "${String(tierVal)}")`);
+    }
+    if (tierVal === "local" && defaultTier !== "local") {
+      throw new Error(
+        `${sourcePath}: "tier: local" is unreachable when SOLRAC_DEFAULT_ENGINE != local. ` +
+          `Set SOLRAC_DEFAULT_ENGINE=local or use tier: primary/secondary`,
       );
     }
     tier = tierVal;
   }
   // tool — opt-in flag exposing the skill as a callable MCP tool. Default
-  // false. Phase 1 restriction: only `tier: "ollama"` skills are tool-eligible
-  // (the Claude path's tool catalog is untouched until Phase 2). Operators who
-  // want a Claude-tier skill keep it slash-only.
+  // false. Only `tier: "local"` skills are tool-eligible (the Claude path's
+  // tool catalog is untouched). Operators who want a Claude-tier skill keep
+  // it slash-only.
   let toolFlag = false;
   if ("tool" in f) {
     const v = f.tool;
     if (typeof v !== "boolean") {
       throw new Error(`${sourcePath}: "tool" must be a boolean (got "${String(v)}")`);
     }
-    if (v && tier !== "ollama") {
+    if (v && tier !== "local") {
       throw new Error(
-        `${sourcePath}: "tool: true" requires "tier: ollama" in Phase 1 ` +
-          `(got tier=${tier}). Set tier: ollama or omit tier to inherit ` +
-          `SOLRAC_DEFAULT_ENGINE=ollama, or remove tool: true to keep this ` +
+        `${sourcePath}: "tool: true" requires "tier: local" ` +
+          `(got tier=${tier}). Set tier: local or omit tier to inherit ` +
+          `SOLRAC_DEFAULT_ENGINE=local, or remove tool: true to keep this ` +
           `skill slash-only.`,
       );
     }
@@ -328,7 +334,7 @@ export function parseSkillFile(
   // max_turns — model-turn budget for the skill's body. Default 1 preserves
   // back-compat with pre-agentic-skills (single-shot text transforms like
   // tldr). Cap at 10 to keep a runaway skill bounded; cost-cap is the
-  // ultimate backstop for Claude, OLLAMA_MAX_TOOL_ITERATIONS for Ollama.
+  // ultimate backstop for Claude, LOCAL_MAX_TOOL_ITERATIONS for the local engine.
   let maxTurns = 1;
   if ("max_turns" in f) {
     const v = f.max_turns;

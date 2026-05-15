@@ -308,15 +308,27 @@ Body.`;
     expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(/malformed frontmatter line/);
   });
 
-  test("tier: ollama rejected when defaultTier is not ollama", () => {
+  test("tier: ollama hard-rejected with rename hint (legacy frontmatter)", () => {
     const c = `---
 name: x
 description: y
 tier: ollama
 ---
 Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED, "local")).toThrow(
+      /tier: ollama.*is no longer accepted.*tier: local/s,
+    );
+  });
+
+  test("tier: local rejected when defaultTier is not local", () => {
+    const c = `---
+name: x
+description: y
+tier: local
+---
+Body.`;
     expect(() => parseSkillFile(c, "/p", RESERVED, "primary")).toThrow(
-      /unreachable when SOLRAC_DEFAULT_ENGINE != ollama/,
+      /unreachable when SOLRAC_DEFAULT_ENGINE != local/,
     );
   });
 
@@ -329,7 +341,7 @@ tool: true
 ---
 Body.`;
     expect(() => parseSkillFile(c, "/p", RESERVED, "primary")).toThrow(
-      /"tool: true" requires "tier: ollama"/,
+      /"tool: true" requires "tier: local"/,
     );
   });
 
@@ -341,12 +353,12 @@ tier: secondary
 tool: true
 ---
 Body.`;
-    expect(() => parseSkillFile(c, "/p", RESERVED, "ollama")).toThrow(
-      /"tool: true" requires "tier: ollama"/,
+    expect(() => parseSkillFile(c, "/p", RESERVED, "local")).toThrow(
+      /"tool: true" requires "tier: local"/,
     );
   });
 
-  test("tool: true rejected when default tier is non-ollama and tier omitted", () => {
+  test("tool: true rejected when default tier is non-local and tier omitted", () => {
     // Skill omits tier; defaultTier is "primary" so resolved tier is primary.
     // tool: true must then fail.
     const c = `---
@@ -356,7 +368,7 @@ tool: true
 ---
 Body.`;
     expect(() => parseSkillFile(c, "/p", RESERVED, "primary")).toThrow(
-      /"tool: true" requires "tier: ollama"/,
+      /"tool: true" requires "tier: local"/,
     );
   });
 
@@ -367,7 +379,7 @@ description: y
 tool: yes
 ---
 Body.`;
-    expect(() => parseSkillFile(c, "/p", RESERVED, "ollama")).toThrow(
+    expect(() => parseSkillFile(c, "/p", RESERVED, "local")).toThrow(
       /"tool" must be a boolean/,
     );
   });
@@ -384,33 +396,33 @@ name: example
 description: x
 ---
 Body.`;
-    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    const skill = parseSkillFile(c, "/p", RESERVED, "local");
     expect(skill.tool).toBe(false);
   });
 
-  test("tool: true accepted with tier: ollama", () => {
+  test("tool: true accepted with tier: local", () => {
     const c = `---
 name: example
 description: x
-tier: ollama
+tier: local
 tool: true
 ---
 Body.`;
-    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    const skill = parseSkillFile(c, "/p", RESERVED, "local");
     expect(skill.tool).toBe(true);
-    expect(skill.tier).toBe("ollama");
+    expect(skill.tier).toBe("local");
   });
 
-  test("tool: true accepted with omitted tier inheriting ollama default", () => {
+  test("tool: true accepted with omitted tier inheriting local default", () => {
     const c = `---
 name: example
 description: x
 tool: true
 ---
 Body.`;
-    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    const skill = parseSkillFile(c, "/p", RESERVED, "local");
     expect(skill.tool).toBe(true);
-    expect(skill.tier).toBe("ollama");
+    expect(skill.tier).toBe("local");
   });
 
   test("tool: false accepted with any tier", () => {
@@ -421,7 +433,7 @@ tier: primary
 tool: false
 ---
 Body.`;
-    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    const skill = parseSkillFile(c, "/p", RESERVED, "local");
     expect(skill.tool).toBe(false);
     expect(skill.tier).toBe("primary");
   });
@@ -584,30 +596,30 @@ Body.`;
     expect(skill.tier).toBe("secondary");
   });
 
-  test("omitted tier inherits defaultTier=ollama", () => {
-    const skill = parseSkillFile(BARE, "/p", RESERVED, "ollama");
-    expect(skill.tier).toBe("ollama");
+  test("omitted tier inherits defaultTier=local", () => {
+    const skill = parseSkillFile(BARE, "/p", RESERVED, "local");
+    expect(skill.tier).toBe("local");
   });
 
-  test("explicit tier: ollama parses when defaultTier=ollama", () => {
+  test("explicit tier: local parses when defaultTier=local", () => {
     const c = `---
 name: example
 description: x
-tier: ollama
+tier: local
 ---
 Body.`;
-    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
-    expect(skill.tier).toBe("ollama");
+    const skill = parseSkillFile(c, "/p", RESERVED, "local");
+    expect(skill.tier).toBe("local");
   });
 
-  test("explicit tier: primary still works under defaultTier=ollama (escalation override)", () => {
+  test("explicit tier: primary still works under defaultTier=local (escalation override)", () => {
     const c = `---
 name: example
 description: x
 tier: primary
 ---
 Body.`;
-    const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
+    const skill = parseSkillFile(c, "/p", RESERVED, "local");
     expect(skill.tier).toBe("primary");
   });
 });

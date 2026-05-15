@@ -22,13 +22,19 @@ curl -fsSL https://bun.sh/install | bash
 bun --version   # should be ≥1.3.0
 ```
 
-## 2. Prerequisites: Ollama daemon + model (recommended)
+## 2. Prerequisites: local-model backend + model (recommended)
 
-The recommended Solrac config sets `SOLRAC_DEFAULT_ENGINE=ollama`, which makes a local [Ollama](https://ollama.com) daemon a hard boot requirement. No-prefix Telegram messages route to Ollama for free; `@`/`!` reach Anthropic Sonnet/Opus.
+The recommended Solrac config sets `SOLRAC_DEFAULT_ENGINE=local`, which makes a local-model backend a hard boot requirement. No-prefix Telegram messages route to the local engine for free; `@`/`!` reach Anthropic Sonnet/Opus.
 
-Don't want Ollama? Skip to **§2-alt** for the Claude-only fallback.
+Pick a backend via `LOCAL_BACKEND`:
+- **`ollama`** ([ollama.com](https://ollama.com)) — daemon + CLI; default URL `:11434`; NDJSON wire format.
+- **`lmstudio`** ([lmstudio.ai](https://lmstudio.ai)) — desktop app with a built-in server; default URL `:1234`; OpenAI-compatible SSE wire format.
 
-### 2.1 Install Ollama
+Don't want either? Skip to **§2-alt** for the Claude-only fallback.
+
+### 2.1 Install your chosen backend
+
+**Ollama:**
 
 | Platform | Install |
 |---|---|
@@ -36,19 +42,26 @@ Don't want Ollama? Skip to **§2-alt** for the Claude-only fallback.
 | Linux | `curl -fsSL https://ollama.com/install.sh \| sh` |
 | Docker | `docker run -d -v ollama:/root/.ollama -p 11434:11434 --name ollama ollama/ollama` |
 
-### 2.2 Start the daemon
+**LMStudio:** download the desktop app from [lmstudio.ai](https://lmstudio.ai). Enable the local server (Developer tab → "Start Server", default port 1234). Optional CLI: `lms` ships with the app.
 
-`brew install` typically auto-starts. Otherwise: `ollama serve &` (or `systemctl start ollama` on Linux). Default URL: `http://localhost:11434`.
+### 2.2 Start the backend
 
-### 2.3 Pull a tools-capable model
+- **Ollama:** `brew install` typically auto-starts. Otherwise `ollama serve &` (or `systemctl start ollama` on Linux). Default URL: `http://localhost:11434`.
+- **LMStudio:** open the app and click "Start Server" in the Developer tab, or `lms server start` from the CLI. Default URL: `http://localhost:1234`.
+
+### 2.3 Pull (Ollama) or load (LMStudio) a tools-capable model
 
 **Recommended: `gemma4:e4b`** — native function-calling, ~9.6GB on disk, 128K context. Matches the operator's reference config.
 
 ```sh
+# Ollama
 ollama pull gemma4:e4b
+
+# LMStudio (CLI)
+lms load lmstudio-community/gemma-3-4b-it     # or load via the GUI search
 ```
 
-Alternatives: `gemma4` (varies), `qwen2.5:7b` (~4.7GB), `llama3.2:3b` (~2.0GB). Hardware notes:
+Alternatives: `qwen2.5:7b` / `qwen2.5-7b-instruct` (~4.7GB), `llama3.2:3b` / `llama-3.2-3b-instruct` (~2.0GB). Hardware notes:
 
 | Model | Disk | Min RAM | Tools |
 |---|---|---|---|
@@ -60,23 +73,28 @@ Alternatives: `gemma4` (varies), `qwen2.5:7b` (~4.7GB), `llama3.2:3b` (~2.0GB). 
 ### 2.4 Verify
 
 ```sh
+# Ollama
 ollama list                                    # should show your pulled model
 curl -s http://localhost:11434/api/tags | jq   # daemon HTTP probe
+
+# LMStudio
+lms ls                                         # should show your loaded model
+curl -s http://localhost:1234/v1/models | jq   # server HTTP probe
 ```
 
-If both succeed, Ollama is ready.
+If both succeed, the backend is ready.
 
 ## 2-alt. Claude-only deploy (skip if you completed §2)
 
-If you can't run Ollama (no GPU/RAM, or air-gapped from local model hosting), pin Claude as the default engine. Add this to your `.env` later:
+If you can't run a local backend (no GPU/RAM, or air-gapped from local model hosting), pin Claude as the default engine. Add this to your `.env` later:
 
 ```sh
 SOLRAC_DEFAULT_ENGINE=primary    # no-prefix → Anthropic Sonnet
-OLLAMA_ENABLED=false
-OLLAMA_TOOLS_ENABLED=false
+LOCAL_ENABLED=false
+LOCAL_TOOLS_ENABLED=false
 ```
 
-You'll lose the free default-Ollama path; every no-prefix message is an Anthropic call. `@` and `!` work as documented. The rest of this guide still applies.
+You'll lose the free local default path; every no-prefix message is an Anthropic call. `@` and `!` work as documented. The rest of this guide still applies.
 
 ## 3. Install Solrac
 
@@ -137,15 +155,18 @@ TELEGRAM_BOT_TOKEN=8123456789:AA…      # from §4
 ALLOWLIST_BOOTSTRAP=123456789           # from §5 (your from.id)
 ```
 
-The template ships with the recommended Ollama-default values pre-set:
+The template ships with the recommended local-default values pre-set:
 
 ```sh
-SOLRAC_DEFAULT_ENGINE=ollama
-OLLAMA_ENABLED=true
-OLLAMA_MODEL=gemma4:e4b
-OLLAMA_TOOLS_ENABLED=true
+SOLRAC_DEFAULT_ENGINE=local
+LOCAL_ENABLED=true
+LOCAL_BACKEND=ollama                # or `lmstudio`
+LOCAL_MODEL=gemma4:e4b
+LOCAL_TOOLS_ENABLED=true
 SOLRAC_INTEGRATIONS_ENABLED=true
 ```
+
+> Set `LOCAL_BACKEND` to match whichever backend you set up in §2. `LOCAL_URL` defaults to the backend's standard port (`:11434` for Ollama, `:1234` for LMStudio); set it explicitly only if you moved the server.
 
 If you went with §2-alt (Claude-only deploy), edit those lines per the snippet there. Full reference: [CONFIG.md](./CONFIG.md).
 
@@ -221,20 +242,20 @@ curl -H "Authorization: Bearer $STATS_BEARER_TOKEN" http://localhost:8443/stats
 
 You'll get RSS, uptime, in-flight turn counts, and 24h spend.
 
-## 12. (Optional) Tune the Ollama path
+## 12. (Optional) Tune the local engine
 
-The recommended config already enables Ollama (§2 + §7). Knobs that may matter for non-standard deploys:
+The recommended config already enables the local engine (§2 + §7). Knobs that may matter for non-standard deploys:
 
 | Env | Default | When to override |
 |---|---|---|
-| `OLLAMA_URL` | `http://localhost:11434` | Daemon on a remote host or non-standard port. |
-| `OLLAMA_TIMEOUT_MS` | `60000` (`120000` when tools-on) | Slower hardware needs more headroom for multi-round tool loops. |
-| `OLLAMA_HISTORY_LIMIT` | `6` | Smaller context windows on 3B models; or `1` to bypass history pollution after flipping `OLLAMA_TOOLS_ENABLED` on an existing chat. |
-| `OLLAMA_MAX_TOOL_ITERATIONS` | `8` | Lower if a model loops; raise only with caution. |
+| `LOCAL_URL` | backend-aware (`:11434` ollama, `:1234` lmstudio) | Backend on a remote host or non-standard port. |
+| `LOCAL_TIMEOUT_MS` | `60000` (`120000` when tools-on) | Slower hardware needs more headroom for multi-round tool loops. |
+| `LOCAL_HISTORY_LIMIT` | `6` | Smaller context windows on 3B models; or `1` to bypass history pollution after flipping `LOCAL_TOOLS_ENABLED` on an existing chat. |
+| `LOCAL_MAX_TOOL_ITERATIONS` | `8` | Lower if a model loops; raise only with caution. |
 
-Cross-engine context flows in **both** directions: Claude follow-ups see prior local-model exchanges (auto-injected as out-of-band context), and Ollama follow-ups see prior Claude responses. The user's mental model is "single chat thread."
+Cross-engine context flows in **both** directions: Claude follow-ups see prior local-model exchanges (auto-injected as out-of-band context), and local follow-ups see prior Claude responses. The user's mental model is "single chat thread."
 
-For the live-smoke harness against your local Ollama: `npm run smoke:ollama`. Set `OLLAMA_TOOLS_ENABLED=true` to also exercise the tool-loop path.
+For the live-smoke harness against your local backend: `LOCAL_BACKEND=ollama npm run smoke:local` (or `LOCAL_BACKEND=lmstudio npm run smoke:local`). Set `LOCAL_TOOLS_ENABLED=true` to also exercise the tool-loop path.
 
 ## 13. (Optional) Enable the browser web UI
 

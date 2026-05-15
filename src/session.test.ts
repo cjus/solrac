@@ -228,42 +228,42 @@ describe("createSessionStore (PNX-167 summary + clear paths)", () => {
     });
   });
 
-  test("ollama cutoff: get returns null when unset, set then get round-trips", async () => {
+  test("local cutoff: get returns null when unset, set then get round-trips", async () => {
     const { db } = await newDb();
     const sessions = createSessionStore(db);
-    expect(sessions.getOllamaCutoff(100)).toBeNull();
-    sessions.setOllamaCutoff(100, 12345);
-    expect(sessions.getOllamaCutoff(100)).toBe(12345);
+    expect(sessions.getLocalCutoff(100)).toBeNull();
+    sessions.setLocalCutoff(100, 12345);
+    expect(sessions.getLocalCutoff(100)).toBe(12345);
   });
 
-  test("ollama cutoff: setOllamaCutoff upserts on a chat with no prior sessions row", async () => {
+  test("local cutoff: setLocalCutoff upserts on a chat with no prior sessions row", async () => {
     const { db } = await newDb();
     const sessions = createSessionStore(db);
-    sessions.setOllamaCutoff(200, 555);
+    sessions.setLocalCutoff(200, 555);
     const row = sessions.getSession(200);
     expect(row).not.toBeNull();
-    expect(row!.ollamaCutoffMs).toBe(555);
+    expect(row!.localCutoffMs).toBe(555);
     expect(row!.primarySessionId).toBeNull();
     expect(row!.secondarySessionId).toBeNull();
   });
 
-  test("ollama cutoff: setOllamaCutoff preserves existing tier columns", async () => {
+  test("local cutoff: setLocalCutoff preserves existing tier columns", async () => {
     const { db } = await newDb();
     const sessions = createSessionStore(db);
     sessions.setSessionId(300, "primary", "p-uuid");
     sessions.setSummary(300, "secondary", "s-sum", 999);
-    sessions.setOllamaCutoff(300, 12345);
+    sessions.setLocalCutoff(300, 12345);
     const row = sessions.getSession(300);
     expect(row!.primarySessionId).toBe("p-uuid");
     expect(row!.secondarySummary).toBe("s-sum");
     expect(row!.secondarySummaryAt).toBe(999);
-    expect(row!.ollamaCutoffMs).toBe(12345);
+    expect(row!.localCutoffMs).toBe(12345);
   });
 
-  test("ollama cutoff: getSession includes ollamaCutoffMs", async () => {
+  test("local cutoff: getSession includes localCutoffMs", async () => {
     const { db } = await newDb();
     const sessions = createSessionStore(db);
-    sessions.setOllamaCutoff(400, 7777);
-    expect(sessions.getSession(400)).toMatchObject({ ollamaCutoffMs: 7777 });
+    sessions.setLocalCutoff(400, 7777);
+    expect(sessions.getSession(400)).toMatchObject({ localCutoffMs: 7777 });
   });
 });

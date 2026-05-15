@@ -64,13 +64,14 @@ export interface SessionRow {
   primarySummaryAt: number | null;
   secondarySummary: string | null;
   secondarySummaryAt: number | null;
-  // `/clear ollama` cutoff — millisecond timestamp at which the operator
-  // wiped this chat's Ollama context. NULL = never cleared. Both
-  // `recentChatTurns` (Ollama's own history) and `outOfBandForEngine`
-  // (Claude's cross-engine bridge) hide ollama:% rows with `started_at <=`
-  // this value. Ollama is stateless so there's no SDK session id to drop;
-  // the cutoff IS the session boundary.
-  ollamaCutoffMs: number | null;
+  // `/clear local` cutoff — millisecond timestamp at which the operator
+  // wiped this chat's local-engine context. NULL = never cleared. Both
+  // `recentChatTurns` (the local engine's own history) and
+  // `outOfBandForEngine` (Claude's cross-engine bridge) hide `local:%` rows
+  // (and legacy `ollama:%` rows pre-migration) with `started_at <=` this
+  // value. The local engine is stateless so there's no SDK session id to
+  // drop; the cutoff IS the session boundary.
+  localCutoffMs: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -96,12 +97,12 @@ export interface SessionStore {
   clearSummary: (chatId: number, tier: SessionTier) => void;
   // PNX-167 — drop session id AND summary in one statement. Used by `/clear`.
   clearAll: (chatId: number, tier: SessionTier) => void;
-  // `/clear ollama` cutoff. `getOllamaCutoff` returns null when never set
-  // (caller treats as `0`). `setOllamaCutoff` UPSERTs because a chat that
-  // has only ever used Ollama has no `sessions` row yet — the cutoff is
-  // the first thing written.
-  getOllamaCutoff: (chatId: number) => number | null;
-  setOllamaCutoff: (chatId: number, cutoffMs: number) => void;
+  // `/clear local` cutoff. `getLocalCutoff` returns null when never set
+  // (caller treats as `0`). `setLocalCutoff` UPSERTs because a chat that
+  // has only ever used the local engine has no `sessions` row yet — the
+  // cutoff is the first thing written.
+  getLocalCutoff: (chatId: number) => number | null;
+  setLocalCutoff: (chatId: number, cutoffMs: number) => void;
 }
 
 interface SessionRowRaw {
@@ -112,7 +113,7 @@ interface SessionRowRaw {
   primary_summary_at: number | null;
   secondary_summary: string | null;
   secondary_summary_at: number | null;
-  ollama_cutoff_ms: number | null;
+  local_cutoff_ms: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -139,19 +140,19 @@ export function createSessionStore(db: SolracDb): SessionStore {
     "SELECT chat_id, primary_session_id, secondary_session_id, " +
       "primary_summary, primary_summary_at, " +
       "secondary_summary, secondary_summary_at, " +
-      "ollama_cutoff_ms, " +
+      "local_cutoff_ms, " +
       "created_at, updated_at " +
       "FROM sessions WHERE chat_id = ?",
   );
-  // UPSERT — a chat may have only ever used Ollama, in which case the
-  // sessions row doesn't exist yet (Ollama never calls setSessionId).
-  // First clear writes the row; subsequent clears UPDATE the cutoff and
-  // updated_at only.
-  const stUpsertOllamaCutoff = db.raw.prepare(
-    "INSERT INTO sessions (chat_id, ollama_cutoff_ms, created_at, updated_at) " +
+  // UPSERT — a chat may have only ever used the local engine, in which case
+  // the sessions row doesn't exist yet (the local engine never calls
+  // setSessionId). First clear writes the row; subsequent clears UPDATE
+  // the cutoff and updated_at only.
+  const stUpsertLocalCutoff = db.raw.prepare(
+    "INSERT INTO sessions (chat_id, local_cutoff_ms, created_at, updated_at) " +
       "VALUES (?, ?, ?, ?) " +
       "ON CONFLICT(chat_id) DO UPDATE SET " +
-      "ollama_cutoff_ms = excluded.ollama_cutoff_ms, " +
+      "local_cutoff_ms = excluded.local_cutoff_ms, " +
       "updated_at = excluded.updated_at",
   );
   // PNX-167 — UPDATE-only paths. They never INSERT a row: a chat with no
@@ -228,7 +229,7 @@ export function createSessionStore(db: SolracDb): SessionStore {
         primarySummaryAt: row.primary_summary_at,
         secondarySummary: row.secondary_summary,
         secondarySummaryAt: row.secondary_summary_at,
-        ollamaCutoffMs: row.ollama_cutoff_ms,
+        localCutoffMs: row.local_cutoff_ms,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       };
@@ -254,13 +255,13 @@ export function createSessionStore(db: SolracDb): SessionStore {
       const stmt = tier === "primary" ? stClearAllPrimary : stClearAllSecondary;
       stmt.run(Date.now(), chatId);
     },
-    getOllamaCutoff(chatId) {
+    getLocalCutoff(chatId) {
       const row = stGet.get(chatId) as SessionRowRaw | null;
-      return row?.ollama_cutoff_ms ?? null;
+      return row?.local_cutoff_ms ?? null;
     },
-    setOllamaCutoff(chatId, cutoffMs) {
+    setLocalCutoff(chatId, cutoffMs) {
       const now = Date.now();
-      stUpsertOllamaCutoff.run(chatId, cutoffMs, now, now);
+      stUpsertLocalCutoff.run(chatId, cutoffMs, now, now);
     },
   };
 }

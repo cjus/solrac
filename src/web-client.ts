@@ -2,7 +2,7 @@
  * @fileoverview WebClient — a `TelegramClient`-compatible sink that publishes
  *               outbound messages to an in-process bus instead of hitting
  *               Telegram's API. Consumed by the SSE handler in `web.ts`.
- * @purpose Drop-in transport for the web UI. agent.ts / ollama.ts / commands.ts
+ * @purpose Drop-in transport for the web UI. agent.ts / local.ts / commands.ts
  *          already accept any `TelegramClient` — pointing them at this client
  *          gives the browser the same content stream the Telegram bot gets,
  *          without changing any business logic.

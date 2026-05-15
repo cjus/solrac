@@ -9,16 +9,16 @@
  *
  *   - `SOUL.md` — voice, stance, safety. Read once at boot via `loadSoul`;
  *     hard-fails if missing or empty. Joined into Claude's
- *     `systemPrompt.append` and Ollama's first `system` message. Per-engine
- *     capability deltas ("you have tools" / "you don't") stay in code next to
- *     each engine's wiring (see `agent.ts::buildClaudeCapabilityNote` and
- *     `ollama.ts::buildOllamaCapabilityNote`) so SOUL.md stays portable.
+ *     `systemPrompt.append` and the local engine's first `system` message.
+ *     Per-engine capability deltas ("you have tools" / "you don't") stay in
+ *     code next to each engine's wiring (see `agent.ts::buildClaudeCapabilityNote`
+ *     and `local.ts::buildLocalCapabilityNote`) so SOUL.md stays portable.
  *
  *   - `SOLRAC.md` — operator overlay (operator name, channel posture, project
  *     hints). Re-read per turn via `readInstanceMd` so live edits take effect
  *     without restart. Soft-warn if missing — Solrac runs vanilla without it.
  *     Injected as a `<solrac-md>...</solrac-md>` block in the user-message
- *     envelope (Claude path: prepended in `buildAugmentedPrompt`; Ollama path:
+ *     envelope (Claude path: prepended in `buildAugmentedPrompt`; local path:
  *     a second `system` message).
  *
  * Both files ship as **embedded text** inside the compiled Bun binary via
@@ -36,7 +36,7 @@
  *   their voice edits.
  *
  * Position in the dependency graph:
- *   log → instance → consumed by main, agent, ollama
+ *   log → instance → consumed by main, agent, local
  *
  * Exports:
  *   - `INSTANCE_FILE_NAMES` — `{ SOUL: "SOUL.md", SOLRAC: "SOLRAC.md" }`.
@@ -64,7 +64,7 @@
  *   - SOUL.md — canonical default voice (embedded into the binary)
  *   - SOLRAC.md — operator overlay template (embedded into the binary)
  *   - agent.ts::runAgent — Claude path consumer
- *   - ollama.ts::runOllamaTurn — Ollama path consumer
+ *   - local.ts::runLocalTurn — local path consumer
  *   - main.ts — boot wires bootstrap + load
  *   - text-modules.d.ts — ambient string type for `*.md` text imports
  */

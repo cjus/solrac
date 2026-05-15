@@ -73,10 +73,10 @@ export interface WebServerDeps {
   webChatId: number;
   webClient: WebClient;
   /**
-   * Server-resolved label for the default-engine pill in the UI ("ollama" |
-   * "primary Claude (Sonnet)" | "secondary Claude (Opus)"). Substituted into
-   * `index.html` at serve time so the user sees what no-prefix actually does
-   * on this deploy without a `/config` round-trip.
+   * Server-resolved label for the default-engine pill in the UI
+   * ("local (<backend>)" | "primary Claude (Sonnet)" | "secondary Claude
+   * (Opus)"). Substituted into `index.html` at serve time so the user sees
+   * what no-prefix actually does on this deploy without a `/config` round-trip.
    */
   defaultEngineLabel: string;
   /**

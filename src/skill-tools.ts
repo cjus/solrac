@@ -1,5 +1,5 @@
 /**
- * @fileoverview Operator-defined skills exposed as MCP tools to the Ollama agent.
+ * @fileoverview Operator-defined skills exposed as MCP tools to the local agent.
  * @purpose Bridge the slash-command surface (`/<skill>` typed by the operator)
  *          to the agentic surface (model decides to call `skills__<name>`
  *          mid-tool-loop). The model sees each tool-eligible skill in its
@@ -9,29 +9,27 @@
  *          `origin='tool_call'` so operator-typed and agent-driven skill
  *          activity stay distinguishable in the audit log.
  *
- * Phase 1 restrictions (locked-in, see PR description):
- *   - Only `tier: ollama` skills with `tool: true` are exposed. Claude-tier
- *     skills are slash-only until Phase 2.
- *   - Only the Ollama path sees these tools. The Claude SDK's MCP server is
+ * Restrictions:
+ *   - Only `tier: local` skills with `tool: true` are exposed. Claude-tier
+ *     skills are slash-only.
+ *   - Only the local path sees these tools. The Claude SDK's MCP server is
  *     untouched.
- *   - Permission tier is auto-allow. Cost cap is the backstop (Phase 1 skills
+ *   - Permission tier is auto-allow. Cost cap is the backstop (local skills
  *     are free, so this is mostly a forward-compat statement).
  *
  * **RECURSION SAFETY** (load-bearing invariant):
- *   - The handler calls `runSkillBare` which posts to Ollama with NO `tools`
- *     field. The sub-call therefore cannot itself call any tool.
- *   - `skill-tools.test.ts` asserts the outgoing fetch body has no `tools`
- *     key — a regression breaks CI rather than production.
- *   - If a future change adds tool surface to `runSkillBare`, an Ollama agent
+ *   - The handler calls `runSkillBare` which calls the local driver with NO
+ *     `tools` array. The sub-call therefore cannot itself call any tool.
+ *   - If a future change adds tool surface to `runSkillBare`, a local agent
  *     calling `skills__foo` could trigger `foo` calling `skills__foo` →
- *     infinite loop. Loop detector + iteration cap mitigate, but the parser-
- *     level guard (no `tools` field) is the primary defense.
+ *     infinite loop. Loop detector + iteration cap mitigate, but the
+ *     parser-level guard (no `tools` field) is the primary defense.
  *
  * Per-call context propagation:
  *   - Skill handlers need chatId / fromId / updateId / parentAuditId to write
  *     the audit row. The SDK's `(args) => ...` handler signature gives no
  *     room for these. Instead we use `node:async_hooks::AsyncLocalStorage`:
- *     the Ollama tool-loop wraps each turn in `skillToolCtx.run({...}, ...)`,
+ *     the local tool-loop wraps each turn in `skillToolCtx.run({...}, ...)`,
  *     and the handler reads `skillToolCtx.getStore()` synchronously inside
  *     its async boundary.
  *   - ALS propagates correctly across `await` in Bun + Node, so async
@@ -45,7 +43,7 @@
  *
  * Cross-references:
  *   - src/commands.ts::runSkillBare — pure execution helper, recursion-safe
- *   - src/ollama.ts::runOllamaTurnWithTools — wraps loop in skillToolCtx.run
+ *   - src/local.ts::runLocalTurnWithTools — wraps loop in skillToolCtx.run
  *   - docs/USAGE.md#skills-as-tools — operator-facing docs
  */
 
@@ -55,7 +53,7 @@ import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import {
   runSkillBare,
-  type OllamaSkillDeps,
+  type LocalSkillDeps,
 } from "./commands.ts";
 import type { SolracDb } from "./db.ts";
 import { log } from "./log.ts";
@@ -69,9 +67,9 @@ import type { Skill, SkillRegistry } from "./skills.ts";
 export interface SkillToolContext {
   readonly chatId: number;
   readonly fromId: number;
-  // Inherited from the parent Ollama turn. May be null for synthesized
-  // updates (e.g. scheduled fires that route through Ollama and end up
-  // calling a skill tool — those turns have updateId=null already).
+  // Inherited from the parent local-engine turn. May be null for synthesized
+  // updates (e.g. scheduled fires that route through the local engine and
+  // call a skill tool — those turns have updateId=null already).
   readonly updateId: number | null;
   readonly parentAuditId: number;
 }
@@ -82,14 +80,11 @@ export const skillToolCtx = new AsyncLocalStorage<SkillToolContext>();
 // Tool name / format
 // ---------------------------------------------------------------------------
 
-// Short name (what Ollama sees on the wire) is `skills__<name>`. The leading
-// `skills` segment is the synthetic-integration namespace; the trailing
-// `<name>` matches the operator's `name:` frontmatter (already validated to
-// `[a-z0-9_]{1,32}`). Underscores in the separator and the name combine to
-// `skills__foo_bar` for a skill named `foo_bar`. The `mcp__solrac__` prefix
-// the policy layer expects is added by `ollama-tools.ts::executeToolCall`
-// when reconstructing the full name (matching the existing convention for
-// non-MCP integrations).
+// Short name (what the local engine sees on the wire) is `skills__<name>`.
+// The leading `skills` segment is the synthetic-integration namespace; the
+// trailing `<name>` matches the operator's `name:` frontmatter. The
+// `mcp__solrac__` prefix the policy layer expects is added by
+// `local-tools.ts::executeToolCall` when reconstructing the full name.
 export const SKILL_TOOL_PREFIX = "skills__";
 
 export function skillToolName(skillName: string): string {
@@ -102,43 +97,43 @@ export function skillToolName(skillName: string): string {
 
 export interface BuildSkillToolsDeps {
   readonly db: SolracDb;
-  // Null-safe: deploys without Ollama configured can still load skills (the
-  // tool-eligible filter below catches the contradiction). When null and the
-  // registry contains tool-eligible skills, we log + return empty rather
-  // than crash.
-  readonly ollamaSkillDeps: OllamaSkillDeps | null;
+  // Null-safe: deploys without the local engine configured can still load
+  // skills (the tool-eligible filter below catches the contradiction). When
+  // null and the registry contains tool-eligible skills, we log + return
+  // empty rather than crash.
+  readonly localSkillDeps: LocalSkillDeps | null;
 }
 
 /**
  * Build SDK MCP tool definitions for every tool-eligible skill in the
  * registry. A skill is tool-eligible when both:
  *   - `skill.tool === true` (operator opted in)
- *   - `skill.tier === "ollama"` (Phase 1 free-only restriction)
+ *   - `skill.tier === "local"` (free-only restriction)
  *
  * Skills failing either gate are silently skipped (the parser raises at
- * load when `tool: true` is set with non-ollama tier; this is just defensive).
+ * load when `tool: true` is set with non-local tier; this is just defensive).
  */
 export function buildSkillTools(
   registry: SkillRegistry,
   deps: BuildSkillToolsDeps,
 ): ReadonlyArray<SdkMcpToolDefinition<any>> {
   const eligible = registry.all.filter(
-    (s) => s.tool && s.tier === "ollama",
+    (s) => s.tool && s.tier === "local",
   );
   if (eligible.length === 0) return Object.freeze([]);
 
-  if (deps.ollamaSkillDeps === null) {
-    log.warn("skill_tools.ollama_unconfigured", {
+  if (deps.localSkillDeps === null) {
+    log.warn("skill_tools.local_unconfigured", {
       eligibleCount: eligible.length,
       message:
-        "Tool-eligible skills exist but Ollama isn't configured; tools won't be exposed.",
+        "Tool-eligible skills exist but the local engine isn't configured; tools won't be exposed.",
     });
     return Object.freeze([]);
   }
 
-  const ollama = deps.ollamaSkillDeps;
+  const local = deps.localSkillDeps;
   const tools: SdkMcpToolDefinition<any>[] = eligible.map((skill) =>
-    buildOneSkillTool(skill, deps.db, ollama),
+    buildOneSkillTool(skill, deps.db, local),
   );
   return Object.freeze(tools);
 }
@@ -146,7 +141,7 @@ export function buildSkillTools(
 function buildOneSkillTool(
   skill: Skill,
   db: SolracDb,
-  ollama: OllamaSkillDeps,
+  local: LocalSkillDeps,
 ): SdkMcpToolDefinition<any> {
   // The `args` schema mirrors the only template variable supported by skill
   // bodies (`{{args}}`). We expose it as a single string parameter rather
@@ -182,8 +177,8 @@ function buildOneSkillTool(
         };
       }
 
-      const result = await runSkillBare(ollama, skill, args);
-      const engineModelTag = `ollama:${ollama.model}:skill:${skill.name}`;
+      const result = await runSkillBare(local, skill, args);
+      const engineModelTag = `local:${local.driver.backend}:${local.model}:skill:${skill.name}`;
 
       // Audit row, origin='tool_call' so operators can distinguish agent-
       // driven skill activity from operator-typed `/<skill>` invocations:
@@ -258,12 +253,12 @@ function buildOneSkillTool(
         chatId: cx.chatId,
         parentAuditId: cx.parentAuditId,
         skill: skill.name,
-        tier: "ollama",
+        tier: "local",
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
         replyLength: result.text.length,
       });
-      // Return the model's text verbatim. The calling Ollama agent receives
+      // Return the model's text verbatim. The calling local agent receives
       // it as the `tool` role content and composes its final user-facing
       // reply on top.
       return {

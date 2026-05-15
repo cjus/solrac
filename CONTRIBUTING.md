@@ -32,7 +32,7 @@ For changes that touch policy, cost cap, audit, or shutdown semantics, also run 
 
 ```sh
 npm run smoke:flood
-npm run smoke:ollama   # only if you have Ollama running locally
+LOCAL_BACKEND=ollama npm run smoke:local   # or LOCAL_BACKEND=lmstudio; only if the backend is running locally
 ```
 
 ## Style

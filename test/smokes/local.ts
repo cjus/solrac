@@ -1,22 +1,30 @@
-// PLAN Step 11 live smoke: drives runOllamaTurn against a real local Ollama
-// with a stub Telegram client. Proves the whole pipeline end-to-end without
-// touching the live bot or .env:
-//   1. Streaming NDJSON parsing matches what real Ollama emits.
-//   2. Audit row finalizes correctly (model='ollama:<name>', cost_usd=0, tokens).
-//   3. History reconstruction (turn 2 sees turn 1's prompt+response in messages).
+// Live smoke: drives runLocalTurn against a real local backend (Ollama or
+// LMStudio) with a stub Telegram client. Proves the whole pipeline end-to-end
+// without touching the live bot or .env:
+//   1. Driver event-stream parsing matches what the real backend emits.
+//   2. Audit row finalizes correctly (model='local:<backend>:<name>',
+//      cost_usd=0, tokens populated).
+//   3. History reconstruction (turn 2 sees turn 1's prompt+response).
 //   4. Telegram render path (stub-then-edit) produces sensible final text.
-//   5. (PR-A) Tools-on path: a time_now tool call round-trips via runToolLoop,
-//      audit row has tool_calls populated. Skipped unless
-//      `OLLAMA_TOOLS_ENABLED=true` in env.
+//   5. (tools-on) A time_now tool call round-trips via runToolLoop; audit
+//      row's tool_calls JSON references the tool. Skipped unless
+//      `LOCAL_TOOLS_ENABLED=true` in env.
 //
-// Runs against http://localhost:11434 by default. Override via env:
-//   OLLAMA_URL=http://localhost:11434 OLLAMA_MODEL=gemma4:e4b npm run smoke:ollama
+// Runs against http://localhost:11434 (ollama default) or :1234 (lmstudio
+// default) per the backend. Override via env:
+//   LOCAL_BACKEND=ollama LOCAL_MODEL=gemma4:e4b npm run smoke:local
+//   LOCAL_BACKEND=lmstudio LOCAL_MODEL=qwen2.5-7b npm run smoke:local
 //
 // To exercise the tools-on path:
-//   OLLAMA_TOOLS_ENABLED=true npm run smoke:ollama
+//   LOCAL_TOOLS_ENABLED=true npm run smoke:local
 
 import type { Message } from "@grammyjs/types";
-import { runOllamaTurn } from "../../src/ollama.ts";
+import { runLocalTurn } from "../../src/local.ts";
+import {
+  createLocalDriver,
+  type LocalBackend,
+  type LocalDriver,
+} from "../../src/local-driver.ts";
 import type { ConfirmationBroker } from "../../src/policy.ts";
 import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import timeIntegration from "../../src/integrations-builtin/time/index.ts";
@@ -24,8 +32,21 @@ import { createIntegrationContext } from "../../src/integrations.ts";
 import type { TelegramClient } from "../../src/telegram.ts";
 import { openTestDb, reportAndExit, type Phase } from "./harness.ts";
 
-const URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
-const MODEL = process.env.OLLAMA_MODEL ?? "gemma4:e4b";
+const BACKEND = parseBackend(process.env.LOCAL_BACKEND);
+const URL =
+  process.env.LOCAL_URL ??
+  (BACKEND === "lmstudio" ? "http://localhost:1234" : "http://localhost:11434");
+const MODEL =
+  process.env.LOCAL_MODEL ?? (BACKEND === "lmstudio" ? "qwen2.5-7b" : "gemma4:e4b");
+
+function parseBackend(raw: string | undefined): LocalBackend {
+  if (raw === "lmstudio") return "lmstudio";
+  return "ollama";
+}
+
+// Backend-specific hint substring expected in error messages for the
+// bad-model phase. Each backend has its own "model missing" copy.
+const PULL_HINT = BACKEND === "lmstudio" ? "lms load" : "ollama pull";
 
 interface CapturedTg extends TelegramClient {
   sent: { chatId: number; text: string }[];
@@ -57,30 +78,32 @@ function makeCapturedTg(): CapturedTg {
 
 async function main(): Promise<void> {
   // eslint-disable-next-line no-console
-  console.log(`ollama-smoke: URL=${URL} MODEL=${MODEL}`);
+  console.log(`local-smoke: BACKEND=${BACKEND} URL=${URL} MODEL=${MODEL}`);
 
-  const { db } = await openTestDb("ollama-smoke");
+  const { db } = await openTestDb("local-smoke");
   const tg = makeCapturedTg();
+  const driver: LocalDriver = createLocalDriver(BACKEND, { url: URL });
   const deps = {
     tg,
     db,
-    url: URL,
+    driver,
     model: MODEL,
     timeoutMs: 120_000,
     historyLimit: 6,
-    // PNX-167: smoke runs a synthetic SOUL inline; no SOLRAC.md path on disk
-    // so `readInstanceMd` returns null and no overlay block is sent.
+    // No SOLRAC.md path on disk → `readInstanceMd` returns null and no overlay
+    // block is sent.
     soul: "You are Solrac (smoke).",
-    instanceMdPath: "/tmp/solrac-ollama-smoke-no-such-file.md",
+    instanceMdPath: "/tmp/solrac-local-smoke-no-such-file.md",
   };
 
   const phases: Phase[] = [];
   const CHAT = 8001;
   const FROM = 9001;
+  const EXPECTED_MODEL_TAG = `local:${BACKEND}:${MODEL}`;
 
   // ── Turn 1: cold call. No history, just system + user. ────────────────────
   const t0 = Date.now();
-  await runOllamaTurn(deps, {
+  await runLocalTurn(deps, {
     chatId: CHAT,
     fromId: FROM,
     updateId: 1001,
@@ -112,19 +135,19 @@ async function main(): Promise<void> {
     pass: row1.status === "ok",
   });
   phases.push({
-    name: "turn 1: model column tagged ollama:<name>",
-    expected: `model=ollama:${MODEL}`,
+    name: "turn 1: model column tagged local:<backend>:<name>",
+    expected: `model=${EXPECTED_MODEL_TAG}`,
     actual: `model=${row1.model}`,
-    pass: row1.model === `ollama:${MODEL}`,
+    pass: row1.model === EXPECTED_MODEL_TAG,
   });
   phases.push({
-    name: "turn 1: cost_usd is 0 (Ollama is free)",
+    name: "turn 1: cost_usd is 0 (local engine is free)",
     expected: "cost_usd=0",
     actual: `cost_usd=${row1.cost_usd}`,
     pass: row1.cost_usd === 0,
   });
   phases.push({
-    name: "turn 1: agent_session_id null (Ollama is sessionless)",
+    name: "turn 1: agent_session_id null (local engine is sessionless)",
     expected: "agent_session_id=null",
     actual: `agent_session_id=${row1.agent_session_id}`,
     pass: row1.agent_session_id === null,
@@ -136,13 +159,13 @@ async function main(): Promise<void> {
     pass: row1.tool_calls === null,
   });
   phases.push({
-    name: "turn 1: input_tokens populated from prompt_eval_count",
+    name: "turn 1: input_tokens populated from done event",
     expected: "input_tokens > 0",
     actual: `input_tokens=${row1.input_tokens}`,
     pass: typeof row1.input_tokens === "number" && row1.input_tokens > 0,
   });
   phases.push({
-    name: "turn 1: output_tokens populated from eval_count",
+    name: "turn 1: output_tokens populated from done event",
     expected: "output_tokens > 0",
     actual: `output_tokens=${row1.output_tokens}`,
     pass: typeof row1.output_tokens === "number" && row1.output_tokens > 0,
@@ -154,9 +177,8 @@ async function main(): Promise<void> {
     pass: typeof row1.response === "string" && row1.response.length > 0,
   });
 
-  // The bot should have sent exactly one stub message (the 🦙 thinking stub),
-  // then issued ≥1 edits as the stream came in. Final edit must contain footer
-  // with model + elapsed time.
+  // The bot sent exactly one stub message (💻 thinking…) then issued ≥1 edits
+  // as the stream came in. Final edit must contain footer with model + secs.
   phases.push({
     name: "turn 1: stub message sent once",
     expected: "sent.length=1",
@@ -170,19 +192,17 @@ async function main(): Promise<void> {
     pass: tg.edits.length >= 1,
   });
   const lastEdit1 = tg.edits[tg.edits.length - 1]?.text ?? "";
+  const footerRe = new RegExp(`local:${escapeRegex(BACKEND)}:${escapeRegex(MODEL)} · \\d+\\.\\ds`);
   phases.push({
     name: "turn 1: final edit carries footer with model + seconds",
-    expected: "footer matches /ollama:<model> · \\d+\\.\\ds/",
+    expected: `footer matches ${footerRe}`,
     actual: `last edit ends with: …${lastEdit1.slice(-80)}`,
-    pass: new RegExp(`ollama:${escapeRegex(MODEL)} · \\d+\\.\\ds`).test(lastEdit1),
+    pass: footerRe.test(lastEdit1),
   });
 
-  // ── Turn 2: follow-up. recentChatTurns should now return turn 1, so the ─
-  // outbound messages array carries [system, user1, asst1, user2]. We can't
-  // peek inside the real fetch from this smoke (it goes straight to Ollama),
-  // so we verify history reconstruction at the db layer instead.
+  // ── Turn 2: follow-up. recentChatTurns now returns turn 1. ────────────────
   const tg2 = makeCapturedTg();
-  await runOllamaTurn(
+  await runLocalTurn(
     { ...deps, tg: tg2 },
     {
       chatId: CHAT,
@@ -201,10 +221,10 @@ async function main(): Promise<void> {
     pass: row2.status === "ok",
   });
   phases.push({
-    name: "turn 2: model column tagged ollama:<name>",
-    expected: `model=ollama:${MODEL}`,
+    name: "turn 2: model column tagged local:<backend>:<name>",
+    expected: `model=${EXPECTED_MODEL_TAG}`,
     actual: `model=${row2.model}`,
-    pass: row2.model === `ollama:${MODEL}`,
+    pass: row2.model === EXPECTED_MODEL_TAG,
   });
 
   const history = db.recentChatTurns(CHAT, 6);
@@ -220,7 +240,7 @@ async function main(): Promise<void> {
 
   // ── Error path: bad model name → audit row status='error' with hint ───────
   const tg3 = makeCapturedTg();
-  await runOllamaTurn(
+  await runLocalTurn(
     { ...deps, tg: tg3, model: "definitely-not-a-real-model" },
     {
       chatId: CHAT,
@@ -239,21 +259,22 @@ async function main(): Promise<void> {
     pass: row3.status === "error",
   });
   phases.push({
-    name: "bad model: error_message contains 'not found'",
-    expected: "error_message contains 'not found'",
+    name: "bad model: error_message contains backend-specific pull/load hint",
+    expected: `error_message contains '${PULL_HINT}'`,
     actual: `error_message=${truncate(row3.error_message ?? "", 100)}`,
-    pass: typeof row3.error_message === "string" && row3.error_message.includes("not found"),
+    pass:
+      typeof row3.error_message === "string" && row3.error_message.includes(PULL_HINT),
   });
   const lastEdit3 = tg3.edits[tg3.edits.length - 1]?.text ?? "";
   phases.push({
-    name: "bad model: telegram render shows ❌ with pull hint",
-    expected: "last edit contains '❌' + 'ollama pull'",
+    name: "bad model: telegram render shows ❌ with hint",
+    expected: `last edit contains '❌' + '${PULL_HINT}'`,
     actual: `last edit: ${truncate(lastEdit3, 120)}`,
-    pass: lastEdit3.includes("❌") && lastEdit3.includes("ollama pull"),
+    pass: lastEdit3.includes("❌") && lastEdit3.includes(PULL_HINT),
   });
 
-  // ── Tools-on path (PR-A). Skipped unless `OLLAMA_TOOLS_ENABLED=true`. ──
-  if (process.env.OLLAMA_TOOLS_ENABLED === "true") {
+  // ── Tools-on path. Skipped unless `LOCAL_TOOLS_ENABLED=true`. ─────────────
+  if (process.env.LOCAL_TOOLS_ENABLED === "true") {
     // Load the built-in `time` integration the same way main.ts would.
     const ctx = createIntegrationContext(
       process.env.SOLRAC_HOME ?? "/tmp/solrac-smoke-home",
@@ -264,14 +285,13 @@ async function main(): Promise<void> {
       tools.map((t) => [t.name, timeMod.meta?.tier ?? "confirm"] as const),
     );
     // Stub broker — `time_now` is `auto` tier so this is never consulted; we
-    // wire one in to satisfy the OllamaRunDeps shape and to make the path
-    // work on the off chance the integration's tier changes.
+    // wire one in to satisfy the deps shape.
     const broker: Pick<ConfirmationBroker, "request"> = {
       request: async () => ({ decision: "allow", finalize: async () => {} }),
     };
 
     const tg4 = makeCapturedTg();
-    await runOllamaTurn(
+    await runLocalTurn(
       {
         ...deps,
         tg: tg4,
@@ -307,18 +327,17 @@ async function main(): Promise<void> {
       pass: row4.status === "ok",
     });
     phases.push({
-      name: "tools-on: model column tagged ollama:<name>",
-      expected: `model=ollama:${MODEL}`,
+      name: "tools-on: model column tagged local:<backend>:<name>",
+      expected: `model=${EXPECTED_MODEL_TAG}`,
       actual: `model=${row4.model}`,
-      pass: row4.model === `ollama:${MODEL}`,
+      pass: row4.model === EXPECTED_MODEL_TAG,
     });
     phases.push({
       name: "tools-on: audit tool_calls JSON references time_now",
       expected: "tool_calls JSON contains 'time_now'",
       actual: `tool_calls=${truncate(row4.tool_calls ?? "null", 120)}`,
       pass:
-        typeof row4.tool_calls === "string" &&
-        row4.tool_calls.includes("time_now"),
+        typeof row4.tool_calls === "string" && row4.tool_calls.includes("time_now"),
     });
     const lastEdit4 = tg4.edits[tg4.edits.length - 1]?.text ?? "";
     phases.push({
@@ -338,7 +357,7 @@ async function main(): Promise<void> {
   } else {
     // eslint-disable-next-line no-console
     console.log(
-      "tools-on smoke: skipped (OLLAMA_TOOLS_ENABLED!=true). Set the env to exercise.",
+      "tools-on smoke: skipped (LOCAL_TOOLS_ENABLED!=true). Set the env to exercise.",
     );
   }
 
@@ -354,7 +373,7 @@ async function main(): Promise<void> {
   // eslint-disable-next-line no-console
   console.log("");
 
-  reportAndExit("ollama-smoke", phases);
+  reportAndExit("local-smoke", phases);
 }
 
 function escapeRegex(s: string): string {

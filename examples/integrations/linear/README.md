@@ -2,7 +2,7 @@
 
 Multi-file integration showing how to wrap a third-party SDK (`@linear/sdk`) and expose it as solrac tools. Use this as the template when porting any SDK-backed integration (Notion, Slack, Stripe, Asana, etc.) — the structure transfers directly.
 
-> ℹ️ **Engine reachability.** Integrations are visible to the Claude tiers (`@`, `!`) and the local Ollama path (when `OLLAMA_TOOLS_ENABLED=true`). For Linear's multi-step flows (look up team → filter issues → format output), the Claude tiers are still more reliable — small Ollama tool-callers (e.g. `gemma4:e4b`) can struggle with multi-arg filter shapes across consecutive calls. Prefer `@ list my Linear issues` when you need confidence.
+> ℹ️ **Engine reachability.** Integrations are visible to the Claude tiers (`@`, `!`) and the local engine (when `LOCAL_TOOLS_ENABLED=true`). For Linear's multi-step flows (look up team → filter issues → format output), the Claude tiers are still more reliable — small local tool-callers (e.g. `gemma4:e4b` on Ollama, `qwen2.5-7b` on LMStudio) can struggle with multi-arg filter shapes across consecutive calls. Prefer `@ list my Linear issues` when you need confidence.
 
 ## What this example demonstrates
 

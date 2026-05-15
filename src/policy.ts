@@ -149,18 +149,19 @@ export function gateUpdate(
   return { kind: "ok", fromId, chatId };
 }
 
-// PR-B: tier-aware prefix routing with inverted default.
+// Tier-aware prefix routing.
 // Engines:
 //   primary   = default Claude tier (SOLRAC_PRIMARY_MODEL, currently Sonnet).
 //               Triggered by `@` only (no longer the no-prefix default).
 //   secondary = heavyweight Claude tier (SOLRAC_SECONDARY_MODEL, currently Opus).
 //               Triggered by `!` (think "important / escalate").
-//   ollama    = local-model routing (OLLAMA_MODEL).
-//               Reached only when SOLRAC_DEFAULT_ENGINE=ollama (the new default).
+//   local     = local-model routing (LOCAL_MODEL via LOCAL_BACKEND driver).
+//               Reached only when SOLRAC_DEFAULT_ENGINE=local (the default).
 //
-// The `>` prefix was removed in PR-B — a leading `>` is now literal user
-// text routed to whichever engine is the operator's default. With Ollama as
-// the default and only-non-Claude engine, `>` would be redundant.
+// There is no engine prefix for the local engine — a leading `>` is literal
+// user text routed to whichever engine is the operator's default. With the
+// local engine as the default and only non-Claude engine, `>` would be
+// redundant.
 //
 // The parser strips one leading `!`/`@` plus one optional space. Leading
 // whitespace before the prefix is tolerated so mobile autocorrect doesn't
@@ -168,20 +169,20 @@ export function gateUpdate(
 // `main.ts` can decide whether an empty payload should render a usage hint
 // (only for explicit prefixes) or be ignored.
 //
-// With `defaultEngine="ollama"`:
-//   "hello"        → { engine: "ollama",    explicit: false, prompt: "hello" }
+// With `defaultEngine="local"`:
+//   "hello"        → { engine: "local",     explicit: false, prompt: "hello" }
 //   "@hello"       → { engine: "primary",   explicit: true,  prompt: "hello" }
 //   "@ hello"      → { engine: "primary",   explicit: true,  prompt: "hello" }
 //   "!hello"       → { engine: "secondary", explicit: true,  prompt: "hello" }
 //   "! hello"      → { engine: "secondary", explicit: true,  prompt: "hello" }
-//   ">hello"       → { engine: "ollama",    explicit: false, prompt: ">hello" }
+//   ">hello"       → { engine: "local",     explicit: false, prompt: ">hello" }
 //   "  ! hello"    → { engine: "secondary", explicit: true,  prompt: "hello" }
 //   "@"            → { engine: "primary",   explicit: true,  prompt: "" }
 //   "!"            → { engine: "secondary", explicit: true,  prompt: "" }
 //   "@@literal"    → { engine: "primary",   explicit: true,  prompt: "@literal" }
 //   "!!literal"    → { engine: "secondary", explicit: true,  prompt: "!literal" }
 //   "@!mixed"      → { engine: "primary",   explicit: true,  prompt: "!mixed" }
-//   ""             → { engine: "ollama",    explicit: false, prompt: "" }
+//   ""             → { engine: "local",     explicit: false, prompt: "" }
 //
 // With `defaultEngine="primary"` (Claude-only deploys), the no-prefix branch
 // returns `{ engine: "primary", … }` instead.
@@ -190,7 +191,7 @@ export function gateUpdate(
 // exact text. Explicit-prefix `prompt` is `.trim()`'d on the residue because
 // the prefix character is structural punctuation — surrounding whitespace is
 // not the user's intent.
-export type Engine = "primary" | "secondary" | "ollama";
+export type Engine = "primary" | "secondary" | "local";
 
 export interface EnginePrefixResult {
   engine: Engine;
@@ -804,7 +805,7 @@ export interface PolicyHookDeps {
   // hook can correlate by `tool_use_id` after the SDK runs the tool. The
   // SDK does not pass `tool_use_id` to canUseTool, so we key by content
   // instead. Race-free for non-parallel calls; for parallel identical
-  // calls the per-round single-confirm cap (Ollama) or model behavior
+  // calls the per-round single-confirm cap (local engine) or model behavior
   // (Claude) keeps the queue from stacking.
   pendingHandles?: Map<string, ConfirmHandle>;
 }
