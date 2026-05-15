@@ -114,7 +114,7 @@ export const LOOP_THRESHOLD = 3;
 const TELEGRAM_TEXT_MAX = 3800;
 const EDIT_THROTTLE_MS = 1500;
 // PLAN Step 12 — per-tier thinking-stub emoji so the operator can eyeball
-// which tier handled a turn without checking logs. Ollama uses 🦙 in `ollama.ts`;
+// which tier handled a turn without checking logs. The local engine uses 💻 in `local.ts`;
 // Claude tiers split here so primary (cheap default) is visually distinct
 // from secondary (heavyweight). Same "thinking…" suffix everywhere.
 const THINKING_STUB_BY_ENGINE: Record<SessionTier, string> = {
@@ -128,11 +128,11 @@ const THINKING_STUB_BY_ENGINE: Record<SessionTier, string> = {
 // naturally narrows after this tier consumes it (the next turn for this
 // engine's cutoff has advanced past these rows), so this cap only matters
 // when a user interleaves more than 6 cross-engine turns between two turns
-// of the same tier. PLAN Step 12 — generalized from the Step 11 Ollama-only
+// of the same tier. Generalized from the original local-only
 // version.
 //
-// NOT the same as `config.ollamaHistoryLimit` (env-tunable
-// OLLAMA_HISTORY_LIMIT, default 6). That limit caps the FULL history Ollama
+// NOT the same as `config.localHistoryLimit` (env-tunable
+// LOCAL_HISTORY_LIMIT, default 6). That limit caps the FULL history the local engine
 // reconstructs into its messages array (sessionless — every turn rebuilds
 // from scratch). This limit caps only the BRIDGE between engines on top of
 // the SDK's own session resume. Same default value, different scopes; see
@@ -368,7 +368,7 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
   //    today writes both atomically (`setSummary` + `clearSessionId`).
   //
   // 2. **Out-of-band turns**: if the user had exchanges with OTHER engines
-  //    (the other Claude tier or Ollama) after the most recent successful
+  //    (the other Claude tier or the local engine) after the most recent successful
   //    turn for THIS engine, prepend those turns. The window naturally
   //    narrows after this turn finishes. OOB applies regardless of whether
   //    the SDK session is resumed — the resumed session is THIS engine's
@@ -380,16 +380,17 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
     prevSessionId === null
       ? deps.sessions.getSummary(input.chatId, input.engine)
       : null;
-  // Decision B for `/clear ollama`: the cutoff hides Ollama turns from
-  // Claude's cross-engine bridge too, not just from Ollama's own history.
+  // `/clear local` cutoff: hides local-engine turns from Claude's
+  // cross-engine bridge too, not just from the local engine's own history.
   // Without this, /clear would feel half-broken — the operator would clear
-  // Ollama, then `@ ...` and watch Sonnet recite the freshly-cleared turns.
-  const ollamaCutoff = deps.sessions.getOllamaCutoff(input.chatId) ?? 0;
+  // the local engine, then `@ ...` and watch Sonnet recite the freshly-
+  // cleared turns.
+  const localCutoff = deps.sessions.getLocalCutoff(input.chatId) ?? 0;
   const oobTurns = deps.db.outOfBandForEngine(
     input.chatId,
     enginePrefix,
     OUT_OF_BAND_LIMIT,
-    ollamaCutoff,
+    localCutoff,
   );
   // PNX-167 (system-prompt externalization). Re-read SOLRAC.md per turn so
   // operator edits take effect on the next message without a restart.
@@ -594,6 +595,12 @@ export function sanitizedSubprocessEnv(): Record<string, string | undefined> {
   for (const [key, value] of Object.entries(process.env)) {
     if (key.startsWith("TELEGRAM_")) continue;
     if (key.startsWith("TG_")) continue;
+    // LOCAL_* (LOCAL_URL, LOCAL_MODEL, LOCAL_BACKEND, …) describe the local
+    // backend's endpoint and model; the SDK subprocess has no business
+    // calling Ollama/LMStudio. LOCAL_URL in particular can leak internal
+    // network topology (e.g. http://lmstudio.internal:1234) via an
+    // auto-allowed Bash(echo $LOCAL_URL).
+    if (key.startsWith("LOCAL_")) continue;
     if (key === "STATS_BEARER_TOKEN") continue;
     if (key === "ALLOWLIST_BOOTSTRAP") continue;
     if (key === "NOTION_API_KEY") continue;

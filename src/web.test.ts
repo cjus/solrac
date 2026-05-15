@@ -103,8 +103,8 @@ describe("renderIndexHtml", () => {
   const TEMPLATE = `<button title="default ({{DEFAULT_ENGINE_LABEL}})">●</button>`;
 
   test("substitutes the placeholder with the operator label", () => {
-    expect(renderIndexHtml(TEMPLATE, "ollama")).toBe(
-      `<button title="default (ollama)">●</button>`,
+    expect(renderIndexHtml(TEMPLATE, "local (ollama)")).toBe(
+      `<button title="default (local (ollama))">●</button>`,
     );
   });
 
@@ -120,6 +120,6 @@ describe("renderIndexHtml", () => {
   });
 
   test("leaves text alone when the placeholder is absent", () => {
-    expect(renderIndexHtml("<html>plain</html>", "ollama")).toBe("<html>plain</html>");
+    expect(renderIndexHtml("<html>plain</html>", "local (ollama)")).toBe("<html>plain</html>");
   });
 });

@@ -6,6 +6,7 @@ For day-to-day operations, see [OPERATIONS.md](./OPERATIONS.md).
 
 ## Index
 
+- [Breaking changes — local engine abstraction](#breaking-local-engine)
 - [409 Conflict (two pollers fighting)](#409-conflict)
 - [Queue full, please slow down](#queue-full)
 - [Bot silent, no error in logs](#bot-silent-no-error)
@@ -24,6 +25,56 @@ For day-to-day operations, see [OPERATIONS.md](./OPERATIONS.md).
 - [Ollama errors (default engine path)](#ollama-errors)
 - [Web UI not reachable / login won't take](#web-ui-issues)
 - [Web UI streaming silent / messages don't appear](#web-ui-stream-silent)
+
+---
+
+<a id="breaking-local-engine"></a>
+## Breaking changes — local engine abstraction
+
+The Ollama-specific path has been generalized into a `local` engine that supports multiple backends (Ollama + LMStudio). Every operator-facing surface that referenced "ollama" by name has been renamed. **All `OLLAMA_*` env vars and `engine: ollama` / `tier: ollama` frontmatter values are hard-rejected at boot/parse with an actionable rename hint.**
+
+### Operator action items
+
+1. **Backup the database BEFORE the first restart on the new build:**
+   ```sh
+   cp data/solrac.db data/solrac.db.pre-local-migration
+   ```
+   The migration retags audit rows in-place and renames a sessions column. Both steps are idempotent on retry, but a backup is the recovery path if anything else goes wrong.
+
+2. **Env file:** rename every `OLLAMA_*` env var to `LOCAL_*`, add `LOCAL_BACKEND=ollama` (or `lmstudio`). If `SOLRAC_DEFAULT_ENGINE=ollama`, change it to `SOLRAC_DEFAULT_ENGINE=local`.
+
+   | Legacy                       | New                                        |
+   |------------------------------|--------------------------------------------|
+   | `OLLAMA_ENABLED`             | `LOCAL_ENABLED`                            |
+   | `OLLAMA_URL`                 | `LOCAL_URL` (default backend-aware)        |
+   | `OLLAMA_MODEL`               | `LOCAL_MODEL`                              |
+   | `OLLAMA_TIMEOUT_MS`          | `LOCAL_TIMEOUT_MS`                         |
+   | `OLLAMA_HISTORY_LIMIT`       | `LOCAL_HISTORY_LIMIT`                      |
+   | `OLLAMA_TOOLS_ENABLED`       | `LOCAL_TOOLS_ENABLED`                      |
+   | `OLLAMA_MAX_TOOL_ITERATIONS` | `LOCAL_MAX_TOOL_ITERATIONS`                |
+   | —                            | `LOCAL_BACKEND` (NEW; `ollama`/`lmstudio`) |
+   | `SOLRAC_DEFAULT_ENGINE=ollama` | `SOLRAC_DEFAULT_ENGINE=local`            |
+
+3. **Operator markdown:** rewrite every `engine: ollama` in `tasks/*.md` to `engine: local`. Same for `tier: ollama` → `tier: local` in `skills/*.md`. The parser hard-rejects the legacy values; boot won't load that task/skill until you fix the frontmatter.
+
+4. **Slash commands:** `/clear ollama` → `/clear local`. The short aliases `o` and `>` are no longer accepted; use `l` or the full word.
+
+### What changes in the audit log
+
+- New rows write `model = 'local:<backend>:<modelId>'` (e.g. `local:ollama:gemma4:e4b`, `local:lmstudio:qwen2.5-7b`).
+- Existing `ollama:<modelId>` rows are retagged in-place to `local:ollama:<modelId>` on first boot. The migration logs `db.migrated: audit.ollama_retagged_to_local` with the row count.
+- Audit-read queries match BOTH `local:%` and legacy `ollama:%` for one release (dual-pattern reads). The legacy clause is removed in a follow-up release.
+
+### Rollback
+
+Pre-deploy backup is the operator-facing rollback. If you absolutely must inverse the migration in-place (e.g. running mixed-version pollers across hosts), the inverse SQL is commented in `src/db.ts` next to the forward migration:
+
+```sql
+UPDATE audit SET model = substr(model, 7) WHERE model LIKE 'local:ollama:%';
+ALTER TABLE sessions RENAME COLUMN local_cutoff_ms TO ollama_cutoff_ms;
+```
+
+Caveat: rolling back after operating in mixed mode leaves `local:lmstudio:%` rows orphaned (no inverse target). Operator decides whether to drop them or keep them as historical.
 
 ---
 
@@ -699,60 +750,66 @@ Send the next message. It'll start a fresh SDK session.
 
 ---
 
-<a id="ollama-errors"></a>
+<a id="local-errors"></a>
+<a id="ollama-errors"></a><!-- legacy anchor preserved for inbound links -->
 
-## Ollama errors (default engine path)
+## Local-engine errors (default engine path)
 
 ### Symptoms
 
-User sends a no-prefix message (which routes to Ollama under `SOLRAC_DEFAULT_ENGINE=ollama`) and gets one of:
+User sends a no-prefix message (which routes to the local engine under `SOLRAC_DEFAULT_ENGINE=local`) and gets one of:
 
-- `❌ ollama unreachable: http://localhost:11434`
-- `❌ ollama model not found: <model> — pull with \`ollama pull <model>\` on the host`
-- `❌ ollama timed out after 60s` (or `120s` when `OLLAMA_TOOLS_ENABLED=true`)
-- `❌ ollama error: <status> <body>`
+- `❌ local unreachable: <LOCAL_URL>`
+- `❌ local model not found: <model> — pull with \`ollama pull <model>\` (Ollama) or load via the LMStudio UI / \`lms load <model>\``
+- `❌ local timed out after 60s` (or `120s` when `LOCAL_TOOLS_ENABLED=true`)
+- `❌ local error: <status> <body>`
 - `⚠️ stopped after N tool iterations` (tool-loop didn't converge)
-- `ollama disabled in this deployment` (defensive — boot validation should have rejected this; investigate)
+- `local disabled in this deployment` (defensive — boot validation should have rejected this; investigate)
 
 ### Diagnosis
 
-Each render maps to a distinct cause:
+Each render maps to a distinct cause. Fixes vary by `LOCAL_BACKEND` (`ollama` vs `lmstudio`):
 
-| Render | Cause | Fix |
-|--------|-------|-----|
-| **unreachable** | Ollama daemon not running on `OLLAMA_URL`, or the URL is wrong, or a firewall/listener mismatch | `ollama serve` (start daemon); confirm `curl -sS $OLLAMA_URL/api/tags` returns JSON. |
-| **model not found** | Model name in `OLLAMA_MODEL` isn't in `ollama list` | `ollama pull <model>` on the host. Verify with `ollama list` — the name must match exactly, including any tag (`gemma4:e4b` not `gemma4`). |
-| **timed out** | The model took longer than `OLLAMA_TIMEOUT_MS` (default 60s) to finish streaming | Bump `OLLAMA_TIMEOUT_MS` for slow models / cold-start hardware, or pick a smaller model. Stream timing scales with parameter count and quantization. |
-| **error: 5xx** | Ollama crashed or ran out of memory mid-request | Check `ollama serve` stderr / system log. Common cause: GPU OOM (a 31B model on a 24GB GPU). Restart Ollama; downsize model. |
-| **disabled in this deployment** | Defensive ack — should be unreachable since boot validation throws on `defaultEngine=ollama && !ollamaEnabled`. If you're seeing this, the boot threw a config error and the instance came up in a degraded state, OR you set `defaultEngine=primary/secondary` and somehow the parser still resolved to ollama (file a bug). | Set `OLLAMA_ENABLED=true` and `OLLAMA_MODEL=<name>` in `.env`, restart. See [SETUP.md#2-prerequisites-ollama-daemon--model-recommended](./SETUP.md). |
+| Render | Cause | Fix (Ollama) | Fix (LMStudio) |
+|--------|-------|--------------|----------------|
+| **unreachable** | Backend not running on `LOCAL_URL`, or the URL is wrong, or a firewall/listener mismatch | `ollama serve` (start daemon); confirm `curl -sS $LOCAL_URL/api/tags` returns JSON. | Open the LMStudio app → Developer tab → "Start Server" (or `lms server start`); confirm `curl -sS $LOCAL_URL/v1/models` returns JSON. |
+| **model not found** | Model name in `LOCAL_MODEL` isn't loaded on the backend | `ollama pull <model>` on the host. Verify with `ollama list` — the name must match exactly, including any tag (`gemma4:e4b` not `gemma3`). | Load the model in the LMStudio GUI search or `lms load <model>`. Verify with `lms ls`. |
+| **timed out** | The model took longer than `LOCAL_TIMEOUT_MS` (default 60s, 120s with tools-on) to finish streaming | Bump `LOCAL_TIMEOUT_MS` for slow models / cold-start hardware, or pick a smaller model. Stream timing scales with parameter count and quantization. | Same — `LOCAL_TIMEOUT_MS` is backend-agnostic. LMStudio's `lms log stream` shows per-request timing. |
+| **error: 5xx** | Backend crashed or ran out of memory mid-request | Check `ollama serve` stderr / system log. Common cause: GPU OOM (a 31B model on a 24GB GPU). Restart Ollama; downsize model. | Check LMStudio's status indicator and `lms log stream`. Same GPU-OOM symptom; downsize model or quantization. |
+| **disabled in this deployment** | Defensive ack — should be unreachable since boot validation throws on `defaultEngine=local && !localEnabled`. If you're seeing this, the boot threw a config error and the instance came up in a degraded state, OR you set `defaultEngine=primary/secondary` and somehow the parser still resolved to `local` (file a bug). | Set `LOCAL_ENABLED=true`, `LOCAL_BACKEND=ollama`, and `LOCAL_MODEL=<name>` in `.env`, restart. See [SETUP.md](./SETUP.md#2-prerequisites-local-model-backend--model-recommended). | Same; set `LOCAL_BACKEND=lmstudio` instead. |
 
 The audit row also captures these:
 
 ```sh
 sqlite3 data/solrac.sqlite \
-  "SELECT id, status, error_message FROM audit WHERE model LIKE 'ollama:%' AND status = 'error' ORDER BY id DESC LIMIT 10"
+  "SELECT id, status, error_message FROM audit
+   WHERE (model LIKE 'local:%' OR model LIKE 'ollama:%')  -- dual-pattern: legacy rows for one release
+     AND status = 'error'
+   ORDER BY id DESC LIMIT 10"
 ```
 
 ### Recovery
 
-For most failures, the fix is one of: start Ollama, pull the model, bump timeout, or restart Ollama. None require a Solrac restart — the next message picks up the new state. Solrac re-queries `OLLAMA_URL` on each turn.
+For most failures, the fix is one of: start the backend, pull/load the model, bump timeout, or restart the backend. None require a Solrac restart — the next message picks up the new state. Solrac re-queries `LOCAL_URL` on each turn.
 
-If `OLLAMA_MODEL` itself is wrong (typo, deprecated name), you DO need a Solrac restart — `OLLAMA_MODEL` is read at boot. Edit `.env`, restart with `systemctl restart solrac.service` or kill the dev `pnpm dev` process.
+If `LOCAL_MODEL` itself is wrong (typo, deprecated name), you DO need a Solrac restart — `LOCAL_MODEL` is read at boot. Edit `.env`, restart with `systemctl restart solrac.service` or kill the dev process.
 
-If you suspect a deeper Ollama install problem, run the live smoke harness against your local Ollama to isolate:
+If you suspect a deeper backend install problem, run the live smoke harness against your local backend to isolate:
 
 ```sh
-OLLAMA_MODEL=<model> npm run smoke:ollama
+LOCAL_BACKEND=ollama LOCAL_MODEL=<model> npm run smoke:local
+# or
+LOCAL_BACKEND=lmstudio LOCAL_MODEL=<model> npm run smoke:local
 ```
 
-17 phases of streaming/audit/error checks; if those pass, the problem is between Solrac and the Telegram path, not in the Ollama integration itself.
+Multi-phase streaming/audit/error checks; if those pass, the problem is between Solrac and the Telegram path, not in the local-engine integration itself.
 
 ### Prevention
 
-- Pin Ollama to a specific version on prod hosts; new releases occasionally break NDJSON framing or add fields.
-- After pulling a new model, run the smoke harness once.
-- For the `model not found` class: avoid renaming or removing models on a host without rotating `OLLAMA_MODEL` first.
-- Cross-engine context bridge means Claude follow-ups need **a successful Claude turn** before the bridge stops re-injecting older Ollama context. If a Claude turn errors out (cost cap, allowlist, etc.), the next Claude turn will re-inject — that's by design (the failed turn didn't consume the context).
+- Pin the backend to a specific version on prod hosts. Ollama: new releases occasionally break NDJSON framing or add fields. LMStudio: new releases can shift SSE chunk shapes or tool-call delta semantics (the driver tolerates known variants, but a fresh release may surface a new one).
+- After pulling/loading a new model, run the smoke harness once.
+- For the `model not found` class: avoid renaming or removing models on a host without rotating `LOCAL_MODEL` first.
+- Cross-engine context bridge means Claude follow-ups need **a successful Claude turn** before the bridge stops re-injecting older local-engine context. If a Claude turn errors out (cost cap, allowlist, etc.), the next Claude turn will re-inject — that's by design (the failed turn didn't consume the context).
 
 ---
 

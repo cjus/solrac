@@ -9,7 +9,7 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `ANTHROPIC_API_KEY` | yes | — | string | Direct Anthropic auth. **No Bedrock/Vertex in v1.** |
 | `TELEGRAM_BOT_TOKEN` | yes | — | string | From [BotFather](https://t.me/BotFather). One bot per environment (dev/prod). |
 | `ALLOWLIST_BOOTSTRAP` | yes | — | comma-sep ints | Telegram `from.id` values to seed the allowlist on every boot. |
-| `SOLRAC_DEFAULT_ENGINE` | no | `ollama` | `ollama` \| `primary` \| `secondary` | Engine for messages with no `@`/`!` prefix. `ollama` (the default) requires `OLLAMA_ENABLED=true`. `primary`/`secondary` is the Claude-only-deploy fallback. Ollama is reachable only as the default engine — there is no `>`-style escape prefix. Boot rejects mismatches (e.g. `default=ollama && !ollamaEnabled`, or `default!=ollama && ollamaToolsEnabled`). |
+| `SOLRAC_DEFAULT_ENGINE` | no | `local` | `local` \| `primary` \| `secondary` | Engine for messages with no `@`/`!` prefix. `local` (the default) requires `LOCAL_ENABLED=true`. `primary`/`secondary` is the Claude-only-deploy fallback. The local engine is reachable only as the default engine — there is no escape prefix. Legacy `SOLRAC_DEFAULT_ENGINE=ollama` is **hard-rejected at boot** with a hint to set `local` + `LOCAL_BACKEND=ollama`. Boot rejects mismatches (e.g. `default=local && !localEnabled`, or `default!=local && localToolsEnabled`). |
 | `SOLRAC_TRANSPORT` | no | `poll` | `poll` \| `webhook` | `webhook` requires `TG_WEBHOOK_SECRET ≥32 chars`; v1 ships poll only. |
 | `PORT` | no | `8443` | positive int | `Bun.serve` port (`/health`, `/stats`). Webhook would also bind here. |
 | `SOLRAC_HOME` | no | cwd if it has `SOUL.md`, else `~/.solrac/` | path | Solrac's "home" dir — where `SOUL.md`, `SOLRAC.md`, and (by default) `data/`, `skills/`, `tasks/`, `integrations/` live. Resolution: explicit `SOLRAC_HOME` > cwd-with-`SOUL.md` (the dev workflow) > `~/.solrac/` (the packaged-binary default). All four `*_DIR` values below resolve relative paths against this. See [docs/INSTALL.md](./INSTALL.md). |
@@ -21,19 +21,20 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `SOLRAC_SECONDARY_MODEL` | no | `claude-opus-4-7` | model id | Claude **secondary** tier (`!` prefix — "escalate"). The heavyweight tier — Opus when extra horsepower is needed. Passed straight to the SDK. |
 | `STATS_BEARER_TOKEN` | no | — | string | Required only when `/stats` is hit; absent → `/stats` returns 503. |
 | `TG_WEBHOOK_SECRET` | webhook only | — | string ≥32 chars | Set as Telegram's `secret_token` and verified via `X-Telegram-Bot-Api-Secret-Token`. |
-| `OLLAMA_ENABLED` | no | `false` | boolean | Master switch for the local Ollama path. When `true`, `OLLAMA_MODEL` MUST be set. **Required `true` when `SOLRAC_DEFAULT_ENGINE=ollama` (the default).** Ollama is reached via the default-engine setting; there is no `>`-style escape prefix. |
-| `OLLAMA_URL` | no | `http://localhost:11434` | url | Ollama base URL. Trailing slash stripped at boot. Boot probes `GET /api/tags` once when Ollama is the default engine — non-fatal warn if unreachable or model missing. |
-| `OLLAMA_MODEL` | when `OLLAMA_ENABLED=true` | — | string | No default — explicit choice forced at boot. **Recommended: `gemma4:e4b`** (native function-calling, ~9.6GB, 128K context). Alternatives: `gemma4`, `qwen2.5`, `llama3.2`. Pull on the host first: `ollama pull <model>`. |
-| `OLLAMA_TIMEOUT_MS` | no | `60000` (or `120000` when `OLLAMA_TOOLS_ENABLED=true`) | positive int | Total turn timeout (model + tool execution loop). Default bumps to 120s when tools are on, since one mid-loop confirm prompt can consume 60s alone. Explicit value always wins. Aborted turns surface as `❌ ollama timed out`. |
-| `OLLAMA_HISTORY_LIMIT` | no | `6` | positive int | Last N successful turns reconstructed as conversation context per chat (cross-engine: includes Claude turns). At 256-char prompts × 6 turns ≈ ~3k tokens worst case. **History-pollution mitigation:** if you flip `OLLAMA_TOOLS_ENABLED` off→on on an existing chat, prior "I do not have tools" turns get replayed and the model learns to refuse — use `/clear ollama` to wipe the chat's Ollama history (see `docs/USAGE.md#slash-commands`), or set this to `1` for one turn. |
-| `OLLAMA_TOOLS_ENABLED` | no | `false` | boolean | Local model can call the same `mcp__solrac__*` integration tools the Claude tiers see. Requires `SOLRAC_INTEGRATIONS_ENABLED=true` AND `SOLRAC_DEFAULT_ENGINE=ollama` (boot rejects the unreachable `default!=ollama && tools=on` combo). Recommended `true` for Ollama-default deploys. |
-| `OLLAMA_MAX_TOOL_ITERATIONS` | no | `8` | positive int | Hard ceiling on tool-loop rounds per turn. Loop detector fires earlier on duplicate calls; this is the runaway-loop backstop. Iteration cap surfaces as `⚠️ stopped after N tool iterations`. |
+| `LOCAL_ENABLED` | no | `false` | boolean | Master switch for the local-engine path. When `true`, `LOCAL_BACKEND` AND `LOCAL_MODEL` MUST be set. **Required `true` when `SOLRAC_DEFAULT_ENGINE=local` (the default).** The local engine is reached via the default-engine setting; there is no escape prefix. Legacy `OLLAMA_ENABLED` is **hard-rejected at boot** with a rename hint. |
+| `LOCAL_BACKEND` | when `LOCAL_ENABLED=true` | — | `ollama` \| `lmstudio` | Wire-protocol driver. `ollama` → POST `/api/chat` NDJSON, probe `/api/tags`. `lmstudio` → POST `/v1/chat/completions` SSE (with `parallel_tool_calls: false` Gemma-4 workaround + tool-call arg-delta accumulation), probe `/v1/models`. |
+| `LOCAL_URL` | no | backend-aware (`:11434` ollama, `:1234` lmstudio) | url | Local-backend base URL. Trailing slash stripped at boot. Boot probes the backend-specific health endpoint once when the local engine is the default — non-fatal warn if unreachable or model missing. |
+| `LOCAL_MODEL` | when `LOCAL_ENABLED=true` | — | string | No default — explicit choice forced at boot. Ollama examples: `gemma4:e4b` (native function-calling, ~9.6GB, 128K ctx), `qwen2.5`, `llama3.2` — pull on the host first with `ollama pull <model>`. LMStudio examples: `qwen2.5-7b`, `llama-3.2-3b-instruct` — load via the LMStudio UI or `lms load <model>` first. |
+| `LOCAL_TIMEOUT_MS` | no | `60000` (or `120000` when `LOCAL_TOOLS_ENABLED=true`) | positive int | Total turn timeout (model + tool execution loop). Default bumps to 120s when tools are on, since one mid-loop confirm prompt can consume 60s alone. Explicit value always wins. Aborted turns surface as `❌ local timed out after Ns`. |
+| `LOCAL_HISTORY_LIMIT` | no | `6` | positive int | Last N successful turns reconstructed as conversation context per chat (cross-engine: includes Claude turns). At 256-char prompts × 6 turns ≈ ~3k tokens worst case. If you flip `LOCAL_TOOLS_ENABLED` off→on on an existing chat, prior "I do not have tools" turns get replayed and the model learns to refuse — use `/clear local` to wipe the chat's local history. |
+| `LOCAL_TOOLS_ENABLED` | no | `false` | boolean | Local model can call the same `mcp__solrac__*` integration tools the Claude tiers see. Requires `SOLRAC_INTEGRATIONS_ENABLED=true` AND `SOLRAC_DEFAULT_ENGINE=local` (boot rejects the unreachable `default!=local && tools=on` combo). Recommended `true` for local-default deploys. |
+| `LOCAL_MAX_TOOL_ITERATIONS` | no | `8` | positive int | Hard ceiling on tool-loop rounds per turn. Loop detector fires earlier on duplicate calls; this is the runaway-loop backstop. Iteration cap surfaces as `⚠️ stopped after N tool iterations`. |
 | `SOLRAC_SKILLS_ENABLED` | no | `false` | boolean | Master switch for operator-defined skills. When `true`, Solrac discovers `SKILL.md` files under `SOLRAC_SKILLS_DIR` at boot and exposes each as a `/<name>` slash command. |
 | `SOLRAC_SKILLS_DIR` | no | `./skills` | path | Directory scanned for `<name>/SKILL.md` files. Resolved relative to `SOLRAC_HOME`. Loaded ONCE at boot — edit files and restart. See [USAGE.md#skills-operator-defined-commands](./USAGE.md#skills-operator-defined-commands). |
 | `SOLRAC_TASKS_ENABLED` | no | `false` | boolean | Master switch for scheduled tasks. When `true`, Solrac discovers `TASK.md` files under `SOLRAC_TASKS_DIR` at boot and fires each on its configured schedule (5-field unix `cron:` or absolute `at:`). Fires synthesize updates through the existing turn queue, so cost caps + allowlist gate + policy hooks all apply automatically. |
 | `SOLRAC_TASKS_DIR` | no | `./tasks` | path | Directory scanned for `<name>/TASK.md` files. Resolved relative to `SOLRAC_HOME`. Loaded ONCE at boot — edit files and restart. See [USAGE.md#scheduled-tasks](./USAGE.md#scheduled-tasks). |
 | `TZ` | no | host runtime tz | IANA tz | Default timezone for cron tasks that omit `tz:` in their frontmatter. Set `Environment=TZ=America/Denver` (or your preferred IANA name) in the systemd unit to pin the scheduler's clock predictably across deploys. Per-task `tz:` always wins over `$TZ`. |
-| `SOLRAC_INTEGRATIONS_ENABLED` | no | `false` | boolean | Master switch for operator + blessed integrations. When `true`, Solrac discovers `<name>/index.ts` modules under `src/integrations-builtin/` (always) and `SOLRAC_INTEGRATIONS_DIR` (operator-owned) at boot, and registers each one's tools as `mcp__solrac__<tool>`. **Effective for both Claude tiers (`@`, `!`) and Ollama (when `OLLAMA_TOOLS_ENABLED=true`).** Required `true` when `OLLAMA_TOOLS_ENABLED=true`. See [USAGE.md#integrations](./USAGE.md#integrations). |
+| `SOLRAC_INTEGRATIONS_ENABLED` | no | `false` | boolean | Master switch for operator + blessed integrations. When `true`, Solrac discovers `<name>/index.ts` modules under `src/integrations-builtin/` (always) and `SOLRAC_INTEGRATIONS_DIR` (operator-owned) at boot, and registers each one's tools as `mcp__solrac__<tool>`. **Effective for both Claude tiers (`@`, `!`) and the local engine (when `LOCAL_TOOLS_ENABLED=true`).** Required `true` when `LOCAL_TOOLS_ENABLED=true`. See [USAGE.md#integrations](./USAGE.md#integrations). |
 | `SOLRAC_INTEGRATIONS_DIR` | no | `./integrations` | path | Directory scanned for operator-authored `<name>/index.ts` integration modules. Resolved relative to launch cwd; can also be absolute (e.g. `~/.solrac/integrations`). Loaded ONCE at boot — edit files and restart. |
 | `NOTION_API_KEY` | when `notion` integration in use | — | string | Notion internal-integration secret (`secret_…`). Consumed by the blessed `notion` integration only — not validated in `config.ts`. Boot probes `GET /v1/users/me` (3s timeout); failure → integration self-gates to zero tools, solrac boots normally. **Scrubbed** from the SDK-spawned `claude` subprocess env by `agent.ts::sanitizedSubprocessEnv` (the integration handler runs in solrac's main process; the subprocess never needs the token). See [USAGE.md#notion-single-token-notion-workspace-opt-in-dep](./USAGE.md#notion--single-token-notion-workspace-opt-in-dep). |
 | `SOLRAC_WEB_ENABLED` | no | `false` | boolean | Master switch for the browser web UI. When `true`, Solrac binds a second `Bun.serve` instance to `SOLRAC_WEB_HOST:SOLRAC_WEB_PORT`. `SOLRAC_WEB_TOKEN` becomes required. |
@@ -52,12 +53,13 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 - **`PORT`**, **`MAX_CONCURRENT_TURNS`** must parse as positive integers. Non-integer floats throw.
 - **`HOURLY_COST_CAP_USD`** and **`GLOBAL_HOURLY_COST_CAP_USD`** must parse as positive numbers (float allowed). The global cap defaults to `HOURLY_COST_CAP_USD × MAX_CONCURRENT_TURNS` if unset, so bumping `MAX_CONCURRENT_TURNS` auto-tracks unless you've explicitly overridden the global. Set both explicitly for production if you want the cap independent from concurrency.
 - **Webhook constraint:** when `SOLRAC_TRANSPORT=webhook`, `TG_WEBHOOK_SECRET` must be set and ≥32 characters.
+- **Legacy `OLLAMA_*` env var rejection:** any `OLLAMA_*` env var still set at boot causes Solrac to fail loud with the full list and a rename mapping (`OLLAMA_ENABLED` → `LOCAL_ENABLED`, etc., plus `add LOCAL_BACKEND=ollama`). Same for `SOLRAC_DEFAULT_ENGINE=ollama`. See [RUNBOOK.md#breaking-local-engine](./RUNBOOK.md#breaking-local-engine).
 - **Default-engine constraints:**
-  - `SOLRAC_DEFAULT_ENGINE=ollama` requires `OLLAMA_ENABLED=true`. Boot throws with the actionable hint to either enable Ollama or pick a different default.
-  - `SOLRAC_DEFAULT_ENGINE=primary|secondary` with `OLLAMA_TOOLS_ENABLED=true` is **unreachable** — Ollama only runs as the default engine, so this combination would load tools no engine can call. Boot throws.
-  - When `SOLRAC_DEFAULT_ENGINE` is unset, a `solrac.default_engine_implicit` warn fires at boot so deployments never run on an implicit default. Set the variable explicitly (even to `ollama`) to silence the warning.
-- **Ollama constraint:** when `OLLAMA_ENABLED=true`, `OLLAMA_MODEL` must be set and non-blank. `OLLAMA_TIMEOUT_MS`, `OLLAMA_HISTORY_LIMIT`, and `OLLAMA_MAX_TOOL_ITERATIONS` must parse as positive integers if provided. `OLLAMA_URL` has its trailing slash stripped at boot.
-- **Ollama tools constraint:** `OLLAMA_TOOLS_ENABLED=true` requires `SOLRAC_INTEGRATIONS_ENABLED=true` (else there are no tools to expose; boot throws).
+  - `SOLRAC_DEFAULT_ENGINE=local` requires `LOCAL_ENABLED=true`. Boot throws with the actionable hint to either enable the local engine or pick a different default.
+  - `SOLRAC_DEFAULT_ENGINE=primary|secondary` with `LOCAL_TOOLS_ENABLED=true` is **unreachable** — the local engine only runs as the default engine, so this combination would load tools no engine can call. Boot throws.
+  - When `SOLRAC_DEFAULT_ENGINE` is unset, a `solrac.default_engine_implicit` warn fires at boot so deployments never run on an implicit default. Set the variable explicitly (even to `local`) to silence the warning.
+- **Local-engine constraint:** when `LOCAL_ENABLED=true`, both `LOCAL_BACKEND` (∈ `ollama`/`lmstudio`) and `LOCAL_MODEL` must be set and non-blank. `LOCAL_TIMEOUT_MS`, `LOCAL_HISTORY_LIMIT`, and `LOCAL_MAX_TOOL_ITERATIONS` must parse as positive integers if provided. `LOCAL_URL` has its trailing slash stripped at boot.
+- **Local-tools constraint:** `LOCAL_TOOLS_ENABLED=true` requires `SOLRAC_INTEGRATIONS_ENABLED=true` (else there are no tools to expose; boot throws).
 - **Web UI constraint:** when `SOLRAC_WEB_ENABLED=true`, `SOLRAC_WEB_TOKEN` must be set (any value; ≥32 chars recommended). `SOLRAC_WEB_PORT` must differ from `PORT`. `SOLRAC_WEB_CHAT_ID` must be a negative integer.
 
 The returned `Config` object is `Object.freeze`d; `allowlistBootstrap` is also frozen. There's no runtime mutation path.
@@ -92,21 +94,22 @@ ANTHROPIC_API_KEY=sk-ant-…
 TELEGRAM_BOT_TOKEN=8123456789:AA…
 ALLOWLIST_BOOTSTRAP=123456789
 
-# Engine routing — default is ollama; `@` → primary Claude, `!` → secondary Claude
-SOLRAC_DEFAULT_ENGINE=ollama          # `ollama` | `primary` | `secondary`
+# Engine routing — default is local; `@` → primary Claude, `!` → secondary Claude
+SOLRAC_DEFAULT_ENGINE=local           # `local` | `primary` | `secondary`
 SOLRAC_PRIMARY_MODEL=claude-sonnet-4-6   # `@` prefix
 SOLRAC_SECONDARY_MODEL=claude-opus-4-7   # `!` prefix (escalate)
 
-# Ollama (required when SOLRAC_DEFAULT_ENGINE=ollama)
-OLLAMA_ENABLED=true
-OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=gemma4:e4b               # native function-calling, ~9.6GB
-OLLAMA_TIMEOUT_MS=60000               # bumps to 120000 when tools-on
-OLLAMA_HISTORY_LIMIT=6
-OLLAMA_TOOLS_ENABLED=true             # requires SOLRAC_INTEGRATIONS_ENABLED=true
-OLLAMA_MAX_TOOL_ITERATIONS=8
+# Local engine (required when SOLRAC_DEFAULT_ENGINE=local)
+LOCAL_ENABLED=true
+LOCAL_BACKEND=ollama                  # `ollama` | `lmstudio`
+# LOCAL_URL=http://localhost:11434    # backend-aware default; explicit wins
+LOCAL_MODEL=gemma4:e4b                # native function-calling, ~9.6GB
+LOCAL_TIMEOUT_MS=60000                # bumps to 120000 when tools-on
+LOCAL_HISTORY_LIMIT=6
+LOCAL_TOOLS_ENABLED=true              # requires SOLRAC_INTEGRATIONS_ENABLED=true
+LOCAL_MAX_TOOL_ITERATIONS=8
 
-# Integrations (precondition for OLLAMA_TOOLS_ENABLED=true)
+# Integrations (precondition for LOCAL_TOOLS_ENABLED=true)
 SOLRAC_INTEGRATIONS_ENABLED=true
 SOLRAC_INTEGRATIONS_DIR=./integrations
 
@@ -140,12 +143,12 @@ SOLRAC_WEB_TOKEN=                 # required when enabled; generate: openssl ran
 
 ### Claude-only deploy
 
-For hosts that can't run Ollama:
+For hosts that can't run a local model:
 
 ```sh
 SOLRAC_DEFAULT_ENGINE=primary     # no-prefix → Anthropic Sonnet
-OLLAMA_ENABLED=false
-OLLAMA_TOOLS_ENABLED=false
+LOCAL_ENABLED=false
+LOCAL_TOOLS_ENABLED=false
 SOLRAC_INTEGRATIONS_ENABLED=true  # still useful for Claude tiers
 ```
 
@@ -174,8 +177,8 @@ Two operator-editable markdown files at `$SOLRAC_HOME` (default: cwd in dev — 
 
 | File | Purpose | Lifecycle | Failure mode |
 |---|---|---|---|
-| `SOUL.md` | Voice, stance, untrusted-content safety clause. Shared across engines. | Read once at boot. Joined with an engine-specific capability note and shipped as `systemPrompt.append` (Claude) or first `system` message (Ollama). | Hard-fail: boot exits 1 if missing or empty. |
-| `SOLRAC.md` | Operator-specific overlay: operator name, channel posture, project hints. | Re-read per turn. Wrapped in `<solrac-md>...</solrac-md>` and injected at the top of the user-message envelope (Claude) or as a second `system` message (Ollama). | Soft-warn: missing or unedited-template state injects nothing; Solrac runs vanilla. |
+| `SOUL.md` | Voice, stance, untrusted-content safety clause. Shared across engines. | Read once at boot. Joined with an engine-specific capability note and shipped as `systemPrompt.append` (Claude) or first `system` message (local). | Hard-fail: boot exits 1 if missing or empty. |
+| `SOLRAC.md` | Operator-specific overlay: operator name, channel posture, project hints. | Re-read per turn. Wrapped in `<solrac-md>...</solrac-md>` and injected at the top of the user-message envelope (Claude) or as a second `system` message (local). | Soft-warn: missing or unedited-template state injects nothing; Solrac runs vanilla. |
 
 Both ship as **embedded text constants** baked into the binary via text imports of the canonical copies in the repo root (`instance.ts` — the `EMBEDDED_DEFAULTS` constant). On first boot, if `$SOLRAC_HOME` lacks them, `bootstrapInstanceFiles` writes the embedded defaults to `$SOLRAC_HOME` so the operator has a customizable copy. Subsequent boots read from disk; the embedded copies are a one-time seed.
 
@@ -195,7 +198,7 @@ On boot, `solrac.boot` is logged with the non-secret summary:
   "level": "info",
   "msg": "solrac.boot",
   "transport": "poll",
-  "defaultEngine": "ollama",
+  "defaultEngine": "local",
   "primaryModel": "claude-sonnet-4-6",
   "secondaryModel": "claude-opus-4-7",
   "port": 8443,
@@ -204,9 +207,10 @@ On boot, `solrac.boot` is logged with the non-secret summary:
   "maxConcurrentTurns": 4,
   "hourlyCostCapUsd": 1,
   "globalHourlyCostCapUsd": 4,
-  "ollamaEnabled": true,
-  "ollamaModel": "gemma4:e4b",
-  "ollamaUrl": "http://localhost:11434"
+  "localEnabled": true,
+  "localBackend": "ollama",
+  "localModel": "gemma4:e4b",
+  "localUrl": "http://localhost:11434"
 }
 ```
 

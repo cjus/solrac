@@ -49,7 +49,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDb, type SolracDb } from "./db.ts";
+import { AUDIT_TOOL_CALLS_MAX_LEN, openDb, type SolracDb } from "./db.ts";
 
 const dirs: string[] = [];
 const dbs: SolracDb[] = [];
@@ -281,28 +281,59 @@ describe("openDb migrations", () => {
     expect(auditCols.get("cache_read_input_tokens")!.notnull).toBe(0);
   });
 
-  test("adds sessions.ollama_cutoff_ms on upgrade and is nullable", async () => {
+  test("adds sessions.local_cutoff_ms on a fresh install (no legacy column)", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    const sessionCols = columns(db.raw, "sessions");
+    expect(sessionCols.has("local_cutoff_ms")).toBe(true);
+    expect(sessionCols.get("local_cutoff_ms")!.notnull).toBe(0);
+    expect(sessionCols.has("ollama_cutoff_ms")).toBe(false);
+  });
+
+  test("renames sessions.ollama_cutoff_ms → local_cutoff_ms on upgrade, value preserved", async () => {
     const dir = newDir();
     {
+      // Set up a pre-Phase-3 schema: rename back from local_cutoff_ms to
+      // ollama_cutoff_ms so the next openDb sees the legacy column.
       const db1 = await openDb(dir);
-      db1.raw.run("ALTER TABLE sessions DROP COLUMN ollama_cutoff_ms");
+      db1.raw.run("ALTER TABLE sessions RENAME COLUMN local_cutoff_ms TO ollama_cutoff_ms");
       db1.raw.run(`
-        INSERT INTO sessions (chat_id, primary_session_id, created_at, updated_at)
-          VALUES (888, 'p-uuid', 100, 100);
+        INSERT INTO sessions (chat_id, primary_session_id, ollama_cutoff_ms, created_at, updated_at)
+          VALUES (888, 'p-uuid', 12345, 100, 100);
       `);
       db1.close();
     }
     const db2 = await openDb(dir);
     dbs.push(db2);
     const sessionCols = columns(db2.raw, "sessions");
-    expect(sessionCols.has("ollama_cutoff_ms")).toBe(true);
-    expect(sessionCols.get("ollama_cutoff_ms")!.notnull).toBe(0);
+    expect(sessionCols.has("local_cutoff_ms")).toBe(true);
+    expect(sessionCols.has("ollama_cutoff_ms")).toBe(false);
     const row = db2.raw.query("SELECT * FROM sessions WHERE chat_id = 888").get() as {
       primary_session_id: string;
-      ollama_cutoff_ms: number | null;
+      local_cutoff_ms: number | null;
     };
     expect(row.primary_session_id).toBe("p-uuid");
-    expect(row.ollama_cutoff_ms).toBeNull();
+    expect(row.local_cutoff_ms).toBe(12345);
+  });
+
+  test("retags legacy ollama:<model> audit rows to local:ollama:<model>", async () => {
+    const dir = newDir();
+    {
+      const db1 = await openDb(dir);
+      // Insert with a legacy tag — the migration on next open should retag.
+      db1.raw.run(
+        "INSERT INTO audit (tree_id, chat_id, from_id, prompt, status, started_at, model) " +
+          "VALUES (0, 1, 1, 'p', 'ok', 100, 'ollama:gemma3:e4b')",
+      );
+      db1.close();
+    }
+    const db2 = await openDb(dir);
+    dbs.push(db2);
+    const row = db2.raw
+      .query("SELECT model FROM audit WHERE chat_id = 1 ORDER BY id LIMIT 1")
+      .get() as { model: string };
+    expect(row.model).toBe("local:ollama:gemma3:e4b");
   });
 
   test("PNX-167 — adds summary columns on a pre-Step-167 schema", async () => {
@@ -425,7 +456,7 @@ describe("openDb engine-scoped helpers (PNX-167)", () => {
       { chatId: 1, model: "claude:primary:m", startedAt: 200, response: "mid", cost: 0.01, status: "ok" },
       { chatId: 1, model: "claude:primary:m", startedAt: 300, response: "new", cost: 0.01, status: "ok" },
       // Other engine — filtered out by enginePrefix.
-      { chatId: 1, model: "ollama:llama3", startedAt: 250, response: "ollama", cost: 0, status: "ok" },
+      { chatId: 1, model: "local:ollama:llama3", startedAt: 250, response: "local", cost: 0, status: "ok" },
     ]);
     // sinceMs=0 → all primary turns chronological
     const all = db.recentChatTurnsForEngine(1, "claude:primary:%", 10, 0);
@@ -526,7 +557,7 @@ describe("openDb engine-scoped helpers (PNX-167)", () => {
     dbs.push(db);
     seedTurns(db, [
       { chatId: 1, model: "claude:primary:m", startedAt: 100, response: "old", cost: 0.01, status: "ok" },
-      { chatId: 1, model: "ollama:gemma", startedAt: 200, response: "mid", cost: 0, status: "ok" },
+      { chatId: 1, model: "local:ollama:gemma", startedAt: 200, response: "mid", cost: 0, status: "ok" },
       { chatId: 1, model: "claude:primary:m", startedAt: 300, response: "new", cost: 0.01, status: "ok" },
     ]);
     expect(db.recentChatTurns(1, 10).map((r) => r.response)).toEqual(["old", "mid", "new"]);
@@ -535,37 +566,71 @@ describe("openDb engine-scoped helpers (PNX-167)", () => {
     expect(db.recentChatTurns(1, 10, 999)).toHaveLength(0);
   });
 
-  test("outOfBandForEngine respects ollamaCutoffMs (decision B)", async () => {
+  test("outOfBandForEngine respects localCutoffMs", async () => {
     const dir = newDir();
     const db = await openDb(dir);
     dbs.push(db);
     seedTurns(db, [
-      { chatId: 1, model: "ollama:gemma", startedAt: 100, response: "ollama-old", cost: 0, status: "ok" },
-      { chatId: 1, model: "ollama:gemma", startedAt: 200, response: "ollama-new", cost: 0, status: "ok" },
+      { chatId: 1, model: "local:ollama:gemma", startedAt: 100, response: "local-old", cost: 0, status: "ok" },
+      { chatId: 1, model: "local:ollama:gemma", startedAt: 200, response: "local-new", cost: 0, status: "ok" },
       { chatId: 1, model: "claude:secondary:m", startedAt: 150, response: "opus", cost: 0.02, status: "ok" },
     ]);
     const all = db.outOfBandForEngine(1, "claude:primary:%", 10).map((r) => r.response);
-    expect(all).toEqual(["ollama-old", "opus", "ollama-new"]);
+    expect(all).toEqual(["local-old", "opus", "local-new"]);
     const filtered = db.outOfBandForEngine(1, "claude:primary:%", 10, 150).map((r) => r.response);
-    expect(filtered).toEqual(["opus", "ollama-new"]);
+    expect(filtered).toEqual(["opus", "local-new"]);
     const onlyOpus = db.outOfBandForEngine(1, "claude:primary:%", 10, 999).map((r) => r.response);
     expect(onlyOpus).toEqual(["opus"]);
   });
 
-  test("hasOllamaTurnsSince returns true only for ok rows with started_at > sinceMs", async () => {
+  test("outOfBandForEngine dual-pattern: legacy ollama:% rows still hidden by cutoff", async () => {
     const dir = newDir();
     const db = await openDb(dir);
     dbs.push(db);
-    expect(db.hasOllamaTurnsSince(1, 0)).toBe(false);
+    // Simulate an unmigrated database by directly inserting legacy-format
+    // rows (bypasses the boot-time retag because that ran on an empty db).
+    db.raw.run(
+      "INSERT INTO audit (tree_id, chat_id, from_id, prompt, response, status, started_at, model, cost_usd) " +
+        "VALUES (0, 1, 1, 'p', 'legacy', 'ok', 100, 'ollama:gemma', 0)",
+    );
     seedTurns(db, [
-      { chatId: 1, model: "ollama:gemma", startedAt: 100, response: "hi", cost: 0, status: "ok" },
-      { chatId: 1, model: "ollama:gemma", startedAt: 200, response: null, cost: null, status: "error" },
-      { chatId: 2, model: "ollama:gemma", startedAt: 300, response: "hi", cost: 0, status: "ok" },
+      { chatId: 1, model: "claude:secondary:m", startedAt: 150, response: "opus", cost: 0.02, status: "ok" },
+    ]);
+    // Without cutoff: both rows appear out-of-band for the primary tier.
+    const all = db.outOfBandForEngine(1, "claude:primary:%", 10).map((r) => r.response);
+    expect(all).toContain("legacy");
+    // With cutoff at 150: legacy ollama:% row pre-cutoff is hidden.
+    const filtered = db.outOfBandForEngine(1, "claude:primary:%", 10, 150).map((r) => r.response);
+    expect(filtered).not.toContain("legacy");
+    expect(filtered).toContain("opus");
+  });
+
+  test("hasLocalTurnsSince returns true only for ok rows with started_at > sinceMs", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    expect(db.hasLocalTurnsSince(1, 0)).toBe(false);
+    seedTurns(db, [
+      { chatId: 1, model: "local:ollama:gemma", startedAt: 100, response: "hi", cost: 0, status: "ok" },
+      { chatId: 1, model: "local:ollama:gemma", startedAt: 200, response: null, cost: null, status: "error" },
+      { chatId: 2, model: "local:ollama:gemma", startedAt: 300, response: "hi", cost: 0, status: "ok" },
       { chatId: 1, model: "claude:primary:m", startedAt: 400, response: "hi", cost: 0.01, status: "ok" },
     ]);
-    expect(db.hasOllamaTurnsSince(1, 0)).toBe(true);
-    expect(db.hasOllamaTurnsSince(1, 99)).toBe(true);
-    expect(db.hasOllamaTurnsSince(1, 100)).toBe(false);
+    expect(db.hasLocalTurnsSince(1, 0)).toBe(true);
+    expect(db.hasLocalTurnsSince(1, 99)).toBe(true);
+    expect(db.hasLocalTurnsSince(1, 100)).toBe(false);
+  });
+
+  test("hasLocalTurnsSince dual-pattern: also matches legacy ollama:% rows", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    db.raw.run(
+      "INSERT INTO audit (tree_id, chat_id, from_id, prompt, response, status, started_at, model, cost_usd) " +
+        "VALUES (0, 1, 1, 'p', 'legacy', 'ok', 100, 'ollama:gemma', 0)",
+    );
+    expect(db.hasLocalTurnsSince(1, 0)).toBe(true);
+    expect(db.hasLocalTurnsSince(1, 100)).toBe(false);
   });
 
   test("sumChatBytesForEngine totals prompt+response over status='ok' rows", async () => {
@@ -575,15 +640,83 @@ describe("openDb engine-scoped helpers (PNX-167)", () => {
     seedTurns(db, [
       { chatId: 1, model: "claude:primary:m", startedAt: 100, response: "abcd", cost: 0.01, status: "ok" },
       // Different engine — should be excluded.
-      { chatId: 1, model: "ollama:llama", startedAt: 200, response: "zzzz", cost: 0, status: "ok" },
+      { chatId: 1, model: "local:ollama:llama", startedAt: 200, response: "zzzz", cost: 0, status: "ok" },
       // Error row — should be excluded.
       { chatId: 1, model: "claude:primary:m", startedAt: 300, response: null, cost: null, status: "error" },
     ]);
     // Prompt = "p" (1) + response = "abcd" (4) = 5 bytes per row in the `seedTurns` helper.
     expect(db.sumChatBytesForEngine(1, "claude:primary:%")).toBe(5);
-    expect(db.sumChatBytesForEngine(1, "ollama:%")).toBe(5);
+    expect(db.sumChatBytesForEngine(1, "local:%")).toBe(5);
     // No rows for unknown chat → 0.
     expect(db.sumChatBytesForEngine(99, "claude:primary:%")).toBe(0);
+  });
+
+  test("updateAuditEnd caps audit.tool_calls at AUDIT_TOOL_CALLS_MAX_LEN", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    const id = db.insertAudit({
+      chatId: 1,
+      fromId: 200,
+      updateId: 0,
+      prompt: "p",
+      startedAt: 1,
+      model: "local:ollama:gemma",
+    });
+    const oversized = "x".repeat(AUDIT_TOOL_CALLS_MAX_LEN + 5000);
+    db.updateAuditEnd({
+      id,
+      response: null,
+      toolCalls: oversized,
+      inputTokens: null,
+      outputTokens: null,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+      costUsd: 0,
+      agentSessionId: null,
+      status: "ok",
+      errorMessage: null,
+      endedAt: 2,
+    });
+    const row = db.raw
+      .query("SELECT tool_calls FROM audit WHERE id = ?")
+      .get(id) as { tool_calls: string };
+    expect(row.tool_calls.length).toBeLessThanOrEqual(AUDIT_TOOL_CALLS_MAX_LEN + 100);
+    expect(row.tool_calls).toContain("truncated:");
+    expect(row.tool_calls).toContain(`${AUDIT_TOOL_CALLS_MAX_LEN}/${oversized.length}`);
+  });
+
+  test("updateAuditEnd passes through tool_calls under the cap unchanged", async () => {
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    const id = db.insertAudit({
+      chatId: 1,
+      fromId: 200,
+      updateId: 0,
+      prompt: "p",
+      startedAt: 1,
+      model: "local:ollama:gemma",
+    });
+    const small = JSON.stringify([{ name: "time_now", input: { timezone: "UTC" } }]);
+    db.updateAuditEnd({
+      id,
+      response: null,
+      toolCalls: small,
+      inputTokens: null,
+      outputTokens: null,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+      costUsd: 0,
+      agentSessionId: null,
+      status: "ok",
+      errorMessage: null,
+      endedAt: 2,
+    });
+    const row = db.raw
+      .query("SELECT tool_calls FROM audit WHERE id = ?")
+      .get(id) as { tool_calls: string };
+    expect(row.tool_calls).toBe(small);
   });
 });
 

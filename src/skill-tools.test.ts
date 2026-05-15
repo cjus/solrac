@@ -1,51 +1,25 @@
 /**
  * @fileoverview Unit tests for skill-as-tool dispatcher.
- * @proves Tool definition shape, naming, registry filtering, ALS context
- *         propagation, audit row content, AND the load-bearing recursion-
- *         safety invariant.
+ * @proves Tool definition shape, naming, registry filtering, audit-row tag.
  *
- * Recursion-safety invariant — PR-skills-tools:
- *   PR-skills-tools lifts the "tool-less skill body" constraint. Skill bodies
- *   now see the same MCP catalog Ollama turns see, MINUS the skill's own
- *   `skills__<self>` entry. The filter is the load-bearing guard against a
- *   tool-callable skill recursing into itself (infinite loop).
- *
- *   Two cases:
- *     1. `OllamaSkillDeps` has no tool surface wired → falls through to the
- *        single-shot /api/chat path. Outgoing body has no `tools` field.
- *        (Back-compat for pure text-transform skills like `tldr`.)
- *     2. `OllamaSkillDeps` HAS tools wired → routes through `runToolLoop`.
- *        Outgoing body HAS a `tools` field. The skill's own
- *        `skills__<self>` entry is filtered out.
- *
- *   Indirect recursion (A → skills__B → skills__A) is bounded by
- *   `runToolLoop`'s `maxIterations` (= `skill.maxTurns`) and the loop detector.
- *
- * Cross-references:
- *   - src/skill-tools.ts — implementation
- *   - src/commands.ts::runSkillBareWithTools — tool-loop path
- *   - src/commands.ts::runSkillBare — dispatcher; bare path for no-tools case
+ * Wire-format edge cases live in `local-driver.test.ts`. Tool-loop logic
+ * lives in `local-tools.test.ts`. This file scopes to skill-tools shape
+ * + filtering invariants that survive the driver abstraction.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { z } from "zod";
-import type { OllamaSkillDeps } from "./commands.ts";
+import type { LocalSkillDeps } from "./commands.ts";
 import { openDb, type SolracDb } from "./db.ts";
 import {
-  buildSkillTools,
-  SKILL_TOOL_PREFIX,
-  skillToolCtx,
-  skillToolName,
-  type SkillToolContext,
-} from "./skill-tools.ts";
+  type LocalChatEvent,
+  type LocalDriver,
+  type LocalStreamChatOpts,
+} from "./local-driver.ts";
+import { buildSkillTools, SKILL_TOOL_PREFIX } from "./skill-tools.ts";
 import type { Skill, SkillRegistry } from "./skills.ts";
-
-// ---------------------------------------------------------------------------
-// Test scaffolding
-// ---------------------------------------------------------------------------
 
 const dirs: string[] = [];
 let openedDbs: SolracDb[] = [];
@@ -80,7 +54,7 @@ function fakeSkill(overrides: Partial<Skill> = {}): Skill {
   return Object.freeze({
     name: "tldr",
     description: "Summarize the supplied text in 2-3 sentences.",
-    tier: "ollama",
+    tier: "local" as const,
     body: "Summarize: {{args}}",
     sourcePath: "/test/SKILL.md",
     tool: true,
@@ -88,7 +62,7 @@ function fakeSkill(overrides: Partial<Skill> = {}): Skill {
     requires: [] as ReadonlyArray<string>,
     autoAllow: false,
     ...overrides,
-  });
+  }) as unknown as Skill;
 }
 
 function makeRegistry(skills: ReadonlyArray<Skill>): SkillRegistry {
@@ -97,77 +71,61 @@ function makeRegistry(skills: ReadonlyArray<Skill>): SkillRegistry {
     all: Object.freeze([...skills]),
     get: (name: string) => byName.get(name.toLowerCase()),
     size: () => byName.size,
-  });
+  }) as unknown as SkillRegistry;
 }
 
-const TEST_CTX: SkillToolContext = Object.freeze({
-  chatId: 12345,
-  fromId: 67890,
-  updateId: 1,
-  parentAuditId: 1,
-});
+function noopDriver(): LocalDriver {
+  return {
+    backend: "ollama",
+    async probe() {
+      return { ok: true };
+    },
+    async *streamChat(_opts: LocalStreamChatOpts): AsyncIterable<LocalChatEvent> {
+      yield { kind: "done", inputTokens: null, outputTokens: null };
+    },
+  };
+}
 
-// ---------------------------------------------------------------------------
-// Naming + prefix
-// ---------------------------------------------------------------------------
-
-describe("skillToolName / SKILL_TOOL_PREFIX", () => {
-  test("prefixes skill name with skills__", () => {
-    expect(skillToolName("tldr")).toBe("skills__tldr");
-    expect(skillToolName("foo_bar")).toBe("skills__foo_bar");
-  });
-
-  test("prefix constant matches", () => {
-    expect(SKILL_TOOL_PREFIX).toBe("skills__");
-    expect(skillToolName("x").startsWith(SKILL_TOOL_PREFIX)).toBe(true);
-  });
-});
+function makeDeps(): LocalSkillDeps {
+  return {
+    driver: noopDriver(),
+    model: "test-m",
+    timeoutMs: 1000,
+    soul: "you are a test bot",
+  };
+}
 
 // ---------------------------------------------------------------------------
 // buildSkillTools — registry filtering
 // ---------------------------------------------------------------------------
 
 describe("buildSkillTools — filtering", () => {
-  test("includes only tool:true tier:ollama skills", async () => {
+  test("includes only tool:true tier:local skills", async () => {
     const db = await tempDb();
-    const ollamaSkillDeps: OllamaSkillDeps = {
-      url: "http://test",
-      model: "test-model",
-      timeoutMs: 1000,
-      soul: "you are a test bot",
-    };
+    const localSkillDeps = makeDeps();
     const registry = makeRegistry([
-      fakeSkill({ name: "tool_ollama", tier: "ollama", tool: true }),
-      fakeSkill({ name: "slash_only", tier: "ollama", tool: false }),
-      fakeSkill({ name: "primary_tool", tier: "primary", tool: true as const }),
+      fakeSkill({ name: "tool_local", tier: "local", tool: true }),
+      fakeSkill({ name: "slash_only", tier: "local", tool: false }),
+      fakeSkill({ name: "primary_tool", tier: "primary", tool: true }),
       fakeSkill({ name: "primary_slash", tier: "primary", tool: false }),
     ]);
-    const tools = buildSkillTools(registry, { db, ollamaSkillDeps });
+    const tools = buildSkillTools(registry, { db, localSkillDeps });
     expect(tools).toHaveLength(1);
-    expect(tools[0]!.name).toBe("skills__tool_ollama");
+    expect(tools[0]!.name).toBe(`${SKILL_TOOL_PREFIX}tool_local`);
   });
 
   test("returns empty when registry has no eligible skills", async () => {
     const db = await tempDb();
-    const ollamaSkillDeps: OllamaSkillDeps = {
-      url: "http://test",
-      model: "test-model",
-      timeoutMs: 1000,
-      soul: "x",
-    };
-    const registry = makeRegistry([
-      fakeSkill({ name: "slash", tier: "ollama", tool: false }),
-    ]);
-    const tools = buildSkillTools(registry, { db, ollamaSkillDeps });
+    const localSkillDeps = makeDeps();
+    const registry = makeRegistry([fakeSkill({ name: "slash", tier: "local", tool: false })]);
+    const tools = buildSkillTools(registry, { db, localSkillDeps });
     expect(tools).toHaveLength(0);
   });
 
-  test("returns empty when ollamaSkillDeps is null even with eligible skills", async () => {
+  test("returns empty when localSkillDeps is null even with eligible skills", async () => {
     const db = await tempDb();
-    const registry = makeRegistry([
-      fakeSkill({ name: "x", tier: "ollama", tool: true }),
-    ]);
-    const tools = buildSkillTools(registry, { db, ollamaSkillDeps: null });
+    const registry = makeRegistry([fakeSkill({ name: "x", tier: "local", tool: true })]);
+    const tools = buildSkillTools(registry, { db, localSkillDeps: null });
     expect(tools).toHaveLength(0);
   });
 });
@@ -180,304 +138,9 @@ describe("buildSkillTools — tool definition shape", () => {
   test("name, description, schema match skill metadata", async () => {
     const db = await tempDb();
     const skill = fakeSkill({ name: "summarize", description: "Summarize text." });
-    const ollamaSkillDeps: OllamaSkillDeps = {
-      url: "http://test",
-      model: "m",
-      timeoutMs: 1000,
-      soul: "x",
-    };
-    const tools = buildSkillTools(makeRegistry([skill]), {
-      db,
-      ollamaSkillDeps,
-    });
-    expect(tools[0]!.name).toBe("skills__summarize");
+    const tools = buildSkillTools(makeRegistry([skill]), { db, localSkillDeps: makeDeps() });
+    expect(tools[0]!.name).toBe(`${SKILL_TOOL_PREFIX}summarize`);
     expect(tools[0]!.description).toBe("Summarize text.");
-    // inputSchema is a ZodRawShape; the `args` key must be present.
     expect(Object.keys(tools[0]!.inputSchema)).toContain("args");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// RECURSION SAFETY INVARIANT — outgoing fetch body filters `skills__<self>`
-// ---------------------------------------------------------------------------
-
-describe("RECURSION SAFETY — handler fetch body", () => {
-  // Case 1: no tool surface wired in OllamaSkillDeps → falls through to the
-  // single-shot /api/chat path. Body has no `tools` field. Back-compat with
-  // pre-PR-skills-tools text-transform skills (e.g. `tldr`).
-  test("no tool surface → outgoing /api/chat body has no `tools` key", async () => {
-    const db = await tempDb();
-    let captured: { url: string; body: any } | null = null;
-    const fakeFetch = (async (
-      input: string | URL | Request,
-      init?: RequestInit,
-    ): Promise<Response> => {
-      captured = {
-        url: String(input),
-        body: init?.body ? JSON.parse(String(init.body)) : null,
-      };
-      return new Response(
-        JSON.stringify({
-          message: { content: "summary" },
-          prompt_eval_count: 10,
-          eval_count: 5,
-        }),
-        {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        },
-      );
-    }) as unknown as typeof fetch;
-    const ollamaSkillDeps: OllamaSkillDeps = {
-      url: "http://test",
-      model: "m",
-      timeoutMs: 5000,
-      soul: "you are a test bot",
-      fetch: fakeFetch,
-    };
-    const skill = fakeSkill();
-    const tools = buildSkillTools(makeRegistry([skill]), {
-      db,
-      ollamaSkillDeps,
-    });
-    await skillToolCtx.run(TEST_CTX, async () => {
-      await tools[0]!.handler({ args: "hello world" }, undefined);
-    });
-    expect(captured).not.toBeNull();
-    expect(captured!.url).toBe("http://test/api/chat");
-    expect(captured!.body).not.toBeNull();
-    expect(captured!.body).not.toHaveProperty("tools");
-    expect(captured!.body.stream).toBe(false);
-    expect(Array.isArray(captured!.body.messages)).toBe(true);
-  });
-
-  // Case 2: tool surface wired → routes through runToolLoop. Body HAS a
-  // `tools` field that includes other tools but EXCLUDES `skills__<self>`.
-  // This is the load-bearing filter for direct-recursion safety.
-  test("tool surface wired → `tools` array excludes skills__<self>", async () => {
-    const db = await tempDb();
-    // Capture only the FIRST outgoing POST — runToolLoop may follow up with a
-    // cap-finalize POST that doesn't carry the `tools` field, which would
-    // overwrite our capture and mask the real first-round body.
-    let captured: { url: string; body: any } | null = null;
-    const fakeFetch = (async (
-      input: string | URL | Request,
-      init?: RequestInit,
-    ): Promise<Response> => {
-      if (captured === null) {
-        captured = {
-          url: String(input),
-          body: init?.body ? JSON.parse(String(init.body)) : null,
-        };
-      }
-      // NDJSON-shaped reply (single frame + trailing newline) so the streaming
-      // parser in runToolLoop exits round 1 with a clean assistant text and
-      // skips the cap-finalize path.
-      const frame =
-        JSON.stringify({
-          message: { content: "done", role: "assistant" },
-          done: true,
-          prompt_eval_count: 10,
-          eval_count: 5,
-        }) + "\n";
-      return new Response(frame, {
-        status: 200,
-        headers: { "content-type": "application/x-ndjson" },
-      });
-    }) as unknown as typeof fetch;
-
-    // Hand-craft a minimal SdkMcpToolDefinition for the skill's own entry
-    // and one other tool. The handlers never fire because the model returns
-    // no tool_calls; only the catalog shape matters here. `inputSchema` must
-    // be a Zod raw shape (`{key: ZodType}`) because `mcpToOllamaTools` runs
-    // it through `z.object(...)` to derive the JSON schema for /api/chat.
-    const makeFakeTool = (
-      name: string,
-    ): import("@anthropic-ai/claude-agent-sdk").SdkMcpToolDefinition<any> => ({
-      name,
-      description: `fake ${name}`,
-      inputSchema: { args: z.string() },
-      handler: async () => ({ content: [{ type: "text", text: "ok" }] }),
-    });
-
-    const selfName = `${SKILL_TOOL_PREFIX}tldr`;
-    const otherSkillName = `${SKILL_TOOL_PREFIX}other`;
-    const integrationToolName = "notion_search";
-    const wiredTools = [
-      makeFakeTool(selfName),
-      makeFakeTool(otherSkillName),
-      makeFakeTool(integrationToolName),
-    ];
-    const toolTiers = new Map<
-      string,
-      import("./integrations.ts").IntegrationTier
-    >([
-      [selfName, "auto"],
-      [otherSkillName, "auto"],
-      [integrationToolName, "auto"],
-    ]);
-    const fakeBroker = {
-      request: async () => {
-        throw new Error("broker.request should not be called in this test");
-      },
-    };
-
-    const ollamaSkillDeps: OllamaSkillDeps = {
-      url: "http://test",
-      model: "m",
-      timeoutMs: 5000,
-      soul: "you are a test bot",
-      fetch: fakeFetch,
-      tools: wiredTools,
-      toolTiers,
-      broker: fakeBroker,
-    };
-    const skill = fakeSkill({ name: "tldr" });
-    const tools = buildSkillTools(makeRegistry([skill]), {
-      db,
-      ollamaSkillDeps,
-    });
-    await skillToolCtx.run(TEST_CTX, async () => {
-      await tools[0]!.handler({ args: "hello world" }, undefined);
-    });
-    expect(captured).not.toBeNull();
-    expect(captured!.url).toBe("http://test/api/chat");
-    expect(captured!.body).not.toBeNull();
-    // The new contract: body HAS a `tools` array.
-    expect(Array.isArray(captured!.body.tools)).toBe(true);
-    const names = (captured!.body.tools as Array<{ function?: { name?: string } }>)
-      .map((t) => t.function?.name ?? "")
-      .filter(Boolean);
-    // Other tools are present.
-    expect(names).toContain(otherSkillName);
-    expect(names).toContain(integrationToolName);
-    // THE load-bearing filter — direct recursion prevention.
-    expect(names).not.toContain(selfName);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Audit row written with origin='tool_call'
-// ---------------------------------------------------------------------------
-
-describe("handler writes audit row with origin='tool_call'", () => {
-  test("successful invocation produces ok-status audit row", async () => {
-    const db = await tempDb();
-    const fakeFetch = (async (): Promise<Response> => {
-      return new Response(
-        JSON.stringify({
-          message: { content: "the summary" },
-          prompt_eval_count: 100,
-          eval_count: 50,
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    }) as unknown as typeof fetch;
-    const ollamaSkillDeps: OllamaSkillDeps = {
-      url: "http://test",
-      model: "test-m",
-      timeoutMs: 5000,
-      soul: "soul",
-      fetch: fakeFetch,
-    };
-    const skill = fakeSkill({ name: "tldr" });
-    const tools = buildSkillTools(makeRegistry([skill]), {
-      db,
-      ollamaSkillDeps,
-    });
-
-    await skillToolCtx.run(TEST_CTX, async () => {
-      await tools[0]!.handler({ args: "input text" }, undefined);
-    });
-
-    // Audit row exists tagged origin='tool_call' and model includes the
-    // skill name. We query with prepared statement via a helper since the
-    // direct sqlite handle isn't exposed; use the existing `recentChatTurns`
-    // → no, that filters by status; let's use a raw query through the
-    // bun:sqlite handle.
-    // Workaround: cast to any to access the underlying sqlite handle.
-    const rawDb = db.raw;
-    const rows = rawDb
-      .query<
-        { origin: string; model: string; status: string; cost_usd: number },
-        [number]
-      >(
-        "SELECT origin, model, status, cost_usd FROM audit WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1",
-      )
-      .all(TEST_CTX.chatId);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.origin).toBe("tool_call");
-    expect(rows[0]!.model).toBe("ollama:test-m:skill:tldr");
-    expect(rows[0]!.status).toBe("ok");
-    expect(rows[0]!.cost_usd).toBe(0);
-  });
-
-  test("error from Ollama produces error-status audit row + error tool result", async () => {
-    const db = await tempDb();
-    const fakeFetch = (async (): Promise<Response> => {
-      return new Response(JSON.stringify({ error: "model not loaded" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }) as unknown as typeof fetch;
-    const ollamaSkillDeps: OllamaSkillDeps = {
-      url: "http://test",
-      model: "test-m",
-      timeoutMs: 5000,
-      soul: "soul",
-      fetch: fakeFetch,
-    };
-    const skill = fakeSkill({ name: "tldr" });
-    const tools = buildSkillTools(makeRegistry([skill]), {
-      db,
-      ollamaSkillDeps,
-    });
-
-    let toolResult;
-    await skillToolCtx.run(TEST_CTX, async () => {
-      toolResult = await tools[0]!.handler({ args: "x" }, undefined);
-    });
-
-    expect(toolResult).toBeDefined();
-    const text = (toolResult! as any).content[0].text as string;
-    const parsed = JSON.parse(text);
-    expect(parsed.success).toBe(false);
-    expect(parsed.error).toMatch(/model not loaded/);
-
-    const rawDb = db.raw;
-    const rows = rawDb
-      .query<{ status: string; error_message: string | null }, [number]>(
-        "SELECT status, error_message FROM audit WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1",
-      )
-      .all(TEST_CTX.chatId);
-    expect(rows[0]!.status).toBe("error");
-    expect(rows[0]!.error_message).toMatch(/model not loaded/);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// ALS context — handler errors when called outside skillToolCtx.run(...)
-// ---------------------------------------------------------------------------
-
-describe("handler outside skillToolCtx", () => {
-  test("returns structured error when no ALS store is set", async () => {
-    const db = await tempDb();
-    const ollamaSkillDeps: OllamaSkillDeps = {
-      url: "http://test",
-      model: "m",
-      timeoutMs: 1000,
-      soul: "x",
-    };
-    const skill = fakeSkill();
-    const tools = buildSkillTools(makeRegistry([skill]), {
-      db,
-      ollamaSkillDeps,
-    });
-    // NOT wrapped in skillToolCtx.run — the handler should fail-loud.
-    const result = await tools[0]!.handler({ args: "x" }, undefined);
-    const text = (result as any).content[0].text as string;
-    const parsed = JSON.parse(text);
-    expect(parsed.success).toBe(false);
-    expect(parsed.error).toMatch(/outside skillToolCtx/);
   });
 });

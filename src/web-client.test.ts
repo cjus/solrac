@@ -1,7 +1,7 @@
 /**
  * @fileoverview Unit tests for `createWebClient`.
  * @proves The WebClient implements `TelegramClient` faithfully enough that
- *         the agent, ollama, and commands code paths can use it interchangeably.
+ *         the agent, local, and commands code paths can use it interchangeably.
  *         Critical: `markdownSource` propagates to bus events; subscribers
  *         receive every published event; one subscriber's throw doesn't
  *         poison others; `call()` throws (catches accidental coupling).

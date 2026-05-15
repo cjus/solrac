@@ -136,19 +136,22 @@ Rows that reach the end-of-turn update are the ones that ran an SDK or Ollama ca
 
 #### `model` format (engine identity)
 
-Three-segment shape so tier identity stays stable across model-id bumps. Skill invocations append a fourth segment so operator-typed `/<skill>` and agent-driven tool calls are greppable per skill name.
+Three-segment shape so tier/backend identity stays stable across model-id bumps. Skill invocations append a fourth segment so operator-typed `/<skill>` and agent-driven tool calls are greppable per skill name.
 
 | Format | Engine / source | Example |
 |---|---|---|
 | `claude:primary:<modelId>` | Claude primary tier (`@` prefix) | `claude:primary:claude-sonnet-4-6` |
 | `claude:secondary:<modelId>` | Claude secondary tier (`!` prefix) | `claude:secondary:claude-opus-4-7` |
-| `ollama:<modelId>` | local Ollama (default engine) | `ollama:gpt-oss:20b` |
+| `local:<backend>:<modelId>` | local engine (default engine); `<backend>` ∈ `ollama` / `lmstudio` | `local:ollama:gemma4:e4b`, `local:lmstudio:qwen2.5-7b` |
 | `claude:<tier>:<modelId>:skill:<name>` | Claude-tier skill invocation | `claude:primary:claude-sonnet-4-6:skill:tldr` |
-| `ollama:<modelId>:skill:<name>` | Ollama-tier skill invocation (slash or tool call) | `ollama:gpt-oss:20b:skill:tldr` |
+| `local:<backend>:<modelId>:skill:<name>` | local-tier skill invocation (slash or tool call) | `local:ollama:gemma4:e4b:skill:tldr` |
 | `system` | rejection rows that didn't run an engine | `system` |
 | `claude` | legacy pre-tier rows (retagged to `claude:secondary:claude-opus-4-7` on first boot) | rare; should be zero post-migration |
+| `ollama:<modelId>` | **legacy** pre-rename rows; retagged in place to `local:ollama:<modelId>` on first boot under the `local-engine` migration. Read queries match this pattern for one release cycle. | rare; should be zero post-migration |
 
-Cross-engine queries use SQL `LIKE` on the prefix: `model LIKE 'claude:primary:%'` survives a future `claude-sonnet-4-6 → 4-8` upgrade. Per-skill activity: `model LIKE '%:skill:tldr'`.
+Cross-engine queries use SQL `LIKE` on the prefix: `model LIKE 'claude:primary:%'` survives a future `claude-sonnet-4-6 → 4-8` upgrade; `model LIKE 'local:%'` survives a backend swap. Per-skill activity: `model LIKE '%:skill:tldr'`.
+
+> **Dual-pattern reads.** `outOfBandForEngine` and `hasLocalTurnsSince` match BOTH `local:%` and legacy `ollama:%` for one release to keep partial-migration deployments correct. Operator queries against `audit` should prefer `local:%`; legacy `ollama:%` rows will not reappear because the boot migration retags them in place.
 
 #### `origin` values
 
@@ -510,17 +513,18 @@ WHERE chat_id = <chat_id> AND status = 'ok'
 ORDER BY started_at DESC LIMIT 30;
 ```
 
-**Ollama tools-on adoption.** When `OLLAMA_TOOLS_ENABLED=true`, Ollama writes `tool_calls` to audit. Count how often:
+**Local-engine tools-on adoption.** When `LOCAL_TOOLS_ENABLED=true`, the local engine writes `tool_calls` to audit. Count how often:
 
 ```sql
 SELECT
-  COUNT(*)                                                     AS ollama_turns,
+  COUNT(*)                                                     AS local_turns,
   SUM(CASE WHEN tool_calls IS NOT NULL THEN 1 ELSE 0 END)      AS turns_with_tools,
   ROUND(
     AVG(CASE WHEN tool_calls IS NOT NULL THEN json_array_length(tool_calls) END),
     2) AS avg_tools_per_tool_turn
 FROM audit
-WHERE model LIKE 'ollama:%' AND status = 'ok'
+WHERE (model LIKE 'local:%' OR model LIKE 'ollama:%')          -- dual-pattern: legacy rows for one release
+  AND status = 'ok'
   AND started_at >= (strftime('%s','now') - 7*86400) * 1000;
 ```
 

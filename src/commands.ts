@@ -76,8 +76,13 @@ import type { ChatHistoryRow, SolracDb } from "./db.ts";
 import type { IntegrationTier } from "./integrations.ts";
 import { log } from "./log.ts";
 import { mdToTelegramHtml } from "./markdown.ts";
-import { buildToolCapabilityNote } from "./ollama.ts";
-import { mcpToOllamaTools, runToolLoop } from "./ollama-tools.ts";
+import { buildToolCapabilityNote } from "./local.ts";
+import {
+  type LocalChatMessage,
+  type LocalDriver,
+  LocalDriverError,
+} from "./local-driver.ts";
+import { mcpToLocalTools, runToolLoop } from "./local-tools.ts";
 import {
   createLoopDetector,
   createPostToolUseHook,
@@ -117,7 +122,7 @@ import { htmlEscapeText, type BotCommand, type TelegramClient } from "./telegram
 // Types
 // ---------------------------------------------------------------------------
 
-export type TierArg = "primary" | "secondary" | "ollama" | "all";
+export type TierArg = "primary" | "secondary" | "local" | "all";
 export type TierArgSingle = "primary" | "secondary";
 
 export type SolracCommand =
@@ -204,9 +209,8 @@ const TIER_ARG_MAP: Record<string, TierArg> = {
   secondary: "secondary",
   s: "secondary",
   "!": "secondary",
-  ollama: "ollama",
-  o: "ollama",
-  ">": "ollama",
+  local: "local",
+  l: "local",
   all: "all",
   "*": "all",
 };
@@ -263,7 +267,19 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
 
   if (name === "clear") {
     if (argRaw === "") return { kind: "run", cmd: { kind: "clear", tier: "all" } };
-    const tier = TIER_ARG_MAP[argRaw.toLowerCase()];
+    const lower = argRaw.toLowerCase();
+    // Hard-cutover rename hint for legacy tier tokens. Mirrors the OLLAMA_*
+    // env-var rejection (config.ts) and engine: ollama frontmatter rejection
+    // (scheduler.ts, skills.ts) so every operator surface fails loud with the
+    // same shape. Without this branch, legacy tokens fall through to TIER_ARG_MAP
+    // miss → silent "Unknown command" with no actionable hint.
+    if (lower === "ollama" || lower === "o" || lower === ">") {
+      return {
+        kind: "run",
+        cmd: { kind: "unknown", raw: `${prefix}clear ${argRaw} → use ${prefix}clear local` },
+      };
+    }
+    const tier = TIER_ARG_MAP[lower];
     if (tier === undefined) {
       return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}clear ${argRaw}` } };
     }
@@ -271,25 +287,23 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
   }
 
   if (name === "context") {
-    // PR-B: no-arg → reject. Pre-PR-B defaulted to primary because Claude was
-    // the default engine; post-inversion most users haven't used a Claude
-    // session, so a silent `tier: "primary"` would render "context: empty"
-    // and look broken. Make the contract explicit; Ollama has no SDK session
-    // to inspect.
+    // No-arg → reject. Most users haven't used a Claude session, so a silent
+    // `tier: "primary"` would render "context: empty" and look broken. Make
+    // the contract explicit; the local engine has no SDK session to inspect.
     if (argRaw === "") {
       return {
         kind: "run",
         cmd: {
           kind: "unknown",
-          raw: `${prefix}context (specify @|! — Ollama has no SDK session)`,
+          raw: `${prefix}context (specify @|! — local engine has no SDK session)`,
         },
       };
     }
     const tierC = TIER_ARG_MAP[argRaw.toLowerCase()];
-    // `/context` and `/compact` are SDK-session affordances; `ollama` and
-    // `all` aren't valid — Ollama has no SDK session, and the dispatcher's
-    // SolracCommand carries a single tier.
-    if (tierC === undefined || tierC === "all" || tierC === "ollama") {
+    // `/context` and `/compact` are SDK-session affordances; `local` and
+    // `all` aren't valid — the local engine has no SDK session, and the
+    // dispatcher's SolracCommand carries a single tier.
+    if (tierC === undefined || tierC === "all" || tierC === "local") {
       return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}context ${argRaw}` } };
     }
     return { kind: "run", cmd: { kind: "context", tier: tierC } };
@@ -303,20 +317,20 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
   }
 
   // /compact — `all` is invalid (compacting both tiers in one command is two
-  // real Claude calls and surprising). PR-B: no-arg → reject for the same
-  // reason as /context above (silent `primary` default would summarize an
-  // empty session post-inversion). Operators must specify `@` or `!`.
+  // real Claude calls and surprising). No-arg → reject for the same reason
+  // as /context above (silent `primary` default would summarize an empty
+  // session). Operators must specify `@` or `!`.
   if (argRaw === "") {
     return {
       kind: "run",
       cmd: {
         kind: "unknown",
-        raw: `${prefix}compact (specify @|! — Ollama has no SDK session to summarize)`,
+        raw: `${prefix}compact (specify @|! — local engine has no SDK session to summarize)`,
       },
     };
   }
   const tier = TIER_ARG_MAP[argRaw.toLowerCase()];
-  if (tier === undefined || tier === "all" || tier === "ollama") {
+  if (tier === undefined || tier === "all" || tier === "local") {
     return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}compact ${argRaw}` } };
   }
   return { kind: "run", cmd: { kind: "compact", tier } };
@@ -326,30 +340,26 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-// Subset of OllamaRunDeps the skill path needs. Skills don't reuse runOllamaTurn
+// Subset of LocalRunDeps the skill path needs. Skills don't reuse runLocalTurn
 // because they don't carry history or SOLRAC.md overlays and have no streaming
-// stub — but with PR-skills-tools they DO route through the same tool loop
-// (`runToolLoop`) when tool deps are wired, so the skill body can call
-// `mcp__solrac__*` / `skills__*` tools end-to-end. When tool deps are absent
-// or `tools` is empty, `runSkillBare` falls through to the single-shot
-// /api/chat path (preserving back-compat for pure text-transform skills
-// like `tldr`).
-export interface OllamaSkillDeps {
-  url: string;
+// stub — but they DO route through the same tool loop (`runToolLoop`) when
+// tool deps are wired, so the skill body can call `mcp__solrac__*` / `skills__*`
+// tools end-to-end. When tool deps are absent or `tools` is empty, `runSkillBare`
+// falls through to a single-shot driver call (preserving back-compat for pure
+// text-transform skills like `tldr`).
+export interface LocalSkillDeps {
+  driver: LocalDriver;
   model: string;
   timeoutMs: number;
-  // SOUL.md text loaded once at boot. Sent as the system message so Ollama
+  // SOUL.md text loaded once at boot. Sent as the system message so local
   // skills inherit the operator's voice the same way Claude skills do via
   // the SDK's `claude_code` preset append.
   soul: string;
-  // Injectable for tests; production passes `globalThis.fetch`.
-  fetch?: typeof fetch;
-  // PR-skills-tools — when all three are wired, runSkillBare routes the
-  // skill body through `runToolLoop` so the model can call MCP tools the
-  // same way `runOllamaTurnWithTools` does. The skill's own MCP tool entry
-  // (`skills__<self>`) is filtered out of the catalog at dispatch time to
-  // prevent direct recursion; indirect recursion (skill A → skills__B →
-  // skills__A) is bounded by `runToolLoop`'s `maxIterations`.
+  // When all three are wired, runSkillBare routes the skill body through
+  // `runToolLoop` so the model can call MCP tools. The skill's own MCP tool
+  // entry (`skills__<self>`) is filtered out of the catalog at dispatch time
+  // to prevent direct recursion; indirect recursion is bounded by
+  // `runToolLoop`'s `maxIterations`.
   tools?: ReadonlyArray<SdkMcpToolDefinition<any>>;
   toolTiers?: ReadonlyMap<string, IntegrationTier>;
   broker?: Pick<ConfirmationBroker, "request">;
@@ -377,16 +387,16 @@ export interface RunCommandDeps {
   // are disabled. `/help` enumerates loaded skills; the parser dispatches to
   // them by name.
   skillRegistry: SkillRegistry;
-  // Ollama-tier skills run a one-shot `/api/chat` against the local daemon
-  // (no SDK, no tool loop, no streaming stub). `null` when Ollama isn't
-  // configured for this deploy — a `tier: ollama` skill in that case fails
-  // loud with a config error rather than silently routing to Claude.
-  ollamaSkillDeps: OllamaSkillDeps | null;
-  // PR-B — `/help` renders the engine section dynamically from these two
-  // fields so the card matches the deploy. Static text would lie in three
-  // of four config combinations (default-Ollama vs default-Claude × tools on/off).
-  defaultEngine: "ollama" | "primary" | "secondary";
-  ollamaToolsEnabled: boolean;
+  // Local-tier skills run a one-shot driver call (no SDK, no streaming stub).
+  // `null` when the local engine isn't configured — a `tier: local` skill in
+  // that case fails loud with a config error rather than silently routing to
+  // Claude.
+  localSkillDeps: LocalSkillDeps | null;
+  // `/help` renders the engine section dynamically from these two fields so
+  // the card matches the deploy. Static text would lie in three of four
+  // config combinations (default-local vs default-Claude × tools on/off).
+  defaultEngine: "local" | "primary" | "secondary";
+  localToolsEnabled: boolean;
   // Phase 2 — scheduled tasks operator surface. Both optional so deploys
   // with `SOLRAC_TASKS_ENABLED=false` can build the deps object without
   // dummy values; `/tasks` surfaces a "scheduler disabled" reply when the
@@ -484,9 +494,9 @@ function writeSystemAudit(
 // ---------------------------------------------------------------------------
 
 // One label per tier-state we actually clear. Claude tiers are SessionTier;
-// "ollama" lives outside that union (no SDK session). Using a string union
+// "local" lives outside that union (no SDK session). Using a string union
 // keeps the dirty list ordered and self-describing for the reply text.
-type ClearableTier = SessionTier | "ollama";
+type ClearableTier = SessionTier | "local";
 
 async function runClear(
   deps: RunCommandDeps,
@@ -496,17 +506,17 @@ async function runClear(
 ): Promise<void> {
   const session = deps.sessions.getSession(msg.chat.id);
   const tiers: ClearableTier[] =
-    tier === "all" ? ["primary", "secondary", "ollama"] : [tier];
+    tier === "all" ? ["primary", "secondary", "local"] : [tier];
 
   // Determine which tiers actually had anything to drop. A Claude tier is
-  // "dirty" when its session id OR its summary is non-null. Ollama is
-  // "dirty" when there's at least one successful audit row past the current
-  // cutoff — set-cutoff-twice is reported honestly as "Already clean".
+  // "dirty" when its session id OR its summary is non-null. The local engine
+  // is "dirty" when there's at least one successful audit row past the
+  // current cutoff — set-cutoff-twice is reported honestly as "Already clean".
   const dirty: ClearableTier[] = [];
   for (const t of tiers) {
-    if (t === "ollama") {
-      const cutoff = session?.ollamaCutoffMs ?? 0;
-      if (deps.db.hasOllamaTurnsSince(msg.chat.id, cutoff)) dirty.push(t);
+    if (t === "local") {
+      const cutoff = session?.localCutoffMs ?? 0;
+      if (deps.db.hasLocalTurnsSince(msg.chat.id, cutoff)) dirty.push(t);
       continue;
     }
     if (!session) continue;
@@ -524,8 +534,8 @@ async function runClear(
   }
 
   for (const t of dirty) {
-    if (t === "ollama") {
-      deps.sessions.setOllamaCutoff(msg.chat.id, Date.now());
+    if (t === "local") {
+      deps.sessions.setLocalCutoff(msg.chat.id, Date.now());
       continue;
     }
     deps.sessions.clearAll(msg.chat.id, t);
@@ -538,7 +548,7 @@ async function runClear(
 }
 
 function tierLabel(tier: TierArg): string {
-  if (tier === "all") return "primary + secondary + ollama";
+  if (tier === "all") return "primary + secondary + local";
   return tier;
 }
 
@@ -918,9 +928,10 @@ export function renderStatusMarkdown(
   const primaryLine = renderTierLineMarkdownIfPresent(deps, chatId, "primary", session, now);
   const secondaryLine = renderTierLineMarkdownIfPresent(deps, chatId, "secondary", session, now);
   const summaryLine = renderSummaryLineMarkdown(session);
-  // PR-B — Ollama activity tally. Engine prefix `ollama:%` matches every
-  // model variant the audit row tags it with (`ollama:gemma4:e4b`, etc).
-  const ollamaTurns24h = deps.db.countChatTurnsForEngineSince(chatId, "ollama:%", oneDayAgo);
+  // Local-engine activity tally. Engine prefix `local:%` matches every
+  // backend + model variant the audit row tags it with (`local:ollama:gemma`,
+  // `local:lmstudio:qwen`, etc).
+  const localTurns24h = deps.db.countChatTurnsForEngineSince(chatId, "local:%", oneDayAgo);
 
   const chatSpend1h = deps.db.sumChatCostSince(chatId, oneHourAgo);
   const chatSpend24h = deps.db.sumChatCostSince(chatId, oneDayAgo);
@@ -933,8 +944,8 @@ export function renderStatusMarkdown(
   if (primaryLine !== null) chatLines.push(`- primary session: ${primaryLine}`);
   if (secondaryLine !== null) chatLines.push(`- secondary session: ${secondaryLine}`);
   if (summaryLine !== null) chatLines.push(`- pending summary: ${summaryLine}`);
-  if (ollamaTurns24h > 0) {
-    chatLines.push(`- ollama turns (24h): ${ollamaTurns24h}`);
+  if (localTurns24h > 0) {
+    chatLines.push(`- local turns (24h): ${localTurns24h}`);
   }
   chatLines.push(`- spent (1h): $${chatSpend1h.toFixed(4)} / $${deps.hourlyCostCapUsd.toFixed(2)}`);
   chatLines.push(`- spent (24h): $${chatSpend24h.toFixed(4)}`);
@@ -1116,7 +1127,7 @@ async function runHelp(
 ): Promise<void> {
   const md = renderHelpMarkdown(deps.skillRegistry, {
     defaultEngine: deps.defaultEngine,
-    ollamaToolsEnabled: deps.ollamaToolsEnabled,
+    localToolsEnabled: deps.localToolsEnabled,
   });
   // Authored once in markdown, derived to Telegram-safe HTML for the bot
   // path. The web transport uses `markdownSource` directly so the browser
@@ -1125,20 +1136,20 @@ async function runHelp(
   writeSystemAudit(deps, msg, updateId, "help_shown", "ok");
 }
 
-// PR-B — engine section reads `defaultEngine` + `ollamaToolsEnabled` and
-// renders one of the §3c-matrix-shaped descriptions. Static text would lie
-// in three of four deploys (default-Claude vs default-Ollama, tools on/off);
-// the dynamic render is one config-read per `/help` call which is free.
+// Engine section reads `defaultEngine` + `localToolsEnabled` and renders
+// one of the matrix-shaped descriptions. Static text would lie in three
+// of four deploys (default-Claude vs default-local, tools on/off); the
+// dynamic render is one config-read per `/help` call which is free.
 function renderEngineSection(opts: {
-  defaultEngine: "ollama" | "primary" | "secondary";
-  ollamaToolsEnabled: boolean;
+  defaultEngine: "local" | "primary" | "secondary";
+  localToolsEnabled: boolean;
 }): string[] {
   const lines: string[] = ["**Engines** (first character of your message):", ""];
-  if (opts.defaultEngine === "ollama") {
-    const ollamaDesc = opts.ollamaToolsEnabled
-      ? "local Ollama (free, with operator-authored tools)"
-      : "local Ollama (free, no tools)";
-    lines.push(`- plain text → ${ollamaDesc} *(default)*`);
+  if (opts.defaultEngine === "local") {
+    const localDesc = opts.localToolsEnabled
+      ? "local engine (free, with operator-authored tools)"
+      : "local engine (free, no tools)";
+    lines.push(`- plain text → ${localDesc} *(default)*`);
     lines.push("- `@` → primary Claude (Sonnet) — heavier reasoning");
     lines.push("- `!` → secondary Claude (Opus) — heaviest reasoning, costs more");
   } else {
@@ -1156,7 +1167,7 @@ function renderEngineSection(opts: {
 const HELP_COMMANDS_MD = [
   "**Commands** (type `/cmd` for autocomplete, or `:cmd`)",
   "",
-  "- **clear** `[primary|secondary|ollama|all]` — drop session state (Claude tiers) or set the Ollama context cutoff. Default: all.",
+  "- **clear** `[primary|secondary|local|all]` — drop session state (Claude tiers) or set the local-engine context cutoff. Default: all.",
   "- **compact** `@|!` — summarize and restart Claude session for that tier. Costs one Claude turn.",
   "- **context** `@|!` — show context-window size in bytes + tokens for that tier.",
   "- **help** — this card.",
@@ -1178,8 +1189,8 @@ const HELP_COMMANDS_MD = [
 export function renderHelpMarkdown(
   skills: SkillRegistry,
   opts: {
-    defaultEngine: "ollama" | "primary" | "secondary";
-    ollamaToolsEnabled: boolean;
+    defaultEngine: "local" | "primary" | "secondary";
+    localToolsEnabled: boolean;
   },
 ): string {
   const head = ["## 🤖 Solrac help", "", ...renderEngineSection(opts), "", HELP_COMMANDS_MD];
@@ -1253,8 +1264,8 @@ async function runSkill(
   skill: Skill,
   args: string,
 ): Promise<void> {
-  if (skill.tier === "ollama") {
-    return runOllamaSkill(deps, msg, updateId, skill, args);
+  if (skill.tier === "local") {
+    return runLocalSkill(deps, msg, updateId, skill, args);
   }
   const startedAt = Date.now();
   const modelId = skill.tier === "primary" ? deps.primaryModel : deps.secondaryModel;
@@ -1507,54 +1518,51 @@ function writeSkillAudit(
   });
 }
 
-// Pure-execution result for an Ollama-tier skill body: just the engine call,
+// Pure-execution result for a local-tier skill body: just the engine call,
 // no audit, no Telegram side-effects. Both the slash-command path
-// (`runOllamaSkill`) and the tool-call path (`skill-tools.ts::dispatch`) wrap
+// (`runLocalSkill`) and the tool-call path (`skill-tools.ts::dispatch`) wrap
 // this with their own audit + reply / return-string handling.
 //
-// **RECURSION SAFETY INVARIANT** — this function MUST NOT add a `tools` field
-// to the outgoing `/api/chat` body. PR-skills-tools lifts the "tool-less"
-// constraint: when `OllamaSkillDeps` is wired with `tools/toolTiers/broker`,
-// the skill body sees the full MCP catalog MINUS its own `skills__<self>`
-// entry (recursion guard). The regression test in `skill-tools.test.ts` now
-// asserts that filter — keep both in sync.
+// **RECURSION SAFETY INVARIANT** — when `LocalSkillDeps` is wired with
+// `tools/toolTiers/broker`, the skill body sees the full MCP catalog MINUS
+// its own `skills__<self>` entry (recursion guard). The regression test in
+// `skill-tools.test.ts` asserts that filter — keep both in sync.
 export interface RunSkillBareResult {
   readonly text: string;
   readonly errorMessage: string | null;
   readonly inputTokens: number | null;
   readonly outputTokens: number | null;
-  // PR-skills-tools — populated when the tool-loop path runs (else empty).
-  // Mirrors `ToolLoopResult.toolCallSummaries` so callers can persist into
-  // the audit `tool_calls` column.
+  // Populated when the tool-loop path runs (else empty). Mirrors
+  // `ToolLoopResult.toolCallSummaries` so callers can persist into the
+  // audit `tool_calls` column.
   readonly toolCallSummaries: ReadonlyArray<{ name: string; input: unknown }>;
 }
 
 export async function runSkillBare(
-  ollama: OllamaSkillDeps,
+  local: LocalSkillDeps,
   skill: Skill,
   args: string,
 ): Promise<RunSkillBareResult> {
-  // PR-skills-tools dispatch. Tool surface wired → route through the tool
-  // loop so the body can call `mcp__solrac__*` / `skills__*` exactly like a
-  // regular Ollama turn. Mirrors the same gate in `runOllamaTurn`.
+  // Tool surface wired → route through the tool loop so the body can call
+  // `mcp__solrac__*` / `skills__*` exactly like a regular local turn.
+  // Mirrors the same gate in `runLocalTurn`.
   if (
-    ollama.tools !== undefined &&
-    ollama.tools.length > 0 &&
-    ollama.toolTiers !== undefined &&
-    ollama.broker !== undefined
+    local.tools !== undefined &&
+    local.tools.length > 0 &&
+    local.toolTiers !== undefined &&
+    local.broker !== undefined
   ) {
-    return runSkillBareWithTools(ollama, skill, args);
+    return runSkillBareWithTools(local, skill, args);
   }
 
   const prompt = renderSkillTemplate(skill.body, args);
-  const messages = [
-    { role: "system", content: ollama.soul },
+  const messages: LocalChatMessage[] = [
+    { role: "system", content: local.soul },
     { role: "user", content: prompt },
   ];
 
-  const fetchImpl = ollama.fetch ?? globalThis.fetch;
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), ollama.timeoutMs);
+  const timer = setTimeout(() => ac.abort(), local.timeoutMs);
 
   let resultText = "";
   let inputTokens: number | null = null;
@@ -1562,55 +1570,30 @@ export async function runSkillBare(
   let errorMessage: string | null = null;
 
   try {
-    const res = await fetchImpl(`${ollama.url}/api/chat`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: ollama.model, messages, stream: false }),
+    for await (const evt of local.driver.streamChat({
+      model: local.model,
+      messages,
       signal: ac.signal,
-    });
-    if (!res.ok) {
-      // Match runOllamaTurn's 404 vs. generic error shape so operators see the
-      // same "pull this model" hint regardless of which path failed.
-      const bodyText = await res.text().catch(() => "");
-      let parsed: { error?: string } = {};
-      try {
-        parsed = JSON.parse(bodyText) as { error?: string };
-      } catch {
-        // not JSON; fall through with empty parsed
-      }
-      if (res.status === 404) {
-        errorMessage = `ollama model not found: ${ollama.model} — pull with \`ollama pull ${ollama.model}\` on the host`;
-      } else {
-        const detail = parsed.error ?? (bodyText.slice(0, 200) || res.statusText);
-        errorMessage = `ollama error: ${res.status} ${detail}`;
-      }
-    } else {
-      const json = (await res.json()) as {
-        message?: { content?: string };
-        prompt_eval_count?: number;
-        eval_count?: number;
-        error?: string;
-      };
-      if (json.error) {
-        errorMessage = `ollama error: ${json.error}`;
-      } else {
-        resultText = json.message?.content ?? "";
-        inputTokens = json.prompt_eval_count ?? null;
-        outputTokens = json.eval_count ?? null;
+    })) {
+      if (evt.kind === "text") resultText += evt.delta;
+      else if (evt.kind === "done") {
+        inputTokens = evt.inputTokens;
+        outputTokens = evt.outputTokens;
+      } else if (evt.kind === "error") {
+        errorMessage = `local error: ${evt.message}`;
+        break;
       }
     }
   } catch (err) {
-    const e = err as Error;
-    if (e.name === "AbortError") {
-      errorMessage = `ollama timed out after ${(ollama.timeoutMs / 1000).toFixed(0)}s`;
+    if (err instanceof LocalDriverError) {
+      errorMessage = err.message;
     } else {
-      errorMessage = `ollama unreachable: ${ollama.url}`;
+      errorMessage = `local unexpected error: ${(err as Error).message}`;
     }
-    log.error("skill.ollama_error", {
+    log.error("skill.local_error", {
       skill: skill.name,
-      url: ollama.url,
-      error: e.message,
-      name: e.name,
+      backend: local.driver.backend,
+      error: errorMessage,
     });
   } finally {
     clearTimeout(timer);
@@ -1633,7 +1616,7 @@ export async function runSkillBare(
 // runSkillBareWithTools — PR-skills-tools tool-loop path
 // ---------------------------------------------------------------------------
 //
-// Mirrors `runOllamaTurnWithTools` (ollama.ts) but skill-shaped:
+// Mirrors `runLocalTurnWithTools` (local.ts) but skill-shaped:
 //   - No history, no SOLRAC.md overlay, no streaming UX (skills already cap
 //     their reply by template; live rendering would muddy the operator's
 //     intent baked into the skill body).
@@ -1643,18 +1626,18 @@ export async function runSkillBare(
 //   - `maxTurns` from the SKILL.md frontmatter doubles as `maxIterations`
 //     so the operator controls the budget per skill.
 //
-// Caller (`runOllamaSkill` for /<skill> typing, `skill-tools.ts` for
+// Caller (`runLocalSkill` for /<skill> typing, `skill-tools.ts` for
 // agent-driven invocations) is responsible for wrapping this in
 // `skillToolCtx.run(...)` so any nested `skills__*` calls have ALS context.
 async function runSkillBareWithTools(
-  ollama: OllamaSkillDeps,
+  local: LocalSkillDeps,
   skill: Skill,
   args: string,
 ): Promise<RunSkillBareResult> {
   // These are guaranteed non-undefined by the dispatch gate above.
-  const allTools = ollama.tools!;
-  const toolTiers = ollama.toolTiers!;
-  const broker = ollama.broker!;
+  const allTools = local.tools!;
+  const toolTiers = local.toolTiers!;
+  const broker = local.broker!;
 
   // The broker uses `chatId` to send the Telegram inline-keyboard confirm
   // prompt; without the real id, sends fail-close to a denial and the
@@ -1676,31 +1659,29 @@ async function runSkillBareWithTools(
   const selfToolName = `${SKILL_TOOL_PREFIX}${skill.name}`;
   const filteredTools = allTools.filter((t) => t.name !== selfToolName);
   const toolMap = new Map(filteredTools.map((t) => [t.name, t]));
-  const toolDefs = mcpToOllamaTools(filteredTools);
+  const toolDefs = mcpToLocalTools(filteredTools);
   const toolNames = filteredTools.map((t) => t.name);
 
   const prompt = renderSkillTemplate(skill.body, args);
-  // Skills are tier-stable (`tier: ollama` for tool-callable skills, per
-  // skills.ts Phase 1 restriction). Build the capability note as the default-
-  // engine variant — accurate when the skill body runs on the deploy's main
-  // Ollama model, which is always the case today.
+  // Skills are tier-stable (`tier: local` for tool-callable skills, per
+  // skills.ts). Build the capability note as the default-engine variant —
+  // accurate when the skill body runs on the deploy's main local model.
   const capabilityNote = buildToolCapabilityNote(toolNames, true);
 
-  const initialMessages = [
-    { role: "system" as const, content: `${ollama.soul}\n\n${capabilityNote}` },
-    { role: "user" as const, content: prompt },
+  const initialMessages: LocalChatMessage[] = [
+    { role: "system", content: `${local.soul}\n\n${capabilityNote}` },
+    { role: "user", content: prompt },
   ];
 
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), ollama.timeoutMs);
+  const timer = setTimeout(() => ac.abort(), local.timeoutMs);
   const loopDetector = createLoopDetector({ threshold: LOOP_THRESHOLD });
 
   try {
     const result = await runToolLoop(
       {
-        fetch: ollama.fetch,
-        url: ollama.url,
-        model: ollama.model,
+        driver: local.driver,
+        model: local.model,
         signal: ac.signal,
         tools: toolMap,
         toolTiers,
@@ -1734,13 +1715,13 @@ async function runSkillBareWithTools(
   }
 }
 
-// Ollama-tier skill: one-shot `/api/chat` (stream:false), no history, no tool
-// loop, no streaming stub. Mirrors Claude runSkill's audit + reply shape so
-// operator-side observability is identical (`skill.done` log, audit row tagged
-// `ollama:<model>:skill:<name>`). Cost is always 0 — the per-chat hourly cap
-// pre-flight is skipped: a chat that's been throttled by Claude burn shouldn't
-// also lose access to free local inference.
-async function runOllamaSkill(
+// Local-tier skill: one-shot driver call, no history, no tool loop, no
+// streaming stub. Mirrors Claude runSkill's audit + reply shape so
+// operator-side observability is identical (`skill.done` log, audit row
+// tagged `local:<backend>:<model>:skill:<name>`). Cost is always 0 — the
+// per-chat hourly cap pre-flight is skipped: a chat that's been throttled
+// by Claude burn shouldn't also lose access to free local inference.
+async function runLocalSkill(
   deps: RunCommandDeps,
   msg: Message,
   updateId: number,
@@ -1749,13 +1730,14 @@ async function runOllamaSkill(
 ): Promise<void> {
   const startedAt = Date.now();
 
-  if (!deps.ollamaSkillDeps) {
-    const errMsg = "ollama not configured for this deploy (set OLLAMA_ENABLED=true and OLLAMA_MODEL)";
+  if (!deps.localSkillDeps) {
+    const errMsg =
+      "local engine not configured (set LOCAL_ENABLED=true with LOCAL_BACKEND and LOCAL_MODEL)";
     writeSkillAudit(
       deps,
       msg,
       updateId,
-      `ollama:unconfigured:skill:${skill.name}`,
+      `local:unconfigured:skill:${skill.name}`,
       startedAt,
       0,
       "error",
@@ -1770,8 +1752,8 @@ async function runOllamaSkill(
     return;
   }
 
-  const ollama = deps.ollamaSkillDeps;
-  const engineModelTag = `ollama:${ollama.model}:skill:${skill.name}`;
+  const local = deps.localSkillDeps;
+  const engineModelTag = `local:${local.driver.backend}:${local.model}:skill:${skill.name}`;
   // Insert audit row BEFORE running so the ALS context can carry the real
   // parentAuditId — nested `skills__*` calls record it in their own
   // `origin='tool_call'` rows for the cross-skill audit story.
@@ -1796,7 +1778,7 @@ async function runOllamaSkill(
         updateId,
         parentAuditId: auditId,
       },
-      () => runSkillBare(ollama, skill, args),
+      () => runSkillBare(local, skill, args),
     );
 
   const toolCallsJson =
@@ -1844,7 +1826,7 @@ async function runOllamaSkill(
   log.info("skill.done", {
     chatId: msg.chat.id,
     skill: skill.name,
-    tier: "ollama",
+    tier: "local",
     inputTokens,
     outputTokens,
     cacheCreationInputTokens: null,

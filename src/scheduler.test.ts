@@ -257,13 +257,13 @@ describe("nextRunAt — at", () => {
 
 describe("parseTaskFile — valid", () => {
   test("minimal cron task", () => {
-    const t = parseTaskFile(MINIMAL, "/tmp/TASK.md", { defaultEngine: "ollama" });
+    const t = parseTaskFile(MINIMAL, "/tmp/TASK.md", { defaultEngine: "local" });
     expect(t.name).toBe("digest");
     expect(t.description).toBe("A digest task.");
     expect(t.spec.kind).toBe("cron");
     if (t.spec.kind === "cron") expect(t.spec.expr).toBe("0 * * * *");
     expect(t.tz).toBe("UTC");
-    expect(t.engine).toBe("ollama"); // inherits default
+    expect(t.engine).toBe("local"); // inherits default
     expect(t.catchUp).toBe(true); // default true for cron
     expect(t.enabled).toBe(true);
     expect(t.maxCostUsd).toBeNull();
@@ -277,12 +277,12 @@ description: x
 cron: "0 * * * *"
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(typeof t.tz).toBe("string");
     expect(t.tz.length).toBeGreaterThan(0);
   });
 
-  test("explicit engine: primary on ollama-default deploy", () => {
+  test("explicit engine: primary on local-default deploy", () => {
     const c = `---
 name: heavy
 description: Heavy task.
@@ -291,7 +291,7 @@ tz: UTC
 engine: primary
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(t.engine).toBe("primary");
   });
 
@@ -304,7 +304,7 @@ tz: UTC
 engine: secondary
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(t.engine).toBe("secondary");
   });
 
@@ -318,11 +318,11 @@ engine: secondary
 max_cost_usd: 0.25
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(t.maxCostUsd).toBe(0.25);
   });
 
-  test("max_cost_usd ignored on ollama (silently nulled)", () => {
+  test("max_cost_usd ignored on local (silently nulled)", () => {
     const c = `---
 name: digest
 description: x
@@ -331,7 +331,7 @@ tz: UTC
 max_cost_usd: 0.25
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(t.maxCostUsd).toBeNull();
   });
 
@@ -342,7 +342,7 @@ description: x
 at: 2026-05-15T13:00:00Z
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(t.catchUp).toBe(false);
     expect(t.spec.kind).toBe("at");
   });
@@ -356,13 +356,13 @@ tz: UTC
 chat_id: -100123456789
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(t.chatId).toBe(-100123456789);
   });
 
   test("source_hash is stable for identical content", () => {
-    const a = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
-    const b = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
+    const a = parseTaskFile(MINIMAL, "/p", { defaultEngine: "local" });
+    const b = parseTaskFile(MINIMAL, "/p", { defaultEngine: "local" });
     expect(a.sourceHash).toBe(b.sourceHash);
   });
 
@@ -374,7 +374,7 @@ cron: "*/30 12-18 * * 1-5"
 tz: America/Denver
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(t.tz).toBe("America/Denver");
   });
 });
@@ -386,7 +386,7 @@ name: digest
 description: x
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(
       /one of "cron.*or "at.*is required/,
     );
   });
@@ -399,7 +399,7 @@ cron: "0 * * * *"
 at: 2026-05-15T13:00:00Z
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(
       /mutually exclusive/,
     );
   });
@@ -412,7 +412,7 @@ cron: "0 * * * *"
 tz: Not/A/Timezone
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(
       /invalid IANA timezone/,
     );
   });
@@ -425,7 +425,7 @@ cron: "@daily"
 tz: UTC
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(
       /predefined aliases/,
     );
   });
@@ -438,12 +438,12 @@ cron: "0 * * *"
 tz: UTC
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(
       /exactly 5 fields/,
     );
   });
 
-  test("engine: ollama on primary-default deploy rejected", () => {
+  test("engine: ollama hard-rejected with rename hint (legacy frontmatter)", () => {
     const c = `---
 name: digest
 description: x
@@ -452,8 +452,22 @@ tz: UTC
 engine: ollama
 ---
 Body.`;
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(
+      /engine: ollama.*is no longer accepted.*engine: local/s,
+    );
+  });
+
+  test("engine: local on primary-default deploy rejected", () => {
+    const c = `---
+name: digest
+description: x
+cron: "0 * * * *"
+tz: UTC
+engine: local
+---
+Body.`;
     expect(() => parseTaskFile(c, "/p", { defaultEngine: "primary" })).toThrow(
-      /unreachable when SOLRAC_DEFAULT_ENGINE != ollama/,
+      /unreachable when SOLRAC_DEFAULT_ENGINE != local/,
     );
   });
 
@@ -466,21 +480,21 @@ tz: UTC
 engine: primary
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(
       /cron interval too tight/,
     );
   });
 
-  test("min-interval: `* * * * *` on Ollama allowed", () => {
+  test("min-interval: `* * * * *` on local engine allowed", () => {
     const c = `---
 name: fast_local
 description: x
 cron: "* * * * *"
 tz: UTC
-engine: ollama
+engine: local
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(t.spec.kind).toBe("cron");
   });
 
@@ -493,7 +507,7 @@ tz: UTC
 engine: primary
 ---
 Body.`;
-    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const t = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(t.spec.kind).toBe("cron");
   });
 
@@ -507,7 +521,7 @@ engine: primary
 max_cost_usd: -1
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/positive number/);
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(/positive number/);
   });
 
   test("boot_catch_up_jitter_s negative rejected", () => {
@@ -519,7 +533,7 @@ tz: UTC
 boot_catch_up_jitter_s: -1
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/non-negative/);
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(/non-negative/);
   });
 
   test("unknown frontmatter key rejected", () => {
@@ -531,7 +545,7 @@ tz: UTC
 unknownkey: foo
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/unknown frontmatter/);
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(/unknown frontmatter/);
   });
 
   test("empty body rejected", () => {
@@ -542,7 +556,7 @@ cron: "0 * * * *"
 tz: UTC
 ---
 `;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/body must be non-empty/);
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(/body must be non-empty/);
   });
 
   test("hyphen in name rejected (Telegram constraint)", () => {
@@ -553,7 +567,7 @@ cron: "0 * * * *"
 tz: UTC
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/"name" must match/);
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(/"name" must match/);
   });
 
   test("legacy `schedule:` key rejected as unknown", () => {
@@ -563,7 +577,7 @@ description: x
 schedule: every 1h
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/unknown frontmatter/);
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "local" })).toThrow(/unknown frontmatter/);
   });
 });
 
@@ -612,7 +626,7 @@ describe("nextRunAt — full-day fire count", () => {
 
 describe("loadTasksSync", () => {
   test("missing directory → empty registry + one error", () => {
-    const result = loadTasksSync("/nonexistent/path", "ollama");
+    const result = loadTasksSync("/nonexistent/path", "local");
     expect(result.loadedCount).toBe(0);
     expect(result.errors.length).toBe(1);
     expect(result.registry).toBe(EMPTY_TASK_REGISTRY);
@@ -620,7 +634,7 @@ describe("loadTasksSync", () => {
 
   test("empty directory → empty registry, no errors", () => {
     const dir = tempDir();
-    const result = loadTasksSync(dir, "ollama");
+    const result = loadTasksSync(dir, "local");
     expect(result.loadedCount).toBe(0);
     expect(result.errors.length).toBe(0);
   });
@@ -629,7 +643,7 @@ describe("loadTasksSync", () => {
     const dir = tempDir();
     writeTask(dir, "morning", MINIMAL);
     writeTask(dir, "evening", MINIMAL.replace("name: digest", "name: digest2"));
-    const result = loadTasksSync(dir, "ollama");
+    const result = loadTasksSync(dir, "local");
     expect(result.loadedCount).toBe(2);
     expect(result.errors.length).toBe(0);
   });
@@ -638,7 +652,7 @@ describe("loadTasksSync", () => {
     const dir = tempDir();
     mkdirSync(join(dir, "no_task"), { recursive: true });
     writeTask(dir, "valid", MINIMAL);
-    const result = loadTasksSync(dir, "ollama");
+    const result = loadTasksSync(dir, "local");
     expect(result.loadedCount).toBe(1);
     expect(result.errors.length).toBe(0);
   });
@@ -647,7 +661,7 @@ describe("loadTasksSync", () => {
     const dir = tempDir();
     writeTask(dir, "broken", "no frontmatter here");
     writeTask(dir, "valid", MINIMAL);
-    const result = loadTasksSync(dir, "ollama");
+    const result = loadTasksSync(dir, "local");
     expect(result.loadedCount).toBe(1);
     expect(result.errors.length).toBe(1);
   });
@@ -692,7 +706,7 @@ describe("startScheduler — boot fire", () => {
   test("cron, never run → does NOT boot-fire (cron is anchored, not stateful)", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
-    const task = parseTaskFile(MINIMAL, "/p/TASK.md", { defaultEngine: "ollama" });
+    const task = parseTaskFile(MINIMAL, "/p/TASK.md", { defaultEngine: "local" });
     const registry = singleTaskRegistry(task);
 
     const handle = startScheduler({
@@ -700,7 +714,7 @@ describe("startScheduler — boot fire", () => {
       registry,
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -722,10 +736,10 @@ description: x
 cron: "* * * * *"
 tz: UTC
 catch_up: false
-engine: ollama
+engine: local
 ---
 Body.`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
 
     let nowMs = Date.UTC(2026, 4, 18, 14, 13, 6); // 14:13:06 UTC — boot
     let tickFn: (() => void) | null = null;
@@ -734,7 +748,7 @@ Body.`;
       registry: singleTaskRegistry(task),
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => nowMs,
       setInterval: (fn) => {
@@ -769,7 +783,7 @@ Body.`;
   test("cron, lastRunAt 3h stale, catch_up=true → boot-fires ONCE", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
-    const task = parseTaskFile(MINIMAL, "/p/TASK.md", { defaultEngine: "ollama" });
+    const task = parseTaskFile(MINIMAL, "/p/TASK.md", { defaultEngine: "local" });
     const registry = singleTaskRegistry(task);
 
     // Seed lastRunAt 3h before FROZEN_NOW.
@@ -786,7 +800,7 @@ Body.`;
       registry,
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -809,7 +823,7 @@ tz: UTC
 catch_up: false
 ---
 Body.`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
     const registry = singleTaskRegistry(task);
 
     db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
@@ -825,7 +839,7 @@ Body.`;
       registry,
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -849,7 +863,7 @@ at: ${past}
 catch_up: false
 ---
 Body.`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
     const registry = singleTaskRegistry(task);
 
     const handle = startScheduler({
@@ -857,7 +871,7 @@ Body.`;
       registry,
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -881,7 +895,7 @@ at: ${past}
 catch_up: true
 ---
 Body.`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
     const registry = singleTaskRegistry(task);
 
     const handle = startScheduler({
@@ -889,7 +903,7 @@ Body.`;
       registry,
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -912,7 +926,7 @@ description: x
 at: ${future}
 ---
 Body.`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
     const registry = singleTaskRegistry(task);
 
     const handle = startScheduler({
@@ -920,7 +934,7 @@ Body.`;
       registry,
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -944,7 +958,7 @@ tz: UTC
 enabled: false
 ---
 Body.`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
     const registry = singleTaskRegistry(task);
 
     // Seed stale lastRunAt — would normally trigger catch-up.
@@ -961,7 +975,7 @@ Body.`;
       registry,
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -976,7 +990,7 @@ Body.`;
     const db = await freshDb();
     const queue = newFakeQueue();
     queue.dropMode = "queue_full";
-    const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "local" });
     const registry = singleTaskRegistry(task);
 
     // Seed stale lastRunAt to force a boot-fire that hits the queue.
@@ -993,7 +1007,7 @@ Body.`;
       registry,
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -1032,14 +1046,14 @@ describe("startScheduler — engine prefix mapping in synthesized text", () => {
   test("task engine matches default → no prefix", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
-    const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "local" });
     staleSeed(db, task.name);
     const handle = startScheduler({
       db,
       registry: singleTaskRegistry(task),
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -1049,7 +1063,7 @@ describe("startScheduler — engine prefix mapping in synthesized text", () => {
     handle.stop();
   });
 
-  test("engine: primary on ollama default → @-prefixed text", async () => {
+  test("engine: primary on local default → @-prefixed text", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
     const c = `---
@@ -1060,14 +1074,14 @@ tz: UTC
 engine: primary
 ---
 fetch the weather`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
     staleSeed(db, task.name);
     const handle = startScheduler({
       db,
       registry: singleTaskRegistry(task),
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -1077,7 +1091,7 @@ fetch the weather`;
     handle.stop();
   });
 
-  test("engine: secondary on ollama default → !-prefixed text", async () => {
+  test("engine: secondary on local default → !-prefixed text", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
     const c = `---
@@ -1088,14 +1102,14 @@ tz: UTC
 engine: secondary
 ---
 think deeply`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
     staleSeed(db, task.name);
     const handle = startScheduler({
       db,
       registry: singleTaskRegistry(task),
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -1110,7 +1124,7 @@ describe("startScheduler — synthetic update_id is negative", () => {
   test("update_id is < 0 (avoids handled_updates collision)", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
-    const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "local" });
     db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
     db.markTaskFired({
       name: task.name,
@@ -1123,7 +1137,7 @@ describe("startScheduler — synthetic update_id is negative", () => {
       registry: singleTaskRegistry(task),
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -1175,7 +1189,7 @@ engine: secondary
 max_cost_usd: 0.20
 ---
 Body.`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
 
     // Seed stale lastRunAt to force boot-fire attempt.
     db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
@@ -1191,7 +1205,7 @@ Body.`;
       registry: singleTaskRegistry(task),
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -1209,7 +1223,7 @@ Body.`;
     handle.stop();
   });
 
-  test("ollama task ignores max_cost_usd silently", async () => {
+  test("local task ignores max_cost_usd silently", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
     const c = `---
@@ -1220,7 +1234,7 @@ tz: UTC
 max_cost_usd: 0.01
 ---
 Body.`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(c, "/p", { defaultEngine: "local" });
     expect(task.maxCostUsd).toBeNull(); // already nulled at parse
 
     // Seed stale lastRunAt.
@@ -1237,7 +1251,7 @@ Body.`;
       registry: singleTaskRegistry(task),
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,
@@ -1257,7 +1271,7 @@ describe("getScheduledContext", () => {
   test("returns context when set on the message", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
-    const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
+    const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "local" });
     db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
     db.markTaskFired({
       name: task.name,
@@ -1270,7 +1284,7 @@ describe("getScheduledContext", () => {
       registry: singleTaskRegistry(task),
       enqueue: queue.enqueue,
       operatorFromId: 100,
-      defaultEngine: "ollama",
+      defaultEngine: "local",
       defaultChatId: 100,
       now: () => FROZEN_NOW,
       setInterval: () => 0,

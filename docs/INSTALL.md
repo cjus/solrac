@@ -61,7 +61,7 @@ Then run:
 solrac
 ```
 
-You should see structured JSON log lines on stdout. DM your bot — the first message should produce a 🤔 / 🦙 / 🙂 thinking stub within a second.
+You should see structured JSON log lines on stdout. DM your bot — the first message should produce a 🤔 / 💻 / 🙂 thinking stub within a second.
 
 ## CLI subcommands
 
@@ -115,7 +115,7 @@ That's everything — Solrac stores no state outside `~/.solrac/`.
 ## Operational dependencies (not embedded in the binary)
 
 - **`claude` CLI** must be on PATH for the `@` (primary) and `!` (secondary) Claude tiers. Solrac shells out to it via the Anthropic Agent SDK. The binary does not embed Anthropic's CLI.
-- **Ollama daemon** must be reachable on `OLLAMA_URL` (default `http://localhost:11434`) for the no-prefix default-engine path. With `OLLAMA_ENABLED=false` you can skip Ollama entirely; set `SOLRAC_DEFAULT_ENGINE=primary` to make Sonnet the no-prefix default.
+- **Local-model backend** must be reachable on `LOCAL_URL` for the no-prefix default-engine path. `LOCAL_BACKEND=ollama` (default port `:11434`, NDJSON `/api/chat`) or `LOCAL_BACKEND=lmstudio` (default port `:1234`, SSE `/v1/chat/completions`). With `LOCAL_ENABLED=false` you can skip the backend entirely; set `SOLRAC_DEFAULT_ENGINE=primary` to make Sonnet the no-prefix default.
 
 ## Supported platforms
 

@@ -53,9 +53,14 @@ type Transport = "poll" | "webhook";
 
 // Engine selected when a user message has no `@` or `!` prefix. Mirrors
 // `policy.Engine` minus the wire-prefix coupling: kept as its own string-set
-// here so config.ts has zero internal deps. Default `"ollama"` since PR-B —
-// Anthropic burn happens only on a deliberate `@` (Sonnet) or `!` (Opus).
-export type DefaultEngine = "ollama" | "primary" | "secondary";
+// here so config.ts has zero internal deps. Default `"local"` — Anthropic
+// burn happens only on a deliberate `@` (Sonnet) or `!` (Opus).
+export type DefaultEngine = "local" | "primary" | "secondary";
+
+// Backend driver behind the `local` engine. Required when `LOCAL_ENABLED=true`.
+// `null` when local is disabled — downstream code that depends on the backend
+// (driver factory, UI label) only runs in the enabled path.
+export type LocalBackend = "ollama" | "lmstudio";
 
 // Cap on prompt text persisted to the audit table. A single user can flood
 // strings of arbitrary length; truncating before insert bounds per-row size.
@@ -92,36 +97,37 @@ export interface Config {
   readonly secondaryModel: string;
   readonly statsBearerToken: string | null;
   readonly tgWebhookSecret: string | null;
-  // PR-B — engine routing inversion. Picks the engine for messages with no
-  // `@` or `!` prefix. Default `"ollama"` shifts cost to $0 by default;
-  // operators on hosts that can't run Ollama set `"primary"` (or
-  // `"secondary"`). Boot validates: `"ollama"` requires `ollamaEnabled`;
-  // anything else with `ollamaToolsEnabled=true` is rejected (Ollama is
-  // unreachable when it's not the default since PR-B removed the `>` prefix).
+  // Picks the engine for messages with no `@` or `!` prefix. Default
+  // `"local"` shifts cost to $0 by default; operators on hosts that can't run
+  // a local LLM set `"primary"` (or `"secondary"`). Boot validates: `"local"`
+  // requires `localEnabled`; anything else with `localToolsEnabled=true` is
+  // rejected (the local engine is unreachable when it's not the default).
   readonly defaultEngine: DefaultEngine;
   // True when the operator set `SOLRAC_DEFAULT_ENGINE` explicitly. Lets
   // main.ts emit a one-release-cycle silent-flip warning so upgrades can't
   // silently route messages to a different engine. Removed in the next minor.
   readonly defaultEngineExplicit: boolean;
-  // PLAN Step 11: local-model routing. Off by default. When true,
-  // `ollamaModel` MUST be set (validated at boot). PR-B removed the `>`
-  // prefix; with `ollamaEnabled=true`, Ollama is reached via `defaultEngine`.
-  readonly ollamaEnabled: boolean;
-  readonly ollamaUrl: string;
-  readonly ollamaModel: string | null;
-  readonly ollamaTimeoutMs: number;
-  readonly ollamaHistoryLimit: number;
-  // PR-A — Ollama tool-calling. When true (and `integrationsEnabled` is also
-  // true), the `>` engine path runs through `runToolLoop` instead of single-
-  // shot streaming, exposing the same `mcp__solrac__*` integration tools that
-  // Claude tiers see. Default false — tools-on is opt-in for v1. Boot fails
-  // loud if `ollamaToolsEnabled && !integrationsEnabled` (no tools to expose).
-  readonly ollamaToolsEnabled: boolean;
+  // Local-model routing. Off by default. When true, `localBackend` AND
+  // `localModel` MUST be set (validated at boot). The local engine is
+  // reached via `defaultEngine="local"`.
+  readonly localEnabled: boolean;
+  // Backend driver — `null` when local is disabled.
+  readonly localBackend: LocalBackend | null;
+  readonly localUrl: string;
+  readonly localModel: string | null;
+  readonly localTimeoutMs: number;
+  readonly localHistoryLimit: number;
+  // Local tool-calling. When true (and `integrationsEnabled` is also true),
+  // the local engine path runs through `runToolLoop` instead of single-shot
+  // streaming, exposing the same `mcp__solrac__*` integration tools that
+  // Claude tiers see. Default false — tools-on is opt-in. Boot fails loud
+  // if `localToolsEnabled && !integrationsEnabled` (no tools to expose).
+  readonly localToolsEnabled: boolean;
   // Hard ceiling on tool-loop rounds per turn. 8 is enough for "fetch X then
   // process it then format the answer" multi-step tool use without giving an
   // infinite-loop bug too much rope. Loop detector bites earlier on duplicate
   // calls.
-  readonly ollamaMaxToolIterations: number;
+  readonly localMaxToolIterations: number;
   // PNX-167.1 — operator-defined skills loaded from the filesystem at boot.
   // `skillsEnabled` is the master switch; `skillsDir` is resolved from cwd
   // so the same Solrac binary can ship to multiple operators each with their
@@ -143,7 +149,8 @@ export interface Config {
   // the same SDK preset tool surface as before. When on, both sources are
   // discovered. Default `./integrations` matches the `./skills` convention
   // for cwd-relative operator dirs. Effective for Claude tiers (`@`, `!`)
-  // only — Ollama path ignores integrations.
+  // unconditionally; the local engine exposes them only when
+  // `localToolsEnabled=true`.
   readonly integrationsEnabled: boolean;
   readonly integrationsDir: string;
   // Web UI transport — second Bun.serve instance on a separate port. When
@@ -207,12 +214,28 @@ function parseBoolean(name: string, raw: string | undefined, fallback: boolean):
 }
 
 function parseDefaultEngine(raw: string | undefined): DefaultEngine {
-  if (raw === undefined || raw.trim() === "") return "ollama";
+  if (raw === undefined || raw.trim() === "") return "local";
   const v = raw.trim().toLowerCase();
-  if (v === "ollama" || v === "primary" || v === "secondary") return v;
+  if (v === "local" || v === "primary" || v === "secondary") return v;
+  // Hard-reject the legacy value with an actionable hint. The boot-time
+  // OLLAMA_* env-var scan catches the env-var case; this catches operators
+  // who only updated some of the rename.
+  if (v === "ollama") {
+    throw new Error(
+      "SOLRAC_DEFAULT_ENGINE=ollama is no longer accepted — " +
+        "set SOLRAC_DEFAULT_ENGINE=local and LOCAL_BACKEND=ollama",
+    );
+  }
   throw new Error(
-    `SOLRAC_DEFAULT_ENGINE must be "ollama", "primary", or "secondary", got "${raw}"`,
+    `SOLRAC_DEFAULT_ENGINE must be "local", "primary", or "secondary", got "${raw}"`,
   );
+}
+
+function parseLocalBackend(raw: string | undefined): LocalBackend | null {
+  if (raw === undefined || raw.trim() === "") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "ollama" || v === "lmstudio") return v;
+  throw new Error(`LOCAL_BACKEND must be "ollama" or "lmstudio", got "${raw}"`);
 }
 
 /**
@@ -258,6 +281,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`Missing required env vars: ${missing.join(", ")}`);
   }
 
+  // Hard cutover from the Ollama-specific path to the generic local-engine
+  // abstraction. Any operator who still has `OLLAMA_*` env vars set has not
+  // updated their deploy — fail loud at boot with an actionable hint rather
+  // than silently ignoring half their config.
+  const legacyOllamaKeys = Object.keys(env)
+    .filter((k) => k.startsWith("OLLAMA_"))
+    .sort();
+  if (legacyOllamaKeys.length > 0) {
+    throw new Error(
+      `Legacy OLLAMA_* env vars are no longer supported (got: ${legacyOllamaKeys.join(", ")}). ` +
+        "Rename to LOCAL_* (e.g. OLLAMA_ENABLED → LOCAL_ENABLED, OLLAMA_MODEL → LOCAL_MODEL) " +
+        "and add LOCAL_BACKEND=ollama (or LOCAL_BACKEND=lmstudio).",
+    );
+  }
+
   const transport = parseTransport(env.SOLRAC_TRANSPORT);
   if (transport === "webhook" && (!env.TG_WEBHOOK_SECRET || env.TG_WEBHOOK_SECRET.length < 32)) {
     throw new Error("TG_WEBHOOK_SECRET must be ≥32 chars when SOLRAC_TRANSPORT=webhook");
@@ -285,96 +323,107 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     hourlyCostCapUsd * maxConcurrentTurns,
   );
 
-  // PLAN Step 11. `OLLAMA_MODEL` is required only when `OLLAMA_ENABLED=true` —
-  // the operator has to make an explicit choice (no surprise default model on
-  // first run). `OLLAMA_URL` keeps a sensible default so a typical localhost
-  // setup works without extra env wiring.
-  const ollamaEnabled = parseBoolean("OLLAMA_ENABLED", env.OLLAMA_ENABLED, false);
-  const ollamaModel =
-    env.OLLAMA_MODEL && env.OLLAMA_MODEL.trim() !== "" ? env.OLLAMA_MODEL.trim() : null;
-  if (ollamaEnabled && !ollamaModel) {
-    throw new Error("OLLAMA_MODEL is required when OLLAMA_ENABLED=true");
+  // `LOCAL_MODEL` and `LOCAL_BACKEND` are required only when `LOCAL_ENABLED=
+  // true` — the operator has to make an explicit choice (no surprise default
+  // model or backend on first run). `LOCAL_URL` keeps a backend-aware default
+  // so a typical localhost setup works without extra env wiring.
+  const localEnabled = parseBoolean("LOCAL_ENABLED", env.LOCAL_ENABLED, false);
+  const localBackend = parseLocalBackend(env.LOCAL_BACKEND);
+  if (localEnabled && localBackend === null) {
+    throw new Error(
+      'LOCAL_BACKEND is required when LOCAL_ENABLED=true (set to "ollama" or "lmstudio")',
+    );
   }
-  const ollamaUrl =
-    env.OLLAMA_URL && env.OLLAMA_URL.trim() !== ""
-      ? env.OLLAMA_URL.trim().replace(/\/$/, "")
-      : "http://localhost:11434";
+  const localModel =
+    env.LOCAL_MODEL && env.LOCAL_MODEL.trim() !== "" ? env.LOCAL_MODEL.trim() : null;
+  if (localEnabled && !localModel) {
+    throw new Error("LOCAL_MODEL is required when LOCAL_ENABLED=true");
+  }
+  // Backend-aware URL default. LMStudio's OpenAI-compat server defaults to
+  // :1234; Ollama defaults to :11434. Operator-set `LOCAL_URL` always wins.
+  const localUrlDefault =
+    localBackend === "lmstudio" ? "http://localhost:1234" : "http://localhost:11434";
+  const localUrl =
+    env.LOCAL_URL && env.LOCAL_URL.trim() !== ""
+      ? env.LOCAL_URL.trim().replace(/\/$/, "")
+      : localUrlDefault;
   // Fail-loud at boot if the URL is malformed or uses a non-HTTP scheme.
-  // Without this, `OLLAMA_URL=localhost:11434` (missing scheme) or
-  // `OLLAMA_URL=ftp://nope` boots happily and only fails at the first `>`
-  // turn with a confusing "ollama unreachable" message. URL validation here
-  // gives operators an actionable error at startup.
-  let ollamaProtocol: string;
+  // Without this, `LOCAL_URL=localhost:11434` (missing scheme) or
+  // `LOCAL_URL=ftp://nope` boots happily and only fails at the first turn
+  // with a confusing "local unreachable" message. URL validation here gives
+  // operators an actionable error at startup.
+  let localProtocol: string;
   try {
-    ollamaProtocol = new URL(ollamaUrl).protocol;
+    localProtocol = new URL(localUrl).protocol;
   } catch {
-    throw new Error(`OLLAMA_URL is not a valid URL: "${ollamaUrl}"`);
+    throw new Error(`LOCAL_URL is not a valid URL: "${localUrl}"`);
   }
-  if (ollamaProtocol !== "http:" && ollamaProtocol !== "https:") {
-    throw new Error(`OLLAMA_URL must use http:// or https://, got "${ollamaProtocol}//" in "${ollamaUrl}"`);
+  if (localProtocol !== "http:" && localProtocol !== "https:") {
+    throw new Error(`LOCAL_URL must use http:// or https://, got "${localProtocol}//" in "${localUrl}"`);
   }
-  // PR-A: tools-on adds tool-loop rounds (model + tool execution) on top of
-  // a single inference. A 60s ceiling that's fine for single-shot can be
+  // Tools-on adds tool-loop rounds (model + tool execution) on top of a
+  // single inference. A 60s ceiling that's fine for single-shot can be
   // tight when one mid-loop confirm prompt eats up to 60s on its own —
   // bump the default to 120s when tools are enabled. Operator override
-  // (any explicit `OLLAMA_TIMEOUT_MS`) wins regardless.
-  const ollamaToolsEnabled = parseBoolean(
-    "OLLAMA_TOOLS_ENABLED",
-    env.OLLAMA_TOOLS_ENABLED,
+  // (any explicit `LOCAL_TIMEOUT_MS`) wins regardless.
+  const localToolsEnabled = parseBoolean(
+    "LOCAL_TOOLS_ENABLED",
+    env.LOCAL_TOOLS_ENABLED,
     false,
   );
-  const ollamaTimeoutDefault = ollamaToolsEnabled ? 120_000 : 60_000;
-  const ollamaTimeoutMs = parsePositiveInt(
-    "OLLAMA_TIMEOUT_MS",
-    env.OLLAMA_TIMEOUT_MS,
-    ollamaTimeoutDefault,
+  const localTimeoutDefault = localToolsEnabled ? 120_000 : 60_000;
+  const localTimeoutMs = parsePositiveInt(
+    "LOCAL_TIMEOUT_MS",
+    env.LOCAL_TIMEOUT_MS,
+    localTimeoutDefault,
   );
-  const ollamaHistoryLimit = parsePositiveInt(
-    "OLLAMA_HISTORY_LIMIT",
-    env.OLLAMA_HISTORY_LIMIT,
+  const localHistoryLimit = parsePositiveInt(
+    "LOCAL_HISTORY_LIMIT",
+    env.LOCAL_HISTORY_LIMIT,
     6,
   );
-  const ollamaMaxToolIterations = parsePositiveInt(
-    "OLLAMA_MAX_TOOL_ITERATIONS",
-    env.OLLAMA_MAX_TOOL_ITERATIONS,
+  const localMaxToolIterations = parsePositiveInt(
+    "LOCAL_MAX_TOOL_ITERATIONS",
+    env.LOCAL_MAX_TOOL_ITERATIONS,
     8,
   );
   // Boot guard: tools-on with no integration source = nothing for the model
   // to call. Fail loud at boot rather than silently shipping an empty
-  // `tools[]` to /api/chat (which would also work but waste tokens listing
+  // `tools[]` to the backend (which would also work but waste tokens listing
   // nothing).
   const integrationsEnabled = parseBoolean(
     "SOLRAC_INTEGRATIONS_ENABLED",
     env.SOLRAC_INTEGRATIONS_ENABLED,
     false,
   );
-  if (ollamaToolsEnabled && !integrationsEnabled) {
+  if (localToolsEnabled && !integrationsEnabled) {
     throw new Error(
-      "OLLAMA_TOOLS_ENABLED=true requires SOLRAC_INTEGRATIONS_ENABLED=true; " +
+      "LOCAL_TOOLS_ENABLED=true requires SOLRAC_INTEGRATIONS_ENABLED=true; " +
         "set SOLRAC_INTEGRATIONS_ENABLED=true to load tools, or " +
-        "OLLAMA_TOOLS_ENABLED=false to keep the single-shot Ollama path",
+        "LOCAL_TOOLS_ENABLED=false to keep the single-shot local path",
     );
   }
 
-  // PR-B — default-engine validation. Two cells of the §3c capability matrix
-  // are unreachable; refuse them at boot rather than letting them run with
-  // confusing UX (Ollama unreachable, or a default engine that errors every
-  // turn).
+  // Default-engine validation. Two cells of the capability matrix are
+  // unreachable; refuse them at boot rather than letting them run with
+  // confusing UX (local engine unreachable, or a default engine that errors
+  // every turn).
   const defaultEngine = parseDefaultEngine(env.SOLRAC_DEFAULT_ENGINE);
   const defaultEngineExplicit =
     env.SOLRAC_DEFAULT_ENGINE !== undefined && env.SOLRAC_DEFAULT_ENGINE.trim() !== "";
-  if (defaultEngine === "ollama" && !ollamaEnabled) {
+  if (defaultEngine === "local" && !localEnabled) {
     throw new Error(
-      "SOLRAC_DEFAULT_ENGINE=ollama requires OLLAMA_ENABLED=true; " +
-        "set OLLAMA_ENABLED=true (and OLLAMA_MODEL=<model>) to run Ollama as the default, or " +
+      "SOLRAC_DEFAULT_ENGINE=local requires LOCAL_ENABLED=true; " +
+        "set LOCAL_ENABLED=true (and LOCAL_BACKEND=ollama|lmstudio, LOCAL_MODEL=<model>) " +
+        "to run the local engine as the default, or " +
         "SOLRAC_DEFAULT_ENGINE=primary to make Anthropic Sonnet the default",
     );
   }
-  if (defaultEngine !== "ollama" && ollamaToolsEnabled) {
+  if (defaultEngine !== "local" && localToolsEnabled) {
     throw new Error(
-      `SOLRAC_DEFAULT_ENGINE=${defaultEngine} with OLLAMA_TOOLS_ENABLED=true is unreachable: ` +
-        "the `>` prefix was removed in PR-B, so Ollama only runs when it's the default. " +
-        "Set OLLAMA_TOOLS_ENABLED=false or SOLRAC_DEFAULT_ENGINE=ollama",
+      `SOLRAC_DEFAULT_ENGINE=${defaultEngine} with LOCAL_TOOLS_ENABLED=true is unreachable: ` +
+        "the local engine only runs when it's the default. " +
+        "Set LOCAL_TOOLS_ENABLED=false or SOLRAC_DEFAULT_ENGINE=local",
     );
   }
 
@@ -442,13 +491,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     tgWebhookSecret: env.TG_WEBHOOK_SECRET && env.TG_WEBHOOK_SECRET.trim() !== "" ? env.TG_WEBHOOK_SECRET : null,
     defaultEngine,
     defaultEngineExplicit,
-    ollamaEnabled,
-    ollamaUrl,
-    ollamaModel,
-    ollamaTimeoutMs,
-    ollamaHistoryLimit,
-    ollamaToolsEnabled,
-    ollamaMaxToolIterations,
+    localEnabled,
+    localBackend,
+    localUrl,
+    localModel,
+    localTimeoutMs,
+    localHistoryLimit,
+    localToolsEnabled,
+    localMaxToolIterations,
     skillsEnabled: parseBoolean("SOLRAC_SKILLS_ENABLED", env.SOLRAC_SKILLS_ENABLED, false),
     skillsDir: resolveAgainstHome(solracHome, skillsDirRaw),
     tasksEnabled: parseBoolean("SOLRAC_TASKS_ENABLED", env.SOLRAC_TASKS_ENABLED, false),

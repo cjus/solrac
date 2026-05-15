@@ -199,9 +199,8 @@ describe("parseCommand", () => {
       ["secondary", "secondary"],
       ["s", "secondary"],
       ["!", "secondary"],
-      ["ollama", "ollama"],
-      ["o", "ollama"],
-      [">", "ollama"],
+      ["local", "local"],
+      ["l", "local"],
       ["all", "all"],
       ["*", "all"],
     ] as const) {
@@ -212,25 +211,37 @@ describe("parseCommand", () => {
     }
   });
 
-  test("/compact rejects ollama tier — Ollama has no SDK session to summarize", () => {
-    expect(parseCommand("/compact ollama", DEPS)).toEqual({
+  test("/clear rejects legacy ollama/o/> tokens with rename hint", () => {
+    // Hard-cutover hint surfaces inline so operators don't see a bare
+    // "Unknown command: /clear ollama" — that was the pre-fix behavior and
+    // trained them to ignore the rename hints they got from env-var + frontmatter
+    // rejection elsewhere.
+    for (const tok of ["ollama", "o", ">"]) {
+      expect(parseCommand(`/clear ${tok}`, DEPS)).toEqual({
+        kind: "run",
+        cmd: { kind: "unknown", raw: `/clear ${tok} → use /clear local` },
+      });
+    }
+  });
+
+  test("/clear rejects case-variant legacy tokens too", () => {
+    expect(parseCommand("/clear OLLAMA", DEPS)).toEqual({
       kind: "run",
-      cmd: { kind: "unknown", raw: "/compact ollama" },
-    });
-    expect(parseCommand("/compact >", DEPS)).toEqual({
-      kind: "run",
-      cmd: { kind: "unknown", raw: "/compact >" },
+      cmd: { kind: "unknown", raw: "/clear OLLAMA → use /clear local" },
     });
   });
 
-  test("/context rejects ollama tier — Ollama has no SDK session to inspect", () => {
-    expect(parseCommand("/context ollama", DEPS)).toEqual({
+  test("/compact rejects local tier — local engine has no SDK session to summarize", () => {
+    expect(parseCommand("/compact local", DEPS)).toEqual({
       kind: "run",
-      cmd: { kind: "unknown", raw: "/context ollama" },
+      cmd: { kind: "unknown", raw: "/compact local" },
     });
-    expect(parseCommand("/context >", DEPS)).toEqual({
+  });
+
+  test("/context rejects local tier — local engine has no SDK session to inspect", () => {
+    expect(parseCommand("/context local", DEPS)).toEqual({
       kind: "run",
-      cmd: { kind: "unknown", raw: "/context >" },
+      cmd: { kind: "unknown", raw: "/context local" },
     });
   });
 
@@ -528,9 +539,9 @@ async function makeHarness(
     hourlyCostCapUsd: opts.capUsd ?? 1.0,
     globalHourlyCostCapUsd: opts.globalCapUsd ?? 4.0,
     skillRegistry: opts.skillRegistry ?? EMPTY_SKILL_REGISTRY,
-    ollamaSkillDeps: null,
-    defaultEngine: "ollama",
-    ollamaToolsEnabled: false,
+    localSkillDeps: null,
+    defaultEngine: "local",
+    localToolsEnabled: false,
   };
   const h: Harness = { dir, db, sessions, tg, costGuard, globalCostGuard, deps };
   harnesses.push(h);
@@ -616,57 +627,57 @@ describe("runCommand /clear", () => {
     expect(h.sessions.getSessionId(100, "primary")).toBe("p-uuid");
   });
 
-  // --- Ollama tier (cutoff-based clear) ---
+  // --- Local tier (cutoff-based clear) ---
 
-  test("/clear ollama on a chat with prior ollama turns sets the cutoff and replies 'Cleared'", async () => {
+  test("/clear local on a chat with prior local turns sets the cutoff and replies 'Cleared'", async () => {
     const h = await makeHarness();
-    seedOllamaTurn(h.db, 100, 5000);
+    seedLocalTurn(h.db, 100, 5000);
     const before = Date.now();
-    await runCommand(h.deps, fakeMsg("/clear ollama"), { kind: "clear", tier: "ollama" }, 1);
-    expect(h.tg.sent[0]!.text).toContain("Cleared <b>ollama</b>");
-    const cutoff = h.sessions.getOllamaCutoff(100);
+    await runCommand(h.deps, fakeMsg("/clear local"), { kind: "clear", tier: "local" }, 1);
+    expect(h.tg.sent[0]!.text).toContain("Cleared <b>local</b>");
+    const cutoff = h.sessions.getLocalCutoff(100);
     expect(cutoff).not.toBeNull();
     expect(cutoff!).toBeGreaterThanOrEqual(before);
-    expect(lastAudit(h.db).response).toBe("cleared:ollama");
+    expect(lastAudit(h.db).response).toBe("cleared:local");
   });
 
-  test("/clear ollama on a chat with no prior ollama turns reports 'Already clean'", async () => {
+  test("/clear local on a chat with no prior local turns reports 'Already clean'", async () => {
     const h = await makeHarness();
-    await runCommand(h.deps, fakeMsg("/clear ollama"), { kind: "clear", tier: "ollama" }, 1);
+    await runCommand(h.deps, fakeMsg("/clear local"), { kind: "clear", tier: "local" }, 1);
     expect(h.tg.sent[0]!.text).toContain("Already clean");
-    expect(h.sessions.getOllamaCutoff(100)).toBeNull();
+    expect(h.sessions.getLocalCutoff(100)).toBeNull();
   });
 
-  test("back-to-back /clear ollama reports 'Already clean' the second time", async () => {
+  test("back-to-back /clear local reports 'Already clean' the second time", async () => {
     const h = await makeHarness();
-    seedOllamaTurn(h.db, 100, 5000);
-    await runCommand(h.deps, fakeMsg("/clear ollama"), { kind: "clear", tier: "ollama" }, 1);
+    seedLocalTurn(h.db, 100, 5000);
+    await runCommand(h.deps, fakeMsg("/clear local"), { kind: "clear", tier: "local" }, 1);
     expect(h.tg.sent[0]!.text).toContain("Cleared");
-    await runCommand(h.deps, fakeMsg("/clear ollama"), { kind: "clear", tier: "ollama" }, 2);
+    await runCommand(h.deps, fakeMsg("/clear local"), { kind: "clear", tier: "local" }, 2);
     expect(h.tg.sent[1]!.text).toContain("Already clean");
   });
 
-  test("/clear all includes ollama when ollama turns exist", async () => {
+  test("/clear all includes local when local turns exist", async () => {
     const h = await makeHarness();
     h.sessions.setSessionId(100, "primary", "p-uuid");
-    seedOllamaTurn(h.db, 100, 5000);
+    seedLocalTurn(h.db, 100, 5000);
     await runCommand(h.deps, fakeMsg("/clear"), { kind: "clear", tier: "all" }, 1);
     expect(h.tg.sent[0]!.text).toContain("primary");
-    expect(h.tg.sent[0]!.text).toContain("ollama");
-    expect(h.sessions.getOllamaCutoff(100)).not.toBeNull();
-    expect(lastAudit(h.db).response).toBe("cleared:primary,ollama");
+    expect(h.tg.sent[0]!.text).toContain("local");
+    expect(h.sessions.getLocalCutoff(100)).not.toBeNull();
+    expect(lastAudit(h.db).response).toBe("cleared:primary,local");
   });
 });
 
-// Insert a successful Ollama audit row so /clear ollama can find something to clear.
-function seedOllamaTurn(db: SolracDb, chatId: number, startedAt: number): void {
+// Insert a successful local-engine audit row so /clear local can find something to clear.
+function seedLocalTurn(db: SolracDb, chatId: number, startedAt: number): void {
   const id = db.insertAudit({
     chatId,
     fromId: 200,
     updateId: 0,
     prompt: "hi",
     startedAt,
-    model: "ollama:gemma",
+    model: "local:ollama:gemma",
   });
   db.updateAuditEnd({
     id,
@@ -730,7 +741,7 @@ describe("runCommand /status", () => {
     const text = h.tg.sent[0]!.text;
     expect(text).toContain("Solrac status");
     // PR-B: session/summary bullets only render when present. Fresh chat
-    // shows neither — operators using default-Ollama don't see Claude noise.
+    // shows neither — operators using default-local don't see Claude noise.
     expect(text).not.toContain("primary session:");
     expect(text).not.toContain("secondary session:");
     expect(text).not.toContain("pending summary:");
@@ -1173,7 +1184,7 @@ describe("runCommand /tasks", () => {
       description: "Morning digest task",
       body: "Run the digest",
       chatId: null,
-      engine: "ollama" as const,
+      engine: "local" as const,
       spec: { kind: "cron" as const, expr: "0 * * * *" },
       tz: "UTC",
       catchUp: true,
@@ -1192,7 +1203,7 @@ describe("runCommand /tasks", () => {
     const text = h.tg.sent[0]!.text;
     expect(text).toContain("morning_digest");
     expect(text).toContain("cron: 0 * * * * (UTC)");
-    expect(text).toContain("ollama");
+    expect(text).toContain("local");
     // Next-fire rendering: contract is that "next:" appears.
     expect(text).toContain("next:");
   });
@@ -1204,7 +1215,7 @@ describe("runCommand /tasks", () => {
       description: "One-off alarm",
       body: "Ring",
       chatId: null,
-      engine: "ollama" as const,
+      engine: "local" as const,
       spec: { kind: "at" as const, atMs: Date.now() - 86_400_000 },
       tz: "UTC",
       catchUp: false,
@@ -1238,7 +1249,7 @@ describe("runCommand /tasks", () => {
       description: "Paused task",
       body: "noop",
       chatId: null,
-      engine: "ollama" as const,
+      engine: "local" as const,
       spec: { kind: "cron" as const, expr: "0 * * * *" },
       tz: "UTC",
       catchUp: true,
@@ -1270,7 +1281,7 @@ describe("runCommand /tasks", () => {
       description: "One-off in 30 min",
       body: "Run",
       chatId: null,
-      engine: "ollama" as const,
+      engine: "local" as const,
       spec: { kind: "at" as const, atMs: futureMs },
       tz: "UTC",
       catchUp: false,
