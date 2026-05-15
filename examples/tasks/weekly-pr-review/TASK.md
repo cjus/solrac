@@ -1,7 +1,8 @@
 ---
 name: weekly_pr_review
 description: Monday PR review summary; escalates to Opus for nuanced reasoning.
-schedule: every 7d
+cron: "0 9 * * 1"
+tz: America/Denver
 engine: secondary
 catch_up: true
 max_cost_usd: 0.50

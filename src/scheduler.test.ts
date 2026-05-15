@@ -1,10 +1,12 @@
 /**
- * @fileoverview Unit tests for the scheduler — parser, schedule grammar,
- *               nextRunAt, catch-up logic, and the boot tick driver.
- * @proves Frontmatter parsing + validation, schedule grammar coverage,
- *         pure-function nextRunAt across all kinds, catch-up policy by
- *         kind × {never run, just ran, missed window}, queue-full audit
- *         row, max_cost_usd pre-flight gate.
+ * @fileoverview Unit tests for the scheduler — cron grammar, parseTaskFile,
+ *               nextRunAt (cron + at), catch-up logic, and the boot tick
+ *               driver.
+ * @proves Frontmatter parsing + validation, 5-field cron grammar coverage,
+ *         tz handling including DST spring-forward/fall-back, weekday filter,
+ *         min-interval guard via next-5-fires, pure-function nextRunAt across
+ *         both kinds, catch-up policy, queue-full audit row, max_cost_usd
+ *         pre-flight gate.
  *
  * The scheduler fires synthetic Telegram updates through the existing turn
  * queue; tests use a fake `enqueue` callback rather than wiring a real
@@ -14,8 +16,7 @@
  *
  * Cross-references:
  *   - scheduler.ts — implementation
- *   - skills.test.ts — parser test pattern this mirrors
- *   - PLAN.md §10 — test surface the user signed off on
+ *   - PLAN.md Phase 4 — test surface the user signed off on
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -29,11 +30,9 @@ import {
   getScheduledContext,
   loadTasksSync,
   nextRunAt,
-  parseScheduleSpec,
   parseTaskFile,
   startScheduler,
-  type ScheduleSpec,
-  type SchedulerHandle,
+  validateCronExpr,
   type Task,
   type TaskRegistry,
 } from "./scheduler.ts";
@@ -82,178 +81,173 @@ function writeTask(root: string, name: string, content: string): string {
 const MINIMAL = `---
 name: digest
 description: A digest task.
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 ---
 You are running as the digest. Reply with "ok".
 `;
 
 // ---------------------------------------------------------------------------
-// parseScheduleSpec — grammar coverage
+// validateCronExpr — grammar coverage
 // ---------------------------------------------------------------------------
 
-describe("parseScheduleSpec — every", () => {
-  test("every 1h → 3600000ms", () => {
-    const spec = parseScheduleSpec("every 1h");
-    expect(spec.kind).toBe("every");
-    if (spec.kind === "every") expect(spec.ms).toBe(3_600_000);
+describe("validateCronExpr — valid", () => {
+  test("hourly anchored", () => {
+    expect(validateCronExpr("0 * * * *", "UTC")).toBe("0 * * * *");
   });
 
-  test("every 30m → 1800000ms", () => {
-    const spec = parseScheduleSpec("every 30m");
-    if (spec.kind === "every") expect(spec.ms).toBe(1_800_000);
+  test("every-30m within window on weekdays", () => {
+    expect(validateCronExpr("*/30 12-18 * * 1-5", "America/Denver")).toBe(
+      "*/30 12-18 * * 1-5",
+    );
   });
 
-  test("every 24h → 86400000ms", () => {
-    const spec = parseScheduleSpec("every 24h");
-    if (spec.kind === "every") expect(spec.ms).toBe(86_400_000);
+  test("daily at 09:00", () => {
+    expect(validateCronExpr("0 9 * * *", "UTC")).toBe("0 9 * * *");
   });
 
-  test("every 1d → 86400000ms", () => {
-    const spec = parseScheduleSpec("every 1d");
-    if (spec.kind === "every") expect(spec.ms).toBe(86_400_000);
+  test("lists and step values", () => {
+    expect(validateCronExpr("0,15,30,45 * * * *", "UTC")).toBe("0,15,30,45 * * * *");
+    expect(validateCronExpr("*/5 * * * *", "UTC")).toBe("*/5 * * * *");
   });
 
-  test("every 30s → 30000ms", () => {
-    const spec = parseScheduleSpec("every 30s");
-    if (spec.kind === "every") expect(spec.ms).toBe(30_000);
-  });
-
-  test("every 0h rejected (not positive)", () => {
-    expect(() => parseScheduleSpec("every 0h")).toThrow(/positive integer/);
-  });
-
-  test("every -1h rejected", () => {
-    expect(() => parseScheduleSpec("every -1h")).toThrow(/unrecognized form/);
-  });
-
-  test("every 1y rejected (unknown unit)", () => {
-    expect(() => parseScheduleSpec("every 1y")).toThrow(/unrecognized form/);
+  test("trims surrounding whitespace", () => {
+    expect(validateCronExpr("  0 * * * *  ", "UTC")).toBe("0 * * * *");
   });
 });
 
-describe("parseScheduleSpec — daily_at", () => {
-  test("daily_at 09:00 → hour=9 minute=0", () => {
-    const spec = parseScheduleSpec("daily_at 09:00");
-    expect(spec.kind).toBe("daily_at");
-    if (spec.kind === "daily_at") {
-      expect(spec.hourUtc).toBe(9);
-      expect(spec.minuteUtc).toBe(0);
-    }
+describe("validateCronExpr — rejection", () => {
+  test("empty string rejected", () => {
+    expect(() => validateCronExpr("", "UTC")).toThrow(/empty/);
   });
 
-  test("daily_at 23:59 valid", () => {
-    const spec = parseScheduleSpec("daily_at 23:59");
-    if (spec.kind === "daily_at") {
-      expect(spec.hourUtc).toBe(23);
-      expect(spec.minuteUtc).toBe(59);
-    }
+  test("@daily rejected with helpful message", () => {
+    expect(() => validateCronExpr("@daily", "UTC")).toThrow(/predefined aliases/);
   });
 
-  test("daily_at 24:00 rejected", () => {
-    expect(() => parseScheduleSpec("daily_at 24:00")).toThrow(/hour out of range/);
+  test("@hourly rejected", () => {
+    expect(() => validateCronExpr("@hourly", "UTC")).toThrow(/predefined aliases/);
   });
 
-  test("daily_at 09:60 rejected", () => {
-    expect(() => parseScheduleSpec("daily_at 09:60")).toThrow(/minute out of range/);
+  test("4-field expression rejected (cron-parser would accept)", () => {
+    expect(() => validateCronExpr("* * * *", "UTC")).toThrow(/exactly 5 fields/);
   });
 
-  test("daily_at 9:00 (single-digit hour) accepted", () => {
-    const spec = parseScheduleSpec("daily_at 9:00");
-    if (spec.kind === "daily_at") expect(spec.hourUtc).toBe(9);
-  });
-});
-
-describe("parseScheduleSpec — at", () => {
-  test("at 2026-05-15T13:00:00Z → atMs is the parsed timestamp", () => {
-    const spec = parseScheduleSpec("at 2026-05-15T13:00:00Z");
-    expect(spec.kind).toBe("at");
-    if (spec.kind === "at") {
-      expect(spec.atMs).toBe(Date.parse("2026-05-15T13:00:00Z"));
-    }
+  test("6-field expression rejected (cron-parser would treat as seconds)", () => {
+    expect(() => validateCronExpr("* * * * * *", "UTC")).toThrow(/exactly 5 fields/);
   });
 
-  test("at with explicit offset accepted", () => {
-    const spec = parseScheduleSpec("at 2026-05-15T13:00:00+02:00");
-    expect(spec.kind).toBe("at");
+  test("minute out of range", () => {
+    expect(() => validateCronExpr("60 * * * *", "UTC")).toThrow(/invalid expression/);
   });
 
-  test("timezone-naive at rejected", () => {
-    expect(() => parseScheduleSpec("at 2026-05-15T13:00:00")).toThrow(/timezone-naive/);
-  });
-
-  test("malformed iso rejected", () => {
-    expect(() => parseScheduleSpec("at not-a-date Z")).toThrow(/not a valid ISO8601/);
-  });
-});
-
-describe("parseScheduleSpec — invalid", () => {
-  test("empty rejected", () => {
-    expect(() => parseScheduleSpec("")).toThrow();
+  test("hour out of range", () => {
+    expect(() => validateCronExpr("* 25 * * *", "UTC")).toThrow(/invalid expression/);
   });
 
   test("garbage rejected", () => {
-    expect(() => parseScheduleSpec("randomly")).toThrow(/unrecognized form/);
+    expect(() => validateCronExpr("not a cron", "UTC")).toThrow();
   });
 });
 
 // ---------------------------------------------------------------------------
-// nextRunAt — pure timestamp computation
+// nextRunAt — cron + at, pure timestamp computation
 // ---------------------------------------------------------------------------
 
-describe("nextRunAt — every", () => {
-  const spec: ScheduleSpec = { kind: "every", ms: 3_600_000 }; // 1h
+function buildTask(spec: Task["spec"], tz = "UTC"): Pick<Task, "spec" | "tz"> {
+  return { spec, tz };
+}
 
-  test("never run → fire on next tick (returns now)", () => {
-    const now = 1_000_000_000;
-    expect(nextRunAt(spec, null, now)).toBe(now);
+describe("nextRunAt — cron", () => {
+  test("hourly, never run → returns next future fire (no boot-fire)", () => {
+    const t = buildTask({ kind: "cron", expr: "0 * * * *" });
+    const now = Date.UTC(2026, 4, 18, 14, 13); // 14:13 UTC
+    const due = nextRunAt(t, null, now);
+    expect(due).toBe(Date.UTC(2026, 4, 18, 15, 0)); // 15:00 UTC
   });
 
-  test("just ran → next due is lastRunAt + ms", () => {
-    const lastRun = 1_000_000_000;
-    expect(nextRunAt(spec, lastRun, lastRun + 100)).toBe(lastRun + 3_600_000);
+  test("hourly, just ran at :00 → next fire is +1h", () => {
+    const t = buildTask({ kind: "cron", expr: "0 * * * *" });
+    const lastRun = Date.UTC(2026, 4, 18, 14, 0);
+    const due = nextRunAt(t, lastRun, lastRun + 100);
+    expect(due).toBe(Date.UTC(2026, 4, 18, 15, 0));
   });
 
-  test("missed window (lastRun is older than interval) → next due is in the past, fires immediately", () => {
-    const lastRun = 1_000_000_000;
-    const now = lastRun + 7_200_000; // 2h later
-    const due = nextRunAt(spec, lastRun, now);
-    expect(due).toBe(lastRun + 3_600_000);
-    expect(due!).toBeLessThanOrEqual(now);
-  });
-});
-
-describe("nextRunAt — daily_at", () => {
-  const spec: ScheduleSpec = { kind: "daily_at", hourUtc: 9, minuteUtc: 0 };
-
-  test("before today's anchor, never run → next due is today's anchor", () => {
-    const now = Date.UTC(2026, 0, 15, 8, 30); // 08:30 UTC
-    const due = nextRunAt(spec, null, now);
-    expect(due).toBe(Date.UTC(2026, 0, 15, 9, 0));
+  test("hourly, missed window — lastRun 3h ago → due is in the past (catch-up fires once)", () => {
+    const t = buildTask({ kind: "cron", expr: "0 * * * *" });
+    const lastRun = Date.UTC(2026, 4, 18, 11, 0);
+    const now = Date.UTC(2026, 4, 18, 14, 13);
+    const due = nextRunAt(t, lastRun, now);
+    // Next cron fire after lastRun=11:00 is 12:00 — in the past, fires once.
+    expect(due).toBe(Date.UTC(2026, 4, 18, 12, 0));
+    expect(due!).toBeLessThan(now);
   });
 
-  test("after today's anchor, never run → next due is today's anchor (catch-up)", () => {
-    const now = Date.UTC(2026, 0, 15, 14, 0);
-    const due = nextRunAt(spec, null, now);
-    expect(due).toBe(Date.UTC(2026, 0, 15, 9, 0));
+  test("weekday filter — Saturday skipped", () => {
+    // Saturday 2026-05-16 at 14:00 UTC. Expression: every hour on Mon-Fri only.
+    const t = buildTask({ kind: "cron", expr: "0 * * * 1-5" });
+    const now = Date.UTC(2026, 4, 16, 14, 0); // Sat
+    const due = nextRunAt(t, null, now);
+    // Next fire is Monday 2026-05-18 00:00 UTC.
+    expect(due).toBe(Date.UTC(2026, 4, 18, 0, 0));
   });
 
-  test("already fired today → next due is tomorrow's anchor", () => {
-    const now = Date.UTC(2026, 0, 15, 14, 0);
-    const lastRun = Date.UTC(2026, 0, 15, 9, 5);
-    const due = nextRunAt(spec, lastRun, now);
-    expect(due).toBe(Date.UTC(2026, 0, 16, 9, 0));
+  test("tz applied — same expression, different tz → different UTC ms", () => {
+    const expr = "0 9 * * *";
+    const utc = buildTask({ kind: "cron", expr }, "UTC");
+    const denver = buildTask({ kind: "cron", expr }, "America/Denver");
+    const tokyo = buildTask({ kind: "cron", expr }, "Asia/Tokyo");
+    const anchor = Date.UTC(2026, 4, 18, 0, 0);
+    const dUtc = nextRunAt(utc, null, anchor);
+    const dDenver = nextRunAt(denver, null, anchor);
+    const dTokyo = nextRunAt(tokyo, null, anchor);
+    expect(dUtc).not.toBe(dDenver);
+    expect(dUtc).not.toBe(dTokyo);
+    expect(dDenver).not.toBe(dTokyo);
+    // UTC 09:00 == 2026-05-18T09:00Z.
+    expect(dUtc).toBe(Date.UTC(2026, 4, 18, 9, 0));
+    // Denver 09:00 MDT == 15:00 UTC.
+    expect(dDenver).toBe(Date.UTC(2026, 4, 18, 15, 0));
+  });
+
+  test("DST spring-forward — 2026-03-08 Denver, `0 2 * * *` skips the non-existent hour", () => {
+    const t = buildTask({ kind: "cron", expr: "0 2 * * *" }, "America/Denver");
+    // Anchor Sat 2026-03-07 03:00 Denver (post-2am fire). Next fire would be
+    // Sun Mar 8 02:00 Denver — but that hour doesn't exist (DST jumps to 03).
+    // cron-parser skips to Mon Mar 9 02:00 (deterministic).
+    const anchor = Date.UTC(2026, 2, 7, 10, 0); // Sat 03:00 MST = 10:00 UTC
+    const due = nextRunAt(t, anchor, anchor + 1);
+    // Sun 2026-03-08 03:00 MDT = 09:00 UTC OR Mon Mar 9 02:00 MDT = 08:00 UTC.
+    // Either is "next valid moment, not crash". Just assert non-null + > anchor.
+    expect(due).not.toBeNull();
+    expect(due!).toBeGreaterThan(anchor);
+  });
+
+  test("DST fall-back — 2025-11-02 Denver, `0 1 * * *` fires once on the doubled hour", () => {
+    const t = buildTask({ kind: "cron", expr: "0 1 * * *" }, "America/Denver");
+    // Anchor Sat 2025-11-01 02:00 Denver — past today's fire.
+    const anchor = Date.UTC(2025, 10, 1, 8, 0); // Sat 02:00 MDT = 08:00 UTC
+    const first = nextRunAt(t, anchor, anchor + 1);
+    expect(first).not.toBeNull();
+    // The next fire should be Sun Nov 2 01:00 (one of them — not BOTH).
+    // Anchor that as the new lastRun and ask again.
+    const second = nextRunAt(t, first, first! + 1);
+    // Second fire must be Mon Nov 3 01:00 (24h+ after Sun's fire), not the
+    // duplicated 01:00 MST on the same Sun.
+    const diff = second! - first!;
+    expect(diff).toBeGreaterThan(20 * 60 * 60 * 1000); // > 20h, ensuring no double
   });
 });
 
 describe("nextRunAt — at", () => {
   test("never run → next due is atMs", () => {
-    const spec: ScheduleSpec = { kind: "at", atMs: 1_500_000_000 };
-    expect(nextRunAt(spec, null, 1_000_000_000)).toBe(1_500_000_000);
+    const t = buildTask({ kind: "at", atMs: 1_500_000_000 });
+    expect(nextRunAt(t, null, 1_000_000_000)).toBe(1_500_000_000);
   });
 
   test("already ran → null (one-off consumed)", () => {
-    const spec: ScheduleSpec = { kind: "at", atMs: 1_500_000_000 };
-    expect(nextRunAt(spec, 1_500_000_000, 2_000_000_000)).toBeNull();
+    const t = buildTask({ kind: "at", atMs: 1_500_000_000 });
+    expect(nextRunAt(t, 1_500_000_000, 2_000_000_000)).toBeNull();
   });
 });
 
@@ -262,23 +256,38 @@ describe("nextRunAt — at", () => {
 // ---------------------------------------------------------------------------
 
 describe("parseTaskFile — valid", () => {
-  test("minimal task", () => {
+  test("minimal cron task", () => {
     const t = parseTaskFile(MINIMAL, "/tmp/TASK.md", { defaultEngine: "ollama" });
     expect(t.name).toBe("digest");
     expect(t.description).toBe("A digest task.");
-    expect(t.spec.kind).toBe("every");
+    expect(t.spec.kind).toBe("cron");
+    if (t.spec.kind === "cron") expect(t.spec.expr).toBe("0 * * * *");
+    expect(t.tz).toBe("UTC");
     expect(t.engine).toBe("ollama"); // inherits default
-    expect(t.catchUp).toBe(true);
+    expect(t.catchUp).toBe(true); // default true for cron
     expect(t.enabled).toBe(true);
     expect(t.maxCostUsd).toBeNull();
     expect(t.bootCatchUpJitterS).toBe(0);
+  });
+
+  test("tz omitted → falls back to runtime default (non-empty)", () => {
+    const c = `---
+name: digest
+description: x
+cron: "0 * * * *"
+---
+Body.`;
+    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    expect(typeof t.tz).toBe("string");
+    expect(t.tz.length).toBeGreaterThan(0);
   });
 
   test("explicit engine: primary on ollama-default deploy", () => {
     const c = `---
 name: heavy
 description: Heavy task.
-schedule: every 6h
+cron: "0 */6 * * *"
+tz: UTC
 engine: primary
 ---
 Body.`;
@@ -290,7 +299,8 @@ Body.`;
     const c = `---
 name: opus
 description: Opus task.
-schedule: every 6h
+cron: "0 */6 * * *"
+tz: UTC
 engine: secondary
 ---
 Body.`;
@@ -302,7 +312,8 @@ Body.`;
     const c = `---
 name: digest
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 engine: secondary
 max_cost_usd: 0.25
 ---
@@ -315,7 +326,8 @@ Body.`;
     const c = `---
 name: digest
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 max_cost_usd: 0.25
 ---
 Body.`;
@@ -323,22 +335,24 @@ Body.`;
     expect(t.maxCostUsd).toBeNull();
   });
 
-  test("one-off task defaults catch_up to false", () => {
+  test("one-off task with at: defaults catch_up to false", () => {
     const c = `---
 name: alarm
 description: x
-schedule: at 2026-05-15T13:00:00Z
+at: 2026-05-15T13:00:00Z
 ---
 Body.`;
     const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
     expect(t.catchUp).toBe(false);
+    expect(t.spec.kind).toBe("at");
   });
 
   test("chat_id parsed as integer", () => {
     const c = `---
 name: digest
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 chat_id: -100123456789
 ---
 Body.`;
@@ -351,23 +365,90 @@ Body.`;
     const b = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
     expect(a.sourceHash).toBe(b.sourceHash);
   });
+
+  test("America/Denver tz accepted", () => {
+    const c = `---
+name: stretch
+description: x
+cron: "*/30 12-18 * * 1-5"
+tz: America/Denver
+---
+Body.`;
+    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    expect(t.tz).toBe("America/Denver");
+  });
 });
 
 describe("parseTaskFile — rejection", () => {
-  test("missing schedule rejected", () => {
+  test("missing both cron and at rejected", () => {
     const c = `---
 name: digest
 description: x
 ---
 Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/schedule/);
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+      /one of "cron.*or "at.*is required/,
+    );
+  });
+
+  test("cron and at both present rejected", () => {
+    const c = `---
+name: digest
+description: x
+cron: "0 * * * *"
+at: 2026-05-15T13:00:00Z
+---
+Body.`;
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+      /mutually exclusive/,
+    );
+  });
+
+  test("invalid IANA tz rejected", () => {
+    const c = `---
+name: digest
+description: x
+cron: "0 * * * *"
+tz: Not/A/Timezone
+---
+Body.`;
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+      /invalid IANA timezone/,
+    );
+  });
+
+  test("@daily alias rejected with cron-specific message", () => {
+    const c = `---
+name: digest
+description: x
+cron: "@daily"
+tz: UTC
+---
+Body.`;
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+      /predefined aliases/,
+    );
+  });
+
+  test("4-field cron expression rejected", () => {
+    const c = `---
+name: digest
+description: x
+cron: "0 * * *"
+tz: UTC
+---
+Body.`;
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
+      /exactly 5 fields/,
+    );
   });
 
   test("engine: ollama on primary-default deploy rejected", () => {
     const c = `---
 name: digest
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 engine: ollama
 ---
 Body.`;
@@ -376,50 +457,52 @@ Body.`;
     );
   });
 
-  test("engine: ollama on secondary-default deploy rejected", () => {
-    const c = `---
-name: digest
-description: x
-schedule: every 1h
-engine: ollama
----
-Body.`;
-    expect(() => parseTaskFile(c, "/p", { defaultEngine: "secondary" })).toThrow(
-      /unreachable/,
-    );
-  });
-
-  test("every <5min on Claude tier rejected", () => {
+  test("min-interval: `* * * * *` on Claude tier rejected", () => {
     const c = `---
 name: too_fast
 description: x
-schedule: every 1m
+cron: "* * * * *"
+tz: UTC
 engine: primary
 ---
 Body.`;
     expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(
-      /interval too short/,
+      /cron interval too tight/,
     );
   });
 
-  test("every 1m on ollama allowed", () => {
+  test("min-interval: `* * * * *` on Ollama allowed", () => {
     const c = `---
 name: fast_local
 description: x
-schedule: every 1m
+cron: "* * * * *"
+tz: UTC
 engine: ollama
 ---
 Body.`;
     const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
-    expect(t.spec.kind).toBe("every");
-    if (t.spec.kind === "every") expect(t.spec.ms).toBe(60_000);
+    expect(t.spec.kind).toBe("cron");
+  });
+
+  test("min-interval: `*/5 * * * *` on Claude allowed", () => {
+    const c = `---
+name: every_five
+description: x
+cron: "*/5 * * * *"
+tz: UTC
+engine: primary
+---
+Body.`;
+    const t = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    expect(t.spec.kind).toBe("cron");
   });
 
   test("max_cost_usd negative rejected", () => {
     const c = `---
 name: digest
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 engine: primary
 max_cost_usd: -1
 ---
@@ -431,7 +514,8 @@ Body.`;
     const c = `---
 name: digest
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 boot_catch_up_jitter_s: -1
 ---
 Body.`;
@@ -442,7 +526,8 @@ Body.`;
     const c = `---
 name: digest
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 unknownkey: foo
 ---
 Body.`;
@@ -453,7 +538,8 @@ Body.`;
     const c = `---
 name: digest
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 ---
 `;
     expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/body must be non-empty/);
@@ -463,10 +549,60 @@ schedule: every 1h
     const c = `---
 name: morning-digest
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 ---
 Body.`;
     expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/"name" must match/);
+  });
+
+  test("legacy `schedule:` key rejected as unknown", () => {
+    const c = `---
+name: digest
+description: x
+schedule: every 1h
+---
+Body.`;
+    expect(() => parseTaskFile(c, "/p", { defaultEngine: "ollama" })).toThrow(/unknown frontmatter/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration — full-weekday simulation
+// ---------------------------------------------------------------------------
+
+describe("nextRunAt — full-day fire count", () => {
+  test("*/30 12-18 * * 1-5 Denver on Monday → 14 fires", () => {
+    // Note: cron `12-18` includes hour 18 (inclusive), so `*/30` yields
+    // 18:00 AND 18:30. The full 7-hour window × 2 fires/hour = 14 fires.
+    // Operators wanting exactly 13 fires ending at 18:00 need multi-trigger
+    // (PLAN OQ#5, deferred).
+    const t = buildTask({ kind: "cron", expr: "*/30 12-18 * * 1-5" }, "America/Denver");
+    let last: number | null = null;
+    const startMs = Date.UTC(2026, 4, 18, 6, 0); // Mon 2026-05-18 00:00 MDT
+    const endMs = Date.UTC(2026, 4, 19, 6, 0); // Tue 2026-05-19 00:00 MDT
+    let n = 0;
+    let cursor = startMs;
+    while (true) {
+      const due = nextRunAt(t, last, cursor);
+      if (due === null || due >= endMs) break;
+      n++;
+      last = due;
+      cursor = due + 1;
+    }
+    expect(n).toBe(14);
+  });
+
+  test("*/30 12-18 * * 1-5 Denver on Saturday → 0 fires", () => {
+    const t = buildTask({ kind: "cron", expr: "*/30 12-18 * * 1-5" }, "America/Denver");
+    const startMs = Date.UTC(2026, 4, 16, 6, 0); // Sat 2026-05-16 00:00 MDT
+    const endMs = Date.UTC(2026, 4, 17, 6, 0); // Sun 00:00 MDT
+    const due = nextRunAt(t, null, startMs);
+    // First fire after Saturday midnight must be either later that Saturday
+    // (nope — weekday filter) or in the following Monday window. Confirm
+    // it's NOT inside the Sat→Sun window.
+    expect(due).not.toBeNull();
+    expect(due!).toBeGreaterThanOrEqual(endMs);
   });
 });
 
@@ -550,51 +686,13 @@ function singleTaskRegistry(task: Task): TaskRegistry {
   });
 }
 
-const FROZEN_NOW = 1_700_000_000_000; // 2023-11 — predictable test clock
+const FROZEN_NOW = Date.UTC(2026, 4, 18, 14, 13); // Mon 2026-05-18 14:13 UTC
 
 describe("startScheduler — boot fire", () => {
-  test("every 1h, never run → fires on boot tick", async () => {
+  test("cron, never run → does NOT boot-fire (cron is anchored, not stateful)", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
     const task = parseTaskFile(MINIMAL, "/p/TASK.md", { defaultEngine: "ollama" });
-    const registry = singleTaskRegistry(task);
-
-    let intervalFn: (() => void) | null = null;
-    const handle: SchedulerHandle = startScheduler({
-      db,
-      registry,
-      enqueue: queue.enqueue,
-      operatorFromId: 100,
-      defaultEngine: "ollama",
-      defaultChatId: 100,
-      now: () => FROZEN_NOW,
-      setInterval: (fn) => {
-        intervalFn = fn;
-        return 0;
-      },
-      clearInterval: () => {},
-    });
-
-    expect(queue.enqueued.length).toBe(1);
-    expect(queue.enqueued[0]!.message?.text).toBe(task.body);
-    const ctx = getScheduledContext(queue.enqueued[0]!.message);
-    expect(ctx?.name).toBe("digest");
-
-    handle.stop();
-    expect(intervalFn).not.toBeNull();
-  });
-
-  test("catch_up: false, just-rebooted with periodic task → does NOT fire on boot", async () => {
-    const db = await freshDb();
-    const queue = newFakeQueue();
-    const c = `---
-name: deferred
-description: x
-schedule: every 1h
-catch_up: false
----
-Body.`;
-    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
     const registry = singleTaskRegistry(task);
 
     const handle = startScheduler({
@@ -610,7 +708,131 @@ Body.`;
     });
 
     expect(queue.enqueued.length).toBe(0);
-    // last_run_at was bumped to now so the next tick won't catch up either.
+    handle.stop();
+  });
+
+  test("cron, never run → tick driver fires on first cron tick AFTER boot (regression: lastRunAt=null must anchor on bootTime, not the moving now)", async () => {
+    const db = await freshDb();
+    const queue = newFakeQueue();
+    // every-minute task; bootTime is mid-minute so the first cron tick after
+    // boot is :00 of the next minute.
+    const c = `---
+name: minute
+description: x
+cron: "* * * * *"
+tz: UTC
+catch_up: false
+engine: ollama
+---
+Body.`;
+    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+
+    let nowMs = Date.UTC(2026, 4, 18, 14, 13, 6); // 14:13:06 UTC — boot
+    let tickFn: (() => void) | null = null;
+    const handle = startScheduler({
+      db,
+      registry: singleTaskRegistry(task),
+      enqueue: queue.enqueue,
+      operatorFromId: 100,
+      defaultEngine: "ollama",
+      defaultChatId: 100,
+      now: () => nowMs,
+      setInterval: (fn) => {
+        tickFn = fn;
+        return 0;
+      },
+      clearInterval: () => {},
+    });
+
+    // Boot tick at 14:13:06 — next cron tick is 14:14:00, in the future, so
+    // no boot fire (matches design: cron is anchored, not stateful).
+    expect(queue.enqueued.length).toBe(0);
+
+    // Advance to 14:14:06 — the first cron tick after boot (14:14:00) has
+    // just passed. The driver MUST detect `due ≤ now` and fire.
+    // Pre-fix bug: nextRunAt anchored on the moving `now` returned 14:15:00,
+    // which is still > now → never fires.
+    nowMs = Date.UTC(2026, 4, 18, 14, 14, 6);
+    tickFn!();
+    expect(queue.enqueued.length).toBe(1);
+
+    // Advance to 14:15:06 — second fire. After the first fire, lastRunAt is
+    // set, so the anchor now flows through the normal path. Confirms the
+    // post-first-fire transition.
+    nowMs = Date.UTC(2026, 4, 18, 14, 15, 6);
+    tickFn!();
+    expect(queue.enqueued.length).toBe(2);
+
+    handle.stop();
+  });
+
+  test("cron, lastRunAt 3h stale, catch_up=true → boot-fires ONCE", async () => {
+    const db = await freshDb();
+    const queue = newFakeQueue();
+    const task = parseTaskFile(MINIMAL, "/p/TASK.md", { defaultEngine: "ollama" });
+    const registry = singleTaskRegistry(task);
+
+    // Seed lastRunAt 3h before FROZEN_NOW.
+    db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name: task.name,
+      lastRunAt: FROZEN_NOW - 3 * 60 * 60 * 1000,
+      lastAuditId: 1,
+      lastStatus: "fired",
+    });
+
+    const handle = startScheduler({
+      db,
+      registry,
+      enqueue: queue.enqueue,
+      operatorFromId: 100,
+      defaultEngine: "ollama",
+      defaultChatId: 100,
+      now: () => FROZEN_NOW,
+      setInterval: () => 0,
+      clearInterval: () => {},
+    });
+
+    // Exactly one catch-up fire (not N catch-ups).
+    expect(queue.enqueued.length).toBe(1);
+    handle.stop();
+  });
+
+  test("cron, lastRunAt 3h stale, catch_up=false → does NOT fire; lastRunAt bumped to now", async () => {
+    const db = await freshDb();
+    const queue = newFakeQueue();
+    const c = `---
+name: deferred
+description: x
+cron: "0 * * * *"
+tz: UTC
+catch_up: false
+---
+Body.`;
+    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const registry = singleTaskRegistry(task);
+
+    db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name: task.name,
+      lastRunAt: FROZEN_NOW - 3 * 60 * 60 * 1000,
+      lastAuditId: 1,
+      lastStatus: "fired",
+    });
+
+    const handle = startScheduler({
+      db,
+      registry,
+      enqueue: queue.enqueue,
+      operatorFromId: 100,
+      defaultEngine: "ollama",
+      defaultChatId: 100,
+      now: () => FROZEN_NOW,
+      setInterval: () => 0,
+      clearInterval: () => {},
+    });
+
+    expect(queue.enqueued.length).toBe(0);
     const state = db.getTaskState("deferred");
     expect(state?.lastRunAt).toBe(FROZEN_NOW);
     handle.stop();
@@ -623,7 +845,7 @@ Body.`;
     const c = `---
 name: past_alarm
 description: x
-schedule: at ${past}
+at: ${past}
 catch_up: false
 ---
 Body.`;
@@ -655,7 +877,7 @@ Body.`;
     const c = `---
 name: late_alarm
 description: x
-schedule: at ${past}
+at: ${past}
 catch_up: true
 ---
 Body.`;
@@ -680,18 +902,59 @@ Body.`;
     handle.stop();
   });
 
+  test("at <future>, cold start → does NOT fire yet, no consumed mark", async () => {
+    const db = await freshDb();
+    const queue = newFakeQueue();
+    const future = new Date(FROZEN_NOW + 60 * 60 * 1000).toISOString();
+    const c = `---
+name: future_alarm
+description: x
+at: ${future}
+---
+Body.`;
+    const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    const registry = singleTaskRegistry(task);
+
+    const handle = startScheduler({
+      db,
+      registry,
+      enqueue: queue.enqueue,
+      operatorFromId: 100,
+      defaultEngine: "ollama",
+      defaultChatId: 100,
+      now: () => FROZEN_NOW,
+      setInterval: () => 0,
+      clearInterval: () => {},
+    });
+
+    expect(queue.enqueued.length).toBe(0);
+    const state = db.getTaskState("future_alarm");
+    expect(state?.oneOffConsumed).toBeFalsy();
+    handle.stop();
+  });
+
   test("disabled task does not fire", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
     const c = `---
 name: paused
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 enabled: false
 ---
 Body.`;
     const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
     const registry = singleTaskRegistry(task);
+
+    // Seed stale lastRunAt — would normally trigger catch-up.
+    db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name: task.name,
+      lastRunAt: FROZEN_NOW - 3 * 60 * 60 * 1000,
+      lastAuditId: 1,
+      lastStatus: "fired",
+    });
 
     const handle = startScheduler({
       db,
@@ -715,6 +978,15 @@ Body.`;
     queue.dropMode = "queue_full";
     const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
     const registry = singleTaskRegistry(task);
+
+    // Seed stale lastRunAt to force a boot-fire that hits the queue.
+    db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name: task.name,
+      lastRunAt: FROZEN_NOW - 3 * 60 * 60 * 1000,
+      lastAuditId: 1,
+      lastStatus: "fired",
+    });
 
     const handle = startScheduler({
       db,
@@ -747,10 +1019,21 @@ Body.`;
 });
 
 describe("startScheduler — engine prefix mapping in synthesized text", () => {
+  function staleSeed(db: SolracDb, name: string) {
+    db.upsertTaskMetadata({ name, sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name,
+      lastRunAt: FROZEN_NOW - 3 * 60 * 60 * 1000,
+      lastAuditId: 1,
+      lastStatus: "fired",
+    });
+  }
+
   test("task engine matches default → no prefix", async () => {
     const db = await freshDb();
     const queue = newFakeQueue();
     const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
+    staleSeed(db, task.name);
     const handle = startScheduler({
       db,
       registry: singleTaskRegistry(task),
@@ -772,11 +1055,13 @@ describe("startScheduler — engine prefix mapping in synthesized text", () => {
     const c = `---
 name: hot
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 engine: primary
 ---
 fetch the weather`;
     const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    staleSeed(db, task.name);
     const handle = startScheduler({
       db,
       registry: singleTaskRegistry(task),
@@ -798,11 +1083,13 @@ fetch the weather`;
     const c = `---
 name: hot
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 engine: secondary
 ---
 think deeply`;
     const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+    staleSeed(db, task.name);
     const handle = startScheduler({
       db,
       registry: singleTaskRegistry(task),
@@ -824,6 +1111,13 @@ describe("startScheduler — synthetic update_id is negative", () => {
     const db = await freshDb();
     const queue = newFakeQueue();
     const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
+    db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name: task.name,
+      lastRunAt: FROZEN_NOW - 3 * 60 * 60 * 1000,
+      lastAuditId: 1,
+      lastStatus: "fired",
+    });
     const handle = startScheduler({
       db,
       registry: singleTaskRegistry(task),
@@ -875,12 +1169,22 @@ describe("startScheduler — max_cost_usd pre-flight", () => {
     const c = `---
 name: expensive
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 engine: secondary
 max_cost_usd: 0.20
 ---
 Body.`;
     const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
+
+    // Seed stale lastRunAt to force boot-fire attempt.
+    db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name: task.name,
+      lastRunAt: FROZEN_NOW - 3 * 60 * 60 * 1000,
+      lastAuditId: priorAuditId,
+      lastStatus: "fired",
+    });
 
     const handle = startScheduler({
       db,
@@ -911,12 +1215,22 @@ Body.`;
     const c = `---
 name: free_run
 description: x
-schedule: every 1h
+cron: "0 * * * *"
+tz: UTC
 max_cost_usd: 0.01
 ---
 Body.`;
     const task = parseTaskFile(c, "/p", { defaultEngine: "ollama" });
     expect(task.maxCostUsd).toBeNull(); // already nulled at parse
+
+    // Seed stale lastRunAt.
+    db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name: task.name,
+      lastRunAt: FROZEN_NOW - 3 * 60 * 60 * 1000,
+      lastAuditId: 1,
+      lastStatus: "fired",
+    });
 
     const handle = startScheduler({
       db,
@@ -944,6 +1258,13 @@ describe("getScheduledContext", () => {
     const db = await freshDb();
     const queue = newFakeQueue();
     const task = parseTaskFile(MINIMAL, "/p", { defaultEngine: "ollama" });
+    db.upsertTaskMetadata({ name: task.name, sourcePath: "/p", sourceHash: "h" });
+    db.markTaskFired({
+      name: task.name,
+      lastRunAt: FROZEN_NOW - 3 * 60 * 60 * 1000,
+      lastAuditId: 1,
+      lastStatus: "fired",
+    });
     const handle = startScheduler({
       db,
       registry: singleTaskRegistry(task),

@@ -1174,7 +1174,8 @@ describe("runCommand /tasks", () => {
       body: "Run the digest",
       chatId: null,
       engine: "ollama" as const,
-      spec: { kind: "every" as const, ms: 3_600_000 },
+      spec: { kind: "cron" as const, expr: "0 * * * *" },
+      tz: "UTC",
       catchUp: true,
       enabled: true,
       maxCostUsd: null,
@@ -1190,11 +1191,9 @@ describe("runCommand /tasks", () => {
     await runCommand(h.deps, fakeMsg("/tasks"), { kind: "tasks_list" }, 1);
     const text = h.tg.sent[0]!.text;
     expect(text).toContain("morning_digest");
-    expect(text).toContain("every 1h");
+    expect(text).toContain("cron: 0 * * * * (UTC)");
     expect(text).toContain("ollama");
-    // Next-fire rendering: never-run task → fire on next tick → "(now)" or
-    // "(<small> late)" depending on the millisecond clock the test ran at.
-    // Both forms include "next:" — that's the contract.
+    // Next-fire rendering: contract is that "next:" appears.
     expect(text).toContain("next:");
   });
 
@@ -1207,6 +1206,7 @@ describe("runCommand /tasks", () => {
       chatId: null,
       engine: "ollama" as const,
       spec: { kind: "at" as const, atMs: Date.now() - 86_400_000 },
+      tz: "UTC",
       catchUp: false,
       enabled: true,
       maxCostUsd: null,
@@ -1239,7 +1239,8 @@ describe("runCommand /tasks", () => {
       body: "noop",
       chatId: null,
       engine: "ollama" as const,
-      spec: { kind: "every" as const, ms: 3_600_000 },
+      spec: { kind: "cron" as const, expr: "0 * * * *" },
+      tz: "UTC",
       catchUp: true,
       enabled: false,
       maxCostUsd: null,
@@ -1260,37 +1261,33 @@ describe("runCommand /tasks", () => {
 
   test("/tasks renders 'in <duration>' for future fire", async () => {
     const h = await makeHarness();
-    const lastRun = Date.now() - 30 * 60 * 1000; // 30 min ago
+    // Use a one-off `at` task scheduled 30 min in the future — deterministic
+    // future-fire rendering regardless of where the wall clock falls relative
+    // to the cron anchor.
+    const futureMs = Date.now() + 30 * 60 * 1000;
     const fakeTask = {
-      name: "hourly",
-      description: "Hourly task",
+      name: "later",
+      description: "One-off in 30 min",
       body: "Run",
       chatId: null,
       engine: "ollama" as const,
-      spec: { kind: "every" as const, ms: 60 * 60 * 1000 }, // 1h
-      catchUp: true,
+      spec: { kind: "at" as const, atMs: futureMs },
+      tz: "UTC",
+      catchUp: false,
       enabled: true,
       maxCostUsd: null,
       bootCatchUpJitterS: 0,
-      sourcePath: "/tasks/hourly/TASK.md",
+      sourcePath: "/tasks/later/TASK.md",
       sourceHash: "abc",
     };
     h.deps.taskRegistry = {
       all: [fakeTask],
-      get: (n: string) => (n === "hourly" ? fakeTask : undefined),
+      get: (n: string) => (n === "later" ? fakeTask : undefined),
       size: () => 1,
     };
-    h.db.upsertTaskMetadata({ name: "hourly", sourcePath: "/p", sourceHash: "h" });
-    h.db.markTaskFired({
-      name: "hourly",
-      lastRunAt: lastRun,
-      lastAuditId: 1,
-      lastStatus: "fired",
-    });
+    h.db.upsertTaskMetadata({ name: "later", sourcePath: "/p", sourceHash: "h" });
     await runCommand(h.deps, fakeMsg("/tasks"), { kind: "tasks_list" }, 1);
     const text = h.tg.sent[0]!.text;
-    // ~30m remain in the hour. Allow either "30m" or "29m" in case the clock
-    // rolled.
     expect(text).toMatch(/\(in \d+m\)/);
   });
 

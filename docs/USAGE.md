@@ -449,26 +449,88 @@ Each task is a `TASK.md` file in `$SOLRAC_TASKS_DIR/<name>/` (default `./tasks`)
 ---
 name: morning_digest
 description: Weekday morning Notion ticket digest.
-schedule: daily_at 13:00
+cron: "0 9 * * 1-5"
+tz: America/Denver
 ---
 
 You are running as the morning digest. List any Notion tickets in "In progress"
 with no update in the last 48h. If there are none, reply "All clear."
 ```
 
-Drop this file at `./tasks/morning_digest/TASK.md`, set `SOLRAC_TASKS_ENABLED=true`, restart. The prompt fires every UTC day at 13:00 into the operator's DM.
+Drop this file at `./tasks/morning_digest/TASK.md`, set `SOLRAC_TASKS_ENABLED=true`, restart. The prompt fires every weekday at 09:00 America/Denver into the operator's DM — assuming the operator has `/start`-ed the bot. If they haven't, the DM is dropped silently by Telegram; set `chat_id:` explicitly to avoid this. See [Where the reply lands](#where-the-reply-lands) below.
 
 ### Schedule grammar
 
-One of (mutually exclusive):
+Exactly one of `cron:` or `at:` must be present.
 
-| Form | Meaning | Example |
-|------|---------|---------|
-| `every <N><unit>` | Periodic interval from `last_run_at`. Units: `s`, `m`, `h`, `d`. | `every 1h`, `every 24h`, `every 30m` |
-| `daily_at HH:MM` | Anchored daily fire (UTC). | `daily_at 09:00`, `daily_at 23:30` |
-| `at <ISO8601>` | Single fire at an absolute timestamp. Must include timezone (`Z` or `±HH:MM`). | `at 2026-05-15T13:00:00Z` |
+**`cron:`** — 5-field unix cron expression: `minute hour day-of-month month day-of-week`. Standard semantics: ranges (`12-18`), lists (`0,15,30,45`), steps (`*/30`), wildcards (`*`). Day-of-week `1-5` is Mon–Fri (`0`/`7` accept as Sun). Predefined aliases (`@daily`, `@hourly`) are **not** supported — use the 5-field equivalent.
 
-**Minimum interval for `every`:** 5 minutes for Claude tiers (cost-runaway guard); 1 minute for Ollama.
+**`tz:`** — optional IANA timezone (e.g., `America/Denver`, `Europe/Berlin`, `UTC`). Cron expressions evaluate against this wall-clock and DST shifts are handled by `cron-parser`: spring-forward skips the non-existent hour to the next valid moment; fall-back fires once, not twice. Defaults to `$TZ` env var, otherwise the host's runtime tz.
+
+| Expression | Meaning |
+|---|---|
+| `cron: "0 * * * *"` | Top of every hour |
+| `cron: "*/30 * * * *"` | Every 30 minutes |
+| `cron: "0 9 * * *"` | Daily at 09:00 (in `tz`) |
+| `cron: "0 9 * * 1-5"` | Weekdays at 09:00 |
+| `cron: "*/30 12-18 * * 1-5"` | Every 30 min during 12:00–18:30 weekdays (14 fires/day; cron's `12-18` is inclusive of hour 18) |
+| `cron: "0 0 1 * *"` | First of every month at midnight |
+
+**`at:`** — single absolute fire. Must be ISO8601 with a `Z` suffix or explicit `±HH:MM` offset (timezone-naive strings are rejected).
+
+```yaml
+at: 2026-06-01T09:00:00-06:00
+```
+
+**Minimum interval (Claude tiers):** 5 minutes. The parser inspects the first 5 fire times of every cron expression at load time and rejects the task if any gap falls below the tier floor. So `* * * * *` is rejected on `engine: primary` / `secondary` but accepted on `engine: ollama` (Ollama's floor is 1 minute).
+
+**Anchored vs drifting.** Cron is anchored: `0 * * * *` always fires at `:00` regardless of when Solrac last started. A mid-window restart at 14:13 with this expression fires next at 15:00, not 15:13. This is a behavior change from the pre-cron `every 1h` grammar, which drifted from `last_run_at`.
+
+**Cron does not "catch up" first-deploy.** A fresh task at 14:00 with `0 9 * * *` waits until tomorrow 09:00 — not today's 09:00, not now. Cron is stateless: it fires at its anchors, period. If you want a one-time-now fire, add a sibling task with `at:`. Catch-up after restart (when `last_run_at` exists) still works: a missed window fires once at the next valid moment.
+
+### Where the reply lands
+
+`chat_id:` is the integer Telegram chat the scheduler synthesizes its update into. Omit it and Solrac falls back to the operator's allowlisted user id — a DM to you.
+
+**DM gotcha.** Telegram silently drops bot DMs to any account that hasn't `/start`-ed the bot at least once. If you're configuring Solrac on a new account and skip `chat_id:`, scheduled fires will appear to do nothing — the audit log shows the turn fired and replied, but Telegram swallows the outbound message. Either `/start` the bot from the operator account once, or set `chat_id:` explicitly to a chat you know the bot can reach.
+
+**Finding a chat_id:**
+
+For a **DM**, your `chat_id` equals your Telegram user id — the exact value already in your `.env` as `ALLOWLIST_BOOTSTRAP`. Just copy it.
+
+```sh
+grep ALLOWLIST_BOOTSTRAP .env       # your user id == your DM chat_id
+```
+
+For a **group** or channel, `chat_id` is a negative integer (e.g., `-100123456789`). Send at least one message into the target chat with the bot present, then query the audit table:
+
+```sh
+sqlite3 data/solrac.sqlite \
+  "SELECT DISTINCT chat_id, from_id FROM audit ORDER BY started_at DESC LIMIT 10"
+```
+
+```yaml
+chat_id: 123456789        # DM to user 123456789
+chat_id: -100123456789    # group chat (note the leading minus)
+```
+
+The bot must already be in a target group; the allowlist gate matches on the *sender's* `from.id`, so any operator-id `from.id` can fire a scheduled prompt into any `chat_id` the bot has access to. Pick a chat you don't actively type in — a scheduled fire waits behind any user turn already running in the same chat (per-chat KeyedMutex), so colocating with your live conversation introduces unpredictable timing.
+
+### Migration from `schedule:` (pre-0.5.0)
+
+The `schedule:` field was replaced by `cron:` / `at:` in v0.5.0. Map old TASK.md files using this table:
+
+| Old `schedule:` | New | Notes |
+|---|---|---|
+| `every 1m` | `cron: "* * * * *"` | Ollama only (Claude floor 5m) |
+| `every 5m` | `cron: "*/5 * * * *"` | |
+| `every 30m` | `cron: "*/30 * * * *"` | |
+| `every 1h` | `cron: "0 * * * *"` | **Behavior change**: anchored to `:00` instead of drifting from `last_run_at` |
+| `every 2h` | `cron: "0 */2 * * *"` | |
+| `every 1d` | `cron: "0 0 * * *"` | |
+| `daily_at 09:00` (was UTC) | `cron: "0 9 * * *"` + `tz: UTC` | `tz` required if your host tz isn't UTC |
+| `daily_at 09:00` (host tz) | `cron: "0 9 * * *"` | Uses host-tz default |
+| `at 2026-06-01T09:00:00Z` | `at: 2026-06-01T09:00:00Z` | Field name change only |
 
 ### Frontmatter reference
 
@@ -476,10 +538,12 @@ One of (mutually exclusive):
 |-----|----------|---------|-------|
 | `name` | yes | — | `[a-z0-9_]{1,32}` (Telegram bot-command shape). Lowercased automatically. |
 | `description` | yes | — | ≤256 chars. Shown in `/tasks`. |
-| `schedule` | yes | — | See grammar above. |
+| `cron` | one of | — | 5-field unix cron expression. Mutually exclusive with `at`. |
+| `at` | one of | — | ISO8601 absolute timestamp with explicit tz suffix. Mutually exclusive with `cron`. |
+| `tz` | no | `$TZ` env / host tz | IANA timezone name. Affects `cron` evaluation only. |
 | `chat_id` | no | first allowlist entry | Where the reply lands. Use a negative integer for group chats. |
 | `engine` | no | `config.defaultEngine` | `primary` (Sonnet, `@`), `secondary` (Opus, `!`), or `ollama` (free, default-engine deploys only). |
-| `catch_up` | no | `true` for periodic, `false` for `at` | If Solrac was down through a missed window, fire once on next boot. Set to `false` to skip catch-up fires. |
+| `catch_up` | no | `true` for `cron`, `false` for `at` | If Solrac was down through a missed window, fire once on next boot. Set to `false` to skip catch-up fires. |
 | `enabled` | no | `true` | Set `false` to pause without deleting. |
 | `max_cost_usd` | no | unset | Per-task hourly cap (Claude tiers only). Pre-flight skip when `SUM(cost_usd)` for this task in past 1 hour ≥ cap. Silently ignored on Ollama. |
 | `boot_catch_up_jitter_s` | no | `0` | Stagger boot catch-up fires by `random(0, N)` seconds so 12 daily tasks don't pile up simultaneously on restart. |

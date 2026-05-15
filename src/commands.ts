@@ -1852,15 +1852,31 @@ async function runTasksList(
   updateId: number,
 ): Promise<void> {
   if (!deps.taskRegistry || deps.taskRegistry.size() === 0) {
-    const reply =
-      "📅 <b>tasks</b>: scheduler disabled or no TASK.md files loaded.\n" +
-      "Set <code>SOLRAC_TASKS_ENABLED=true</code> and drop TASK.md files into <code>$SOLRAC_TASKS_DIR</code>.";
-    await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.tasks_reply_failed");
+    const md =
+      "📅 **tasks**: scheduler disabled or no TASK.md files loaded.\n\n" +
+      "Set `SOLRAC_TASKS_ENABLED=true` and drop TASK.md files into `$SOLRAC_TASKS_DIR`.";
+    await sendOrLog(deps.tg, msg.chat.id, mdToTelegramHtml(md), "cmd.tasks_reply_failed", md);
     writeSystemAudit(deps, msg, updateId, "tasks_disabled", "ok");
     return;
   }
   const now = Date.now();
-  const lines = [`📅 <b>scheduled tasks</b> (${deps.taskRegistry.size()})`];
+  // Author in markdown, derive Telegram HTML via `mdToTelegramHtml`. The web
+  // transport receives the markdown source via `markdownSource` so the browser
+  // gets `<ul>`-rendered list items with `<br>`-broken continuations — without
+  // this dual-render path single `\n`s collapse and the whole listing renders
+  // on one line.
+  //
+  // Markdown shape:
+  //   - Top-line list item: `- **<name>** [(flags)]`
+  //   - Continuation lines indented two spaces (CommonMark list-item content)
+  //   - Trailing `  ` (two spaces) on each continuation forces `<br>` so the
+  //     four sub-lines render as a stack, not a paragraph blob.
+  //   - Cron expression wrapped in backticks — keeps literal `*` from being
+  //     interpreted as emphasis, and renders as `<code>` on both transports.
+  const mdLines: string[] = [
+    `📅 **scheduled tasks** (${deps.taskRegistry.size()})`,
+    "",
+  ];
   for (const t of deps.taskRegistry.all) {
     const state = deps.db.getTaskState(t.name);
     const last = state?.lastRunAt
@@ -1871,15 +1887,15 @@ async function runTasksList(
     const consumed = state?.oneOffConsumed ? " (consumed)" : "";
     const sched = formatScheduleSpec(t);
     const next = formatNextFire(t, state, now);
-    lines.push(
-      `· <b>${htmlEscapeText(t.name)}</b>${enabled}${consumed}\n` +
-        `    schedule: <code>${htmlEscapeText(sched)}</code> · engine: ${t.engine}\n` +
-        `    last: ${last} · ${htmlEscapeText(lastStatus)}\n` +
-        `    next: ${htmlEscapeText(next)}`,
+    mdLines.push(
+      `- **${t.name}**${enabled}${consumed}  \n` +
+        `  schedule: \`${sched}\` · engine: ${t.engine}  \n` +
+        `  last: ${last} · ${lastStatus}  \n` +
+        `  next: ${next}`,
     );
   }
-  const reply = lines.join("\n");
-  await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.tasks_reply_failed");
+  const md = mdLines.join("\n");
+  await sendOrLog(deps.tg, msg.chat.id, mdToTelegramHtml(md), "cmd.tasks_reply_failed", md);
   writeSystemAudit(deps, msg, updateId, "tasks_listed", "ok");
 }
 
@@ -1921,17 +1937,8 @@ async function runTasksRun(
 
 function formatScheduleSpec(t: ScheduledTask): string {
   const s = t.spec;
-  if (s.kind === "every") {
-    const ms = s.ms;
-    if (ms % 86_400_000 === 0) return `every ${ms / 86_400_000}d`;
-    if (ms % 3_600_000 === 0) return `every ${ms / 3_600_000}h`;
-    if (ms % 60_000 === 0) return `every ${ms / 60_000}m`;
-    return `every ${ms / 1000}s`;
-  }
-  if (s.kind === "daily_at") {
-    const hh = String(s.hourUtc).padStart(2, "0");
-    const mm = String(s.minuteUtc).padStart(2, "0");
-    return `daily_at ${hh}:${mm}`;
+  if (s.kind === "cron") {
+    return `cron: ${s.expr} (${t.tz})`;
   }
   return `at ${new Date(s.atMs).toISOString()}`;
 }
@@ -1954,7 +1961,7 @@ function formatNextFire(
 ): string {
   if (state?.oneOffConsumed) return "consumed";
   if (!task.enabled) return "—";
-  const due = nextRunAt(task.spec, state?.lastRunAt ?? null, now);
+  const due = nextRunAt(task, state?.lastRunAt ?? null, now);
   if (due === null) return "—";
   const delta = due - now;
   const abs = formatAbsoluteUtc(due);

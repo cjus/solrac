@@ -1,7 +1,8 @@
 ---
 name: morning_digest
 description: Weekday morning Notion ticket digest (DMs operator).
-schedule: daily_at 13:00
+cron: "0 9 * * 1-5"
+tz: America/Denver
 catch_up: true
 enabled: true
 boot_catch_up_jitter_s: 30
