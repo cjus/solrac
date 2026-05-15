@@ -2,21 +2,36 @@
  * @fileoverview Unit tests for skill-as-tool dispatcher.
  * @proves Tool definition shape, naming, registry filtering, ALS context
  *         propagation, audit row content, AND the load-bearing recursion-
- *         safety invariant: the skill handler's outgoing fetch body has no
- *         `tools` field. If a future change adds tool surface to skill
- *         execution, an Ollama agent calling skills__foo could trigger foo
- *         calling skills__foo → infinite loop. This test catches that
- *         regression at CI time.
+ *         safety invariant.
+ *
+ * Recursion-safety invariant — PR-skills-tools:
+ *   PR-skills-tools lifts the "tool-less skill body" constraint. Skill bodies
+ *   now see the same MCP catalog Ollama turns see, MINUS the skill's own
+ *   `skills__<self>` entry. The filter is the load-bearing guard against a
+ *   tool-callable skill recursing into itself (infinite loop).
+ *
+ *   Two cases:
+ *     1. `OllamaSkillDeps` has no tool surface wired → falls through to the
+ *        single-shot /api/chat path. Outgoing body has no `tools` field.
+ *        (Back-compat for pure text-transform skills like `tldr`.)
+ *     2. `OllamaSkillDeps` HAS tools wired → routes through `runToolLoop`.
+ *        Outgoing body HAS a `tools` field. The skill's own
+ *        `skills__<self>` entry is filtered out.
+ *
+ *   Indirect recursion (A → skills__B → skills__A) is bounded by
+ *   `runToolLoop`'s `maxIterations` (= `skill.maxTurns`) and the loop detector.
  *
  * Cross-references:
  *   - src/skill-tools.ts — implementation
- *   - src/commands.ts::runSkillBare — pure-execution helper invoked by handler
+ *   - src/commands.ts::runSkillBareWithTools — tool-loop path
+ *   - src/commands.ts::runSkillBare — dispatcher; bare path for no-tools case
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import type { OllamaSkillDeps } from "./commands.ts";
 import { openDb, type SolracDb } from "./db.ts";
 import {
@@ -69,6 +84,8 @@ function fakeSkill(overrides: Partial<Skill> = {}): Skill {
     body: "Summarize: {{args}}",
     sourcePath: "/test/SKILL.md",
     tool: true,
+    maxTurns: 1,
+    requires: [] as ReadonlyArray<string>,
     ...overrides,
   });
 }
@@ -180,17 +197,14 @@ describe("buildSkillTools — tool definition shape", () => {
 });
 
 // ---------------------------------------------------------------------------
-// RECURSION SAFETY INVARIANT — outgoing fetch body has no `tools` field
+// RECURSION SAFETY INVARIANT — outgoing fetch body filters `skills__<self>`
 // ---------------------------------------------------------------------------
 
 describe("RECURSION SAFETY — handler fetch body", () => {
-  // Capture every outgoing fetch the handler makes so we can assert its body.
-  // If a future change accidentally adds `tools` to the request body (e.g.
-  // a "smart skills" refactor), this test fails — and it MUST fail, because
-  // a tool-enabled skill could call itself or another tool-callable skill,
-  // creating infinite recursion. This is the parser-level guard the design
-  // depends on.
-  test("outgoing /api/chat body has no `tools` key", async () => {
+  // Case 1: no tool surface wired in OllamaSkillDeps → falls through to the
+  // single-shot /api/chat path. Body has no `tools` field. Back-compat with
+  // pre-PR-skills-tools text-transform skills (e.g. `tldr`).
+  test("no tool surface → outgoing /api/chat body has no `tools` key", async () => {
     const db = await tempDb();
     let captured: { url: string; body: any } | null = null;
     const fakeFetch = (async (
@@ -201,7 +215,6 @@ describe("RECURSION SAFETY — handler fetch body", () => {
         url: String(input),
         body: init?.body ? JSON.parse(String(init.body)) : null,
       };
-      // Return a successful Ollama response so the handler completes.
       return new Response(
         JSON.stringify({
           message: { content: "summary" },
@@ -226,19 +239,119 @@ describe("RECURSION SAFETY — handler fetch body", () => {
       db,
       ollamaSkillDeps,
     });
-    // Invoke the handler under the ALS context (matches what
-    // runOllamaTurnWithTools does). Without this, the handler errors.
     await skillToolCtx.run(TEST_CTX, async () => {
       await tools[0]!.handler({ args: "hello world" }, undefined);
     });
     expect(captured).not.toBeNull();
     expect(captured!.url).toBe("http://test/api/chat");
     expect(captured!.body).not.toBeNull();
-    // THE invariant.
     expect(captured!.body).not.toHaveProperty("tools");
-    // Sanity check: the body has the expected fields.
     expect(captured!.body.stream).toBe(false);
     expect(Array.isArray(captured!.body.messages)).toBe(true);
+  });
+
+  // Case 2: tool surface wired → routes through runToolLoop. Body HAS a
+  // `tools` field that includes other tools but EXCLUDES `skills__<self>`.
+  // This is the load-bearing filter for direct-recursion safety.
+  test("tool surface wired → `tools` array excludes skills__<self>", async () => {
+    const db = await tempDb();
+    // Capture only the FIRST outgoing POST — runToolLoop may follow up with a
+    // cap-finalize POST that doesn't carry the `tools` field, which would
+    // overwrite our capture and mask the real first-round body.
+    let captured: { url: string; body: any } | null = null;
+    const fakeFetch = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      if (captured === null) {
+        captured = {
+          url: String(input),
+          body: init?.body ? JSON.parse(String(init.body)) : null,
+        };
+      }
+      // NDJSON-shaped reply (single frame + trailing newline) so the streaming
+      // parser in runToolLoop exits round 1 with a clean assistant text and
+      // skips the cap-finalize path.
+      const frame =
+        JSON.stringify({
+          message: { content: "done", role: "assistant" },
+          done: true,
+          prompt_eval_count: 10,
+          eval_count: 5,
+        }) + "\n";
+      return new Response(frame, {
+        status: 200,
+        headers: { "content-type": "application/x-ndjson" },
+      });
+    }) as unknown as typeof fetch;
+
+    // Hand-craft a minimal SdkMcpToolDefinition for the skill's own entry
+    // and one other tool. The handlers never fire because the model returns
+    // no tool_calls; only the catalog shape matters here. `inputSchema` must
+    // be a Zod raw shape (`{key: ZodType}`) because `mcpToOllamaTools` runs
+    // it through `z.object(...)` to derive the JSON schema for /api/chat.
+    const makeFakeTool = (
+      name: string,
+    ): import("@anthropic-ai/claude-agent-sdk").SdkMcpToolDefinition<any> => ({
+      name,
+      description: `fake ${name}`,
+      inputSchema: { args: z.string() },
+      handler: async () => ({ content: [{ type: "text", text: "ok" }] }),
+    });
+
+    const selfName = `${SKILL_TOOL_PREFIX}tldr`;
+    const otherSkillName = `${SKILL_TOOL_PREFIX}other`;
+    const integrationToolName = "notion_search";
+    const wiredTools = [
+      makeFakeTool(selfName),
+      makeFakeTool(otherSkillName),
+      makeFakeTool(integrationToolName),
+    ];
+    const toolTiers = new Map<
+      string,
+      import("./integrations.ts").IntegrationTier
+    >([
+      [selfName, "auto"],
+      [otherSkillName, "auto"],
+      [integrationToolName, "auto"],
+    ]);
+    const fakeBroker = {
+      request: async () => {
+        throw new Error("broker.request should not be called in this test");
+      },
+    };
+
+    const ollamaSkillDeps: OllamaSkillDeps = {
+      url: "http://test",
+      model: "m",
+      timeoutMs: 5000,
+      soul: "you are a test bot",
+      fetch: fakeFetch,
+      tools: wiredTools,
+      toolTiers,
+      broker: fakeBroker,
+    };
+    const skill = fakeSkill({ name: "tldr" });
+    const tools = buildSkillTools(makeRegistry([skill]), {
+      db,
+      ollamaSkillDeps,
+    });
+    await skillToolCtx.run(TEST_CTX, async () => {
+      await tools[0]!.handler({ args: "hello world" }, undefined);
+    });
+    expect(captured).not.toBeNull();
+    expect(captured!.url).toBe("http://test/api/chat");
+    expect(captured!.body).not.toBeNull();
+    // The new contract: body HAS a `tools` array.
+    expect(Array.isArray(captured!.body.tools)).toBe(true);
+    const names = (captured!.body.tools as Array<{ function?: { name?: string } }>)
+      .map((t) => t.function?.name ?? "")
+      .filter(Boolean);
+    // Other tools are present.
+    expect(names).toContain(otherSkillName);
+    expect(names).toContain(integrationToolName);
+    // THE load-bearing filter — direct recursion prevention.
+    expect(names).not.toContain(selfName);
   });
 });
 

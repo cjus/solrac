@@ -198,11 +198,16 @@ function buildOneSkillTool(
         origin: "tool_call",
       });
 
+      const toolCallsJson =
+        result.toolCallSummaries.length > 0
+          ? JSON.stringify(result.toolCallSummaries)
+          : null;
+
       if (result.errorMessage !== null) {
         db.updateAuditEnd({
           id: auditId,
           response: null,
-          toolCalls: null,
+          toolCalls: toolCallsJson,
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
           cacheCreationInputTokens: null,
@@ -238,7 +243,7 @@ function buildOneSkillTool(
       db.updateAuditEnd({
         id: auditId,
         response: result.text.slice(0, 200),
-        toolCalls: null,
+        toolCalls: toolCallsJson,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
         cacheCreationInputTokens: null,

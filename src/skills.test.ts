@@ -428,6 +428,92 @@ Body.`;
 });
 
 // ---------------------------------------------------------------------------
+// parseSkillFile — `max_turns` field
+// ---------------------------------------------------------------------------
+
+describe("parseSkillFile — max_turns field", () => {
+  test("defaults to 1 when omitted", () => {
+    const c = `---
+name: example
+description: x
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED);
+    expect(skill.maxTurns).toBe(1);
+  });
+
+  test("accepts a valid integer in [1, 10]", () => {
+    const c = `---
+name: example
+description: x
+max_turns: 5
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED);
+    expect(skill.maxTurns).toBe(5);
+  });
+
+  test("accepts upper bound 10", () => {
+    const c = `---
+name: example
+description: x
+max_turns: 10
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED);
+    expect(skill.maxTurns).toBe(10);
+  });
+
+  test("rejects 0 (below lower bound)", () => {
+    const c = `---
+name: example
+description: x
+max_turns: 0
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(
+      /"max_turns" must be an integer in \[1, 10\]/,
+    );
+  });
+
+  test("rejects negative", () => {
+    const c = `---
+name: example
+description: x
+max_turns: -1
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(
+      /"max_turns" must be an integer in \[1, 10\]/,
+    );
+  });
+
+  test("rejects 11 (above upper bound)", () => {
+    const c = `---
+name: example
+description: x
+max_turns: 11
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(
+      /"max_turns" must be an integer in \[1, 10\]/,
+    );
+  });
+
+  test("rejects non-integer string", () => {
+    const c = `---
+name: example
+description: x
+max_turns: "five"
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(
+      /"max_turns" must be an integer in \[1, 10\]/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parseSkillFile — tier inheritance from defaultTier
 // ---------------------------------------------------------------------------
 
@@ -473,6 +559,69 @@ tier: primary
 Body.`;
     const skill = parseSkillFile(c, "/p", RESERVED, "ollama");
     expect(skill.tier).toBe("primary");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseSkillFile — `requires` field
+// ---------------------------------------------------------------------------
+
+describe("parseSkillFile — requires field", () => {
+  test("omitted → empty array (unconditional load)", () => {
+    const skill = parseSkillFile(MINIMAL, "/p", RESERVED);
+    expect(skill.requires).toEqual([]);
+  });
+
+  test("bare string normalized to single-element array", () => {
+    const c = `---
+name: log
+description: x
+requires: notion
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED);
+    expect(skill.requires).toEqual(["notion"]);
+  });
+
+  test("array form passes through", () => {
+    const c = `---
+name: log
+description: x
+requires: [notion, gmail]
+---
+Body.`;
+    const skill = parseSkillFile(c, "/p", RESERVED);
+    expect(skill.requires).toEqual(["notion", "gmail"]);
+  });
+
+  test("empty string entry rejected", () => {
+    const c = `---
+name: log
+description: x
+requires: ""
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(/"requires" entry must match/);
+  });
+
+  test("uppercase entry rejected (slug must be lowercase)", () => {
+    const c = `---
+name: log
+description: x
+requires: NOTION
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(/"requires" entry must match/);
+  });
+
+  test("array entry with whitespace rejected", () => {
+    const c = `---
+name: log
+description: x
+requires: ["a b"]
+---
+Body.`;
+    expect(() => parseSkillFile(c, "/p", RESERVED)).toThrow(/"requires" entry must match/);
   });
 });
 
@@ -551,6 +700,59 @@ describe("loadSkillsSync", () => {
     expect(result.registry.get("fine")).toBeDefined();
     expect(result.registry.get("clear")).toBeUndefined();
   });
+
+  // requires: gating — every skill with a `requires:` list must have all
+  // entries present in `loadedIntegrations` or it's dropped at boot with a
+  // non-fatal error. Skills with no `requires:` load regardless.
+  const REQUIRES_SKILL = `---
+name: log
+description: x
+requires: notion
+---
+Body.`;
+
+  test("requires: skill loads when integration is present", () => {
+    const root = tempSkillsDir();
+    writeSkill(root, "log", REQUIRES_SKILL);
+    const result = loadSkillsSync(root, RESERVED, "primary", new Set(["notion"]));
+    expect(result.loadedCount).toBe(1);
+    expect(result.errors.length).toBe(0);
+    expect(result.registry.get("log")).toBeDefined();
+  });
+
+  test("requires: skill skipped + errored when integration is missing", () => {
+    const root = tempSkillsDir();
+    writeSkill(root, "log", REQUIRES_SKILL);
+    const result = loadSkillsSync(root, RESERVED, "primary", new Set());
+    expect(result.loadedCount).toBe(0);
+    expect(result.errors.length).toBe(1);
+    expect(result.errors[0]!.message).toMatch(/requires unloaded integration\(s\): notion/);
+    expect(result.registry.get("log")).toBeUndefined();
+  });
+
+  test("multi-requires skill skipped when any entry is missing", () => {
+    const root = tempSkillsDir();
+    const c = `---
+name: log
+description: x
+requires: [notion, gmail]
+---
+Body.`;
+    writeSkill(root, "log", c);
+    const result = loadSkillsSync(root, RESERVED, "primary", new Set(["notion"]));
+    expect(result.loadedCount).toBe(0);
+    expect(result.errors.length).toBe(1);
+    expect(result.errors[0]!.message).toMatch(/gmail/);
+    expect(result.errors[0]!.message).not.toMatch(/notion,/);
+  });
+
+  test("skill with no requires loads regardless of loadedIntegrations", () => {
+    const root = tempSkillsDir();
+    writeSkill(root, "plain", MINIMAL.replace("name: example", "name: plain"));
+    const result = loadSkillsSync(root, RESERVED, "primary", new Set());
+    expect(result.loadedCount).toBe(1);
+    expect(result.registry.get("plain")).toBeDefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -595,6 +797,8 @@ describe("skillsToBotCommands", () => {
       body: "x",
       sourcePath: "/p",
       tool: false,
+      maxTurns: 1,
+      requires: [] as ReadonlyArray<string>,
     });
   }
 

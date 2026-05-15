@@ -94,6 +94,18 @@ export interface Skill {
   // `tool: true` requires `tier: "ollama"` (free-only — avoids cross-engine
   // cost surprises from agent-driven invocations).
   readonly tool: boolean;
+  // Max model turns when running this skill's body. Pure text-transform skills
+  // (no tool calls) want 1; agentic skills that chain tool calls (e.g. a
+  // /log skill doing notion_get_database_schema → notion_create_page) need
+  // headroom. Frontmatter key: `max_turns`. Bounds: 1 ≤ maxTurns ≤ 10.
+  readonly maxTurns: number;
+  // Integration names this skill depends on. When any name is absent from the
+  // set of loaded integrations at boot, the skill is skipped with a non-fatal
+  // error so `/help` + Telegram autocomplete never advertise a skill that
+  // would fail at use-time. Empty array means "no integration deps"
+  // (unconditional load). Frontmatter key: `requires`; accepts a bare string
+  // or a string array.
+  readonly requires: ReadonlyArray<string>;
 }
 
 export interface SkillLoadError {
@@ -127,6 +139,12 @@ export const EMPTY_SKILL_REGISTRY: SkillRegistry = Object.freeze({
 const NAME_RE = /^[a-z0-9_]{1,32}$/;
 const MAX_DESCRIPTION_LEN = 256;
 const FRONTMATTER_DELIM = "---";
+
+// Slug pattern for `requires:` entries. Mirrors the shape of integration
+// subdirectory names (lowercase letters / digits / underscore / hyphen, leading
+// alpha). Hyphens are permitted here even though skill `name` rejects them —
+// integration directories may legitimately be hyphenated (`my-thing`).
+const REQUIRES_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 
 // ---------------------------------------------------------------------------
 // Frontmatter parser (schema-restricted YAML subset)
@@ -301,13 +319,54 @@ export function parseSkillFile(
     toolFlag = v;
   }
 
+  // max_turns — model-turn budget for the skill's body. Default 1 preserves
+  // back-compat with pre-agentic-skills (single-shot text transforms like
+  // tldr). Cap at 10 to keep a runaway skill bounded; cost-cap is the
+  // ultimate backstop for Claude, OLLAMA_MAX_TOOL_ITERATIONS for Ollama.
+  let maxTurns = 1;
+  if ("max_turns" in f) {
+    const v = f.max_turns;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1 || v > 10) {
+      throw new Error(
+        `${sourcePath}: "max_turns" must be an integer in [1, 10] (got ${String(v)})`,
+      );
+    }
+    maxTurns = v;
+  }
+
+  // requires — integration deps that must be loaded for this skill to register.
+  // Accepts a bare string (`requires: notion`) or an array
+  // (`requires: [notion, gmail]`). Empty / omitted → unconditional load
+  // (preserves back-compat for pre-`requires:` skills like `tldr`). The loader
+  // gates on the set of loaded integration names (see `loadSkillsSync`).
+  let requires: ReadonlyArray<string> = Object.freeze([]);
+  if ("requires" in f) {
+    const v = f.requires;
+    let list: ReadonlyArray<string>;
+    if (typeof v === "string") {
+      list = [v];
+    } else if (Array.isArray(v) && v.every((x): x is string => typeof x === "string")) {
+      list = v;
+    } else {
+      throw new Error(`${sourcePath}: "requires" must be a string or string array`);
+    }
+    for (const entry of list) {
+      if (entry === "" || !REQUIRES_NAME_RE.test(entry)) {
+        throw new Error(
+          `${sourcePath}: "requires" entry must match ${REQUIRES_NAME_RE.source} (got "${entry}")`,
+        );
+      }
+    }
+    requires = Object.freeze([...list]);
+  }
+
   // body
   if (body.trim() === "") {
     throw new Error(`${sourcePath}: body must be non-empty (no prompt template)`);
   }
 
   // Reject unknown keys so typos don't silently skip.
-  const ALLOWED = new Set(["name", "description", "tier", "tool"]);
+  const ALLOWED = new Set(["name", "description", "tier", "tool", "max_turns", "requires"]);
   for (const k of Object.keys(f)) {
     if (!ALLOWED.has(k)) {
       throw new Error(
@@ -323,6 +382,8 @@ export function parseSkillFile(
     body,
     sourcePath,
     tool: toolFlag,
+    maxTurns,
+    requires,
   });
 }
 
@@ -334,6 +395,7 @@ export function loadSkillsSync(
   dir: string,
   reservedNames: ReadonlySet<string>,
   defaultTier: SkillTier,
+  loadedIntegrations: ReadonlySet<string> = new Set(),
 ): SkillLoadResult {
   const errors: SkillLoadError[] = [];
   const byName = new Map<string, Skill>();
@@ -377,6 +439,16 @@ export function loadSkillsSync(
     } catch (err) {
       errors.push({ path: skillPath, message: (err as Error).message });
       continue;
+    }
+    if (skill.requires.length > 0) {
+      const missing = skill.requires.filter((r) => !loadedIntegrations.has(r));
+      if (missing.length > 0) {
+        errors.push({
+          path: skillPath,
+          message: `skill "${skill.name}" requires unloaded integration(s): ${missing.join(", ")}; skipping`,
+        });
+        continue;
+      }
     }
     if (byName.has(skill.name)) {
       const first = byName.get(skill.name)!;

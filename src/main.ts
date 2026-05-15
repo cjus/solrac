@@ -607,6 +607,12 @@ async function main(): Promise<void> {
     // reference is shared as `EMPTY_INTEGRATIONS_TOOLS`) when integrations
     // are off so downstream `Array.isArray + length>0` checks work uniformly.
     let integrationTools: ReadonlyArray<SdkMcpToolDefinition<any>> = [];
+    // Names of integrations that successfully registered ≥1 tool. Consumed by
+    // `loadSkillsSync` to gate `requires:`-declared skills at boot rather than
+    // letting them fail opaquely on first invocation. A probe-failed integration
+    // (sources entry with `toolCount === 0`) does NOT satisfy the gate — a
+    // skill that calls notion_search needs the tool to actually exist.
+    let loadedIntegrationNames: ReadonlySet<string> = new Set();
     if (config.integrationsEnabled) {
       // PNX-168 — builtins now load from a static-import registry so the
       // compiled binary includes them. Operator dirs still load via dynamic
@@ -624,6 +630,9 @@ async function main(): Promise<void> {
       integrationToolTiers = result.toolTiers;
       integrationConfirmFormatters = result.confirmFormatters;
       integrationTools = result.tools;
+      loadedIntegrationNames = new Set(
+        result.sources.filter((s) => s.toolCount > 0).map((s) => s.name),
+      );
       if (result.tools.length > 0) {
         integrationsMcpServer = createSdkMcpServer({
           name: "solrac",
@@ -655,7 +664,12 @@ async function main(): Promise<void> {
     const skillRegistry: SkillRegistry = config.skillsEnabled
       ? (() => {
           const reserved = new Set(BOT_COMMAND_REGISTRY.map((c) => c.command));
-          const result = loadSkillsSync(config.skillsDir, reserved, config.defaultEngine);
+          const result = loadSkillsSync(
+            config.skillsDir,
+            reserved,
+            config.defaultEngine,
+            loadedIntegrationNames,
+          );
           logSkillLoadResult(config.skillsDir, result);
           return result.registry;
         })()
@@ -764,6 +778,17 @@ async function main(): Promise<void> {
         timeoutMs: config.ollamaTimeoutMs,
       });
     }
+    // PR-skills-tools — attach the tool surface to ollamaSkillDeps AFTER
+    // integrationTools/skillTools are merged and the broker is built. The
+    // `buildSkillTools` closure earlier captures ollamaSkillDeps by
+    // reference, so mutating the same object reaches every captured site.
+    // Telegram broker is wired here; the web transport rewrites the broker
+    // field in webCommandDeps below for browser-routed confirm prompts.
+    if (ollamaSkillDeps && ollamaToolsActive) {
+      ollamaSkillDeps.tools = integrationTools;
+      ollamaSkillDeps.toolTiers = integrationToolTiers;
+      ollamaSkillDeps.broker = broker;
+    }
     // PR-B — Ollama is the recommended default; probe the daemon at boot so
     // operators see a misconfiguration immediately (vs. on first user turn).
     // Non-fatal: a slow-starting daemon may not be ready yet under systemd
@@ -845,6 +870,11 @@ async function main(): Promise<void> {
         schedulerRef
           ? schedulerRef.triggerNow(name)
           : { kind: "unknown_task", name },
+      // Skills now run with full tool surface (see commands.ts::runSkill);
+      // share the same canUseTool factory + MCP server with runAgent so the
+      // interactive confirm UX and integration tool catalog are identical.
+      createCanUseTool,
+      mcpServer: integrationsMcpServer,
     };
     // Web UI transport (optional). The `webClient` was built earlier so the
     // `webBroker` could capture it; reuse the same instance here so all bus
@@ -853,9 +883,23 @@ async function main(): Promise<void> {
     let webCommandDeps: RunCommandDeps | null = null;
     let webOllamaDeps: OllamaRunDeps | null = null;
     if (webClient) {
+      // Web-routed /<skill> invocations: rewrite the broker so confirm
+      // prompts ride the SSE bus rather than Telegram (mirrors the
+      // webOllamaDeps swap below). `tools` and `toolTiers` are unchanged —
+      // only the broker differs per transport.
+      const webOllamaSkillDeps: OllamaSkillDeps | null = commandDeps.ollamaSkillDeps
+        ? {
+            ...commandDeps.ollamaSkillDeps,
+            broker:
+              commandDeps.ollamaSkillDeps.broker !== undefined
+                ? webBroker!
+                : undefined,
+          }
+        : null;
       webCommandDeps = {
         ...commandDeps,
         tg: webClient,
+        ollamaSkillDeps: webOllamaSkillDeps,
       };
       // Ollama-on-web path needs the web broker (not the Telegram broker)
       // so confirm prompts ride the SSE bus to the operator's browser
