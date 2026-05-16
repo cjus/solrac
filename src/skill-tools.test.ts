@@ -18,7 +18,11 @@ import {
   type LocalDriver,
   type LocalStreamChatOpts,
 } from "./local-driver.ts";
-import { buildSkillTools, SKILL_TOOL_PREFIX } from "./skill-tools.ts";
+import {
+  buildSkillErrorPayload,
+  buildSkillTools,
+  SKILL_TOOL_PREFIX,
+} from "./skill-tools.ts";
 import type { Skill, SkillRegistry } from "./skills.ts";
 
 const dirs: string[] = [];
@@ -142,5 +146,49 @@ describe("buildSkillTools — tool definition shape", () => {
     expect(tools[0]!.name).toBe(`${SKILL_TOOL_PREFIX}summarize`);
     expect(tools[0]!.description).toBe("Summarize text.");
     expect(Object.keys(tools[0]!.inputSchema)).toContain("args");
+  });
+});
+
+describe("buildSkillErrorPayload", () => {
+  // Regression coverage for v0.7.0 dogfooding: weak local models (gpt-oss-20b
+  // under LMStudio) treated bare `{success:false, error:"iteration_cap"}`
+  // envelopes as transient and retried 3-4× before the loop detector tripped.
+  // The hardened payload makes the non-retryability explicit so the parent
+  // model abandons the skill on the FIRST failure and produces a final answer.
+  test("returns valid MCP content shape with success:false JSON body", () => {
+    const payload = buildSkillErrorPayload("tldr", "iteration_cap");
+    expect(payload.content).toHaveLength(1);
+    expect(payload.content[0]!.type).toBe("text");
+    const parsed = JSON.parse(payload.content[0]!.text) as Record<string, unknown>;
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toBe("iteration_cap");
+  });
+
+  test("marks retryable:false and surfaces explicit don't-retry hint", () => {
+    const payload = buildSkillErrorPayload("tldr", "iteration_cap");
+    const parsed = JSON.parse(payload.content[0]!.text) as Record<string, unknown>;
+    expect(parsed.retryable).toBe(false);
+    expect(parsed.hint).toContain("Do not call 'skills__tldr' again");
+    expect(parsed.hint).toContain("same input produces the same result");
+  });
+
+  test("hint references the specific skill name (so multi-skill turns disambiguate)", () => {
+    const a = buildSkillErrorPayload("tldr", "x");
+    const b = buildSkillErrorPayload("summarize", "x");
+    const ha = (JSON.parse(a.content[0]!.text) as { hint: string }).hint;
+    const hb = (JSON.parse(b.content[0]!.text) as { hint: string }).hint;
+    expect(ha).toContain("skills__tldr");
+    expect(ha).not.toContain("skills__summarize");
+    expect(hb).toContain("skills__summarize");
+    expect(hb).not.toContain("skills__tldr");
+  });
+
+  test("preserves arbitrary error strings verbatim (not just iteration_cap)", () => {
+    const payload = buildSkillErrorPayload(
+      "tldr",
+      "chat_cost_cap: $1.0001 ≥ $1.00/hr for this chat",
+    );
+    const parsed = JSON.parse(payload.content[0]!.text) as { error: string };
+    expect(parsed.error).toBe("chat_cost_cap: $1.0001 ≥ $1.00/hr for this chat");
   });
 });

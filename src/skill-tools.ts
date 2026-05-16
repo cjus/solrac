@@ -91,6 +91,44 @@ export function skillToolName(skillName: string): string {
   return `${SKILL_TOOL_PREFIX}${skillName}`;
 }
 
+/**
+ * Error payload returned to the parent model when a skill-as-tool call fails.
+ *
+ * Why this shape: weak local models (gpt-oss-20b under LMStudio, surfaced
+ * during v0.7.0 dogfooding) treat a bare `{success:false, error:"iteration_cap"}`
+ * envelope as a transient failure and retry the same call 3-4× before the
+ * loop detector intervenes. Skill execution is deterministic for the same
+ * (skill, args) — retries can't succeed, they just waste rounds and confuse
+ * the parent's reasoning about what tools to use next. Explicit `retryable:
+ * false` + plain-prose `hint` give small models the signal they need to
+ * abandon the tool and answer with whatever information they already have.
+ *
+ * Exported for unit-testing the payload shape and for callers that need to
+ * synthesize a skill-error envelope outside the handler (e.g. context-missing
+ * defensive path).
+ */
+export function buildSkillErrorPayload(
+  skillName: string,
+  errorMessage: string,
+): { content: Array<{ type: "text"; text: string }> } {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          success: false,
+          error: errorMessage,
+          retryable: false,
+          hint:
+            `Do not call 'skills__${skillName}' again this turn — same input ` +
+            "produces the same result. Continue without this skill and answer the user " +
+            "with whatever information you already have.",
+        }),
+      },
+    ],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tool definition builder
 // ---------------------------------------------------------------------------
@@ -167,14 +205,7 @@ function buildOneSkillTool(
       if (!cx) {
         const msg = `skill tool "${skill.name}" called outside skillToolCtx — loop driver did not wrap dispatch`;
         log.error("skill_tools.no_context", { skill: skill.name });
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ success: false, error: msg }),
-            },
-          ],
-        };
+        return buildSkillErrorPayload(skill.name, msg);
       }
 
       const result = await runSkillBare(local, skill, args);
@@ -219,20 +250,11 @@ function buildOneSkillTool(
           skill: skill.name,
           error: result.errorMessage,
         });
-        // The model gets a structured error string so it can adapt — drop
-        // the call from its plan, retry with different args, etc. Mirrors
-        // the integration error envelope (success/error JSON).
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                success: false,
-                error: result.errorMessage,
-              }),
-            },
-          ],
-        };
+        // Skill execution is deterministic given the same (skill, args).
+        // Tell the parent model explicitly not to retry — weak local models
+        // otherwise burn 3-4 rounds re-calling the same failing skill before
+        // the loop detector breaks the cycle. See `buildSkillErrorPayload`.
+        return buildSkillErrorPayload(skill.name, result.errorMessage);
       }
 
       db.updateAuditEnd({

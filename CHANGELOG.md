@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — skill-as-tool error payload: tell weak models not to retry
+
+Live v0.7.0 dogfooding under `openai/gpt-oss-20b` on LMStudio surfaced a tool-loop pathology: when a skill-as-tool call hit `iteration_cap` (e.g. `skills__tldr` ran out of its single-iteration budget) the parent model treated the bare `{success:false, error:"iteration_cap"}` envelope as a transient failure and retried the same skill 3–4× before `local.tool_loop_detected` intervened at the loop-detector's threshold. Skill execution is deterministic for fixed `(skill, args)` — retries can't succeed; they just waste rounds, accumulate noise in the parent's context, and produce confused final answers. The fix expands the error envelope with explicit non-retry signaling that weak local models can act on.
+
+- **New envelope shape.** Skill-tool errors now return `{success:false, error:<raw>, retryable:false, hint:"Do not call 'skills__<name>' again this turn — same input produces the same result. Continue without this skill and answer the user with whatever information you already have."}`. The error string is preserved verbatim for operator log-grepping; the `retryable` flag + plain-prose `hint` are additive fields a parent model can read.
+- **Centralized payload builder.** `buildSkillErrorPayload(skillName, errorMessage)` exported from `src/skill-tools.ts` so both error sites (skill execution failure, missing `skillToolCtx` defensive path) share one shape. New unit tests pin the MCP `content` shape, the `retryable:false` invariant, the per-skill `hint` identifier, and arbitrary-error-string passthrough.
+- **No new dependencies.** No SDK pin bump. No anti-goal reversals.
+
+Symptom in the wild that motivated this: `auditId 220` chain under LMStudio+gpt-oss-20b — model fires `gmail_list_accounts` correctly, then unprompted `gmail_search_messages`, then 4 attempts at `skills__tldr` (each spawning a nested loop that hits its own iteration_cap), before the loop detector breaks the cycle. Final user-facing response was "I'm not sure what you'd like me to log…" — the parent's confused interpretation of repeated tldr failures rather than an answer to the actual query (`list my gmail accounts`).
+
 ## v0.7.0 — local LLM backend abstraction: Ollama + LMStudio (BREAKING)
 
 Replaces the Ollama-specific path with a generic `local` engine that supports multiple backends behind a unified driver interface (`src/local-driver.ts`). Hard cutover — every `OLLAMA_*` env var, `engine: ollama` / `tier: ollama` frontmatter value, and `/clear ollama` / `>` slash alias is rejected with a rename hint. The audit-row tag becomes three-segment `local:<backend>:<modelId>` and matches the `claude:<tier>:<modelId>` shape so cross-engine queries are symmetric. LMStudio joins Ollama as a first-class backend with its own SSE wire format, `parallel_tool_calls: false` Gemma-4 workaround, and tool-call argument-delta accumulation.
