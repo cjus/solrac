@@ -71,6 +71,7 @@ import {
   type SdkMcpToolDefinition,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Update } from "@grammyjs/types";
+import packageJson from "../package.json";
 import { runAgent } from "./agent.ts";
 import { createAllowlist, type Allowlist } from "./allowlist.ts";
 import {
@@ -543,6 +544,7 @@ async function main(): Promise<void> {
   }
 
   log.info("solrac.boot", {
+    version: packageJson.version,
     transport: config.transport,
     defaultEngine: config.defaultEngine,
     primaryModel: config.primaryModel,
