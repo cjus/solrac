@@ -1,12 +1,12 @@
 # Solrac
 
-> A self-hosted, hackable personal Agent: free local Ollama by default, Claude Sonnet/Opus on demand via Anthropic's Claude Agent SDK. Reach it from Telegram or a browser; own every audit row, permission rule, and budget cap.
+> A self-hosted, hackable personal Agent: free local LLM (Ollama or LMStudio) by default, Claude Sonnet/Opus on demand via Anthropic's Claude Agent SDK. Reach it from Telegram or a browser; own every audit row, permission rule, and budget cap.
 
 <image src="./docs/solrac.png" width="300px" />
 
 ## Why Solrac
 
-Solrac is a single-process Bun agent that bridges Telegram (and an optional browser UI) to a local Ollama model, escalating to Claude Sonnet or Opus only when you explicitly ask. It was built as part of [PNXStudios.com](https://pnxstudios.com) to manage a complex monorepo from anywhere — and, in doing so, to explore the mechanics of building a personal agent from first principles while enforcing hard cost controls and behavior auditing on every turn.
+Solrac is a single-process agent that bridges Telegram and a browser UI to a local model served by Ollama or LMStudio (operator picks via `LOCAL_BACKEND`), escalating to Claude Sonnet or Opus only when you explicitly ask. It was built as part of [PNXStudios.com](https://pnxstudios.com) to manage that complex monorepo from anywhere — and, in doing so, to explore the mechanics of building a personal agent from first principles while enforcing hard cost controls and behavior auditing on every turn.
 
 It's deliberately smaller and narrower than other personal-assistant projects:
 
@@ -15,7 +15,7 @@ It's deliberately smaller and narrower than other personal-assistant projects:
 
 Both are broader and better-resourced. **Solrac's distinct value:**
 
-- **Local-LLM-first economics.** No-prefix messages route to free Ollama; `@` and `!` are paid Claude escalations only on operator intent.
+- **Local-LLM-first economics.** No-prefix messages route to the free local engine (Ollama or LMStudio); `@` and `!` are paid Claude escalations only on operator intent.
 - **Cost enforcement, not just visibility.** Sliding hourly USD caps that *deny* turns when hit, plus a daily cost-report DM.
 - **Audit-before-acting.** Every update (allowed, denied, queue-full) writes a row to one append-only SQLite table.
 - **Single-process minimalism.** No HTTP framework, no Telegram framework runtime, no queue server, no Docker, no sub-agents. A few thousand lines of TypeScript you can read in an afternoon and fork.
