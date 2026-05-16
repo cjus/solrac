@@ -17,6 +17,7 @@ import {
   buildLocalCapabilityNote,
   buildToolCapabilityNote,
   runLocalTurn,
+  scrubLocalControlTokens,
 } from "./local.ts";
 import {
   type LocalChatEvent,
@@ -353,5 +354,49 @@ describe("runLocalTurn — token capture", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("scrubLocalControlTokens", () => {
+  test("strips paired <|channel>...<channel|> block including header content", () => {
+    const input = "<|channel>thought<channel|>It is 8:44 PM in London.";
+    expect(scrubLocalControlTokens(input)).toBe("It is 8:44 PM in London.");
+  });
+
+  test("strips multiline channel block with leading whitespace", () => {
+    const input =
+      "<|channel>thought\n<channel|>Logged: https://www.notion.so/abc";
+    expect(scrubLocalControlTokens(input)).toBe(
+      "Logged: https://www.notion.so/abc",
+    );
+  });
+
+  test("suppresses an unclosed opener mid-stream", () => {
+    expect(scrubLocalControlTokens("<|channel>thought")).toBe("");
+    expect(scrubLocalControlTokens("Hi.<|channel>par")).toBe("Hi.");
+  });
+
+  test("strips stray symmetric harmony tokens", () => {
+    expect(scrubLocalControlTokens("<|start|>hello<|end|>")).toBe("hello");
+    expect(
+      scrubLocalControlTokens("<|message|>real content<|return|>"),
+    ).toBe("real content");
+  });
+
+  test("strips orphan closing tokens", () => {
+    expect(scrubLocalControlTokens("leftover<channel|>real")).toBe(
+      "leftoverreal",
+    );
+  });
+
+  test("leaves normal text alone", () => {
+    const txt = "Pipes | are fine. <html> tags too.";
+    expect(scrubLocalControlTokens(txt)).toBe(txt);
+  });
+
+  test("handles multiple blocks in one buffer", () => {
+    const input =
+      "<|channel>thought<channel|>first.<|channel>analysis<channel|>second.";
+    expect(scrubLocalControlTokens(input)).toBe("first.second.");
   });
 });
