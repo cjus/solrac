@@ -55,7 +55,7 @@ Files renamed/added:
 - `src/ollama.test.ts` + `src/ollama-tools.test.ts` → `src/local.test.ts`, `src/local-tools.test.ts`, new `src/local-driver.test.ts`.
 - `test/smokes/ollama.ts` → `test/smokes/local.ts`.
 
-## Unreleased — scheduler: switch to unix cron (BREAKING TASK.md format)
+## v0.8.0 — scheduler: switch to unix cron (BREAKING TASK.md format)
 
 Replaces the three-form schedule grammar (`every <dur>` / `daily_at HH:MM` / `at <ISO8601>`) with 5-field unix cron + optional per-task `tz:` (default: `$TZ` env / host runtime tz). One grammar closes four real gaps in a single change: time-of-day windows, day-of-week filtering, local-timezone scheduling, and anchored cadence. Predicate: the live stretch trigger on 2026-05-15 ("every 30m between 12:00 and 18:00 weekdays Denver") required thirteen separate `daily_at` TASK.md files under the old grammar.
 
