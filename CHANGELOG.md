@@ -1,14 +1,36 @@
 # Changelog
 
-## Unreleased — skill-as-tool error payload: tell weak models not to retry
+## v0.7.1 — weak-local-model hardening + docs
+
+Four post-v0.7.0 fixes that together make LMStudio + small open-weight models (gpt-oss-20b class) usable on long-running chats. No breaking changes, no new env vars, no SDK pin bump.
+
+### Skill-as-tool error payload: tell weak models not to retry (#24)
 
 Live v0.7.0 dogfooding under `openai/gpt-oss-20b` on LMStudio surfaced a tool-loop pathology: when a skill-as-tool call hit `iteration_cap` (e.g. `skills__tldr` ran out of its single-iteration budget) the parent model treated the bare `{success:false, error:"iteration_cap"}` envelope as a transient failure and retried the same skill 3–4× before `local.tool_loop_detected` intervened at the loop-detector's threshold. Skill execution is deterministic for fixed `(skill, args)` — retries can't succeed; they just waste rounds, accumulate noise in the parent's context, and produce confused final answers. The fix expands the error envelope with explicit non-retry signaling that weak local models can act on.
 
 - **New envelope shape.** Skill-tool errors now return `{success:false, error:<raw>, retryable:false, hint:"Do not call 'skills__<name>' again this turn — same input produces the same result. Continue without this skill and answer the user with whatever information you already have."}`. The error string is preserved verbatim for operator log-grepping; the `retryable` flag + plain-prose `hint` are additive fields a parent model can read.
 - **Centralized payload builder.** `buildSkillErrorPayload(skillName, errorMessage)` exported from `src/skill-tools.ts` so both error sites (skill execution failure, missing `skillToolCtx` defensive path) share one shape. New unit tests pin the MCP `content` shape, the `retryable:false` invariant, the per-skill `hint` identifier, and arbitrary-error-string passthrough.
-- **No new dependencies.** No SDK pin bump. No anti-goal reversals.
 
 Symptom in the wild that motivated this: `auditId 220` chain under LMStudio+gpt-oss-20b — model fires `gmail_list_accounts` correctly, then unprompted `gmail_search_messages`, then 4 attempts at `skills__tldr` (each spawning a nested loop that hits its own iteration_cap), before the loop detector breaks the cycle. Final user-facing response was "I'm not sure what you'd like me to log…" — the parent's confused interpretation of repeated tldr failures rather than an answer to the actual query (`list my gmail accounts`).
+
+### Surface LMStudio inline-error frames + empty-stream diagnostic (#25)
+
+LMStudio sends server-side errors as HTTP 200 SSE frames (`{"error":{"message":"…"}, …}`), not error statuses. The driver parser only knew `model`/`choices`/`usage`, so these frames fell through and turns rendered as `(empty response)` with no diagnostic — operators had no idea LMStudio had told us what went wrong (e.g. context-length overruns from undersized model windows).
+
+- **Parser now yields `kind:"error"` on `frame.error`**, mirroring Ollama's existing branch. The message propagates through `runStreamingRound` → `errorMessage` → audit row `status='error'` → rendered `❌ error: …` reply.
+- **New `local.lmstudio_empty_stream` warn** as a safety net for future protocol drift. Captures up to 30 raw `data:` payloads (400 chars each) iff both text and tool-call event counters end at zero. Happy path is silent.
+- **Docs across 4 files**: ARCHITECTURE Tricky Seam §10, RUNBOOK failure table (context-length + empty-stream rows), CONFIG LMStudio context-length sizing section, OPERATIONS log-events entry.
+
+### Strip harmony-style control tokens from local-engine render (#26)
+
+Local models (gpt-oss variants surfaced via Ollama/LMStudio) leak harmony channel markers like `<|channel>thought<channel|>` and stray `<|start|>` / `<|end|>` / `<|message|>` / `<|return|>` tokens into the user-facing Telegram/web reply.
+
+- **`scrubLocalControlTokens(text)` in `src/local.ts`** applied at all four render touch-points (`renderStreamingStub`, `renderFinal`, `renderToolLoopStub`, `renderToolLoopFinal`). Three-pass scrubber: collapse paired `<|name>...<name|>` blocks (drops channel-header content), suppress unclosed openers at end of buffer (prevents mid-stream flicker), strip stray symmetric harmony tokens and orphan closers.
+- **Display-only** — `audit.response` and `recentChatTurns` history still see the raw model output for forensics. **Local engine only** — Claude tiers untouched.
+
+### README: mention LMStudio alongside Ollama (#27)
+
+Landing-page tagline + "Why Solrac" paragraph + Local-LLM-first bullet all read as Ollama-only, even though the rest of the doc set has covered both backends since v0.7.0's hard cutover. Three copy edits in `README.md` to keep the surface consistent with `LOCAL_BACKEND=ollama|lmstudio`.
 
 ## v0.7.0 — local LLM backend abstraction: Ollama + LMStudio (BREAKING)
 
