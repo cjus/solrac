@@ -1058,6 +1058,16 @@ If we reordered (offset before claim), a crash between steps 2 and 3 would re-pr
 
 **See also.** `docs/INSTALL.md` for the operator-facing install flow; `scripts/build.ts` for the multi-target build runner; `text-modules.d.ts` for the ambient `*.md`/`*.html`/`*.css`/`*.js` declarations that satisfy `tsc --noEmit`.
 
+### 10. LMStudio inline-error SSE frames (HTTP 200)
+
+**Problem.** Ollama signals request-level errors via HTTP status codes (caught by `LocalDriverError` in `streamChat`'s pre-stream `res.ok` check). **LMStudio does not.** Context-length overruns, prompt-template mismatches, and similar server-side rejections arrive with **HTTP 200** and a single SSE frame shaped `{"error":{"message":"…"},"message":"…"}`, often followed by `[DONE]` or an immediate stream close. The driver's frame parser previously only knew about `model`/`choices`/`usage`, so these frames fell through, the consumer saw zero events, and the UI rendered `(empty response)` with no diagnostic — a silent failure where the operator had no way to know LMStudio actually told us what went wrong.
+
+**Solution.** `LmstudioSseFrame` has an `error?: { message?: string } | string` field; the parse loop in `createLmstudioDriver` checks `frame.error` immediately after JSON-parsing each frame and yields `{ kind: "error", message }` (mirroring the Ollama-side `frame.error` branch at the top of `streamChat`). `runStreamingRound` then breaks on `kind:"error"` and the message propagates through `errorMessage` to the `local.done` audit row and the rendered `❌ error: …` reply.
+
+**Diagnostic layer.** A separate guard, `maybeLogEmptyStream` in `local-driver.ts`, captures up to 30 raw `data:` payloads (truncated to 400 chars each) and emits `local.lmstudio_empty_stream` at warn level if both text and tool-call counters end at zero. This is the safety net for *future* unknown frame shapes — if LMStudio adds a new error envelope or content channel, the raw frames land in the log so the cause is recoverable without a wire-capture rerun. Happy path is silent; only fires when no events were yielded.
+
+**Implication.** Adding a new LMStudio response shape requires either (a) extending `LmstudioSseFrame` with the new field and adding a parse branch, or (b) extending the error detection. Either way, when a turn fails, **check `local.lmstudio_empty_stream` warns first** — they're the canary for protocol drift between releases.
+
 ---
 
 ## Logging

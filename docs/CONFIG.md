@@ -86,6 +86,30 @@ This collides with Anthropic's per-model **input tokens per minute (ITPM)** rate
 
 If you see `429 · This request would exceed your organization's rate limit of N input tokens per minute`, raise your Anthropic plan tier rather than tuning Solrac. Routing heavy turns through the secondary tier (`!` prefix → Opus) uses a separate ITPM bucket and may unblock you in the short term.
 
+## LMStudio context-length sizing
+
+LMStudio operators must size the **model's loaded context window** to fit Solrac's per-turn input. This is a model-loader knob (set in the LMStudio UI when loading the model, or via `lms load --context-length <N>`), **not** a Solrac env var — Solrac doesn't control it. Get this wrong and every turn fails with `❌ error: local error: The number of tokens to keep from the initial prompt is greater than the context length…` ([RUNBOOK.md#diagnosis](./RUNBOOK.md#diagnosis)).
+
+**Per-turn input shape** (worst case, tools-on with the blessed integrations enabled):
+
+| Component | Approx tokens |
+|-----------|---------------|
+| `SOUL.md` + capability note (lists all tool names) | 0.3-0.5K |
+| Tool schemas in the OpenAI `tools` array (~25 tools — `notion__*`, `gmail__*`, `time_*`, `echo`, plus skills) | **6-10K** |
+| `SOLRAC.md` overlay (operator-edited) | 0.2-1K |
+| Chat history (capped by `LOCAL_HISTORY_LIMIT`, default 6 turns) | 1-5K |
+| Cross-engine bridge block (when present) | 0.2-2K |
+| User prompt | varies |
+| **Floor (idle chat, history full)** | **~10-15K** |
+
+**Recommended context length: 16K minimum, 32K sweet spot.** 16K leaves comfortable headroom for a chat that has filled `LOCAL_HISTORY_LIMIT`; 32K covers operators who paste large documents into the prompt.
+
+**Costs of going higher.** KV cache memory pre-allocates linearly with context length (~2-3 GB at 16K, ~16-24 GB at 128K, ~32-48 GB at 256K for a 26B model on Apple Silicon — comes straight out of unified memory). Prompt-eval latency on a *filled* context is O(n²); per-token decode latency scales with cached length. **Idle context costs nothing extra** — these costs only bite when you actually use the headroom. Don't pre-allocate 128K+ unless you're genuinely processing long inputs.
+
+**Effective vs nominal context.** Most models that advertise 128K+ degrade noticeably past their training distribution (the RULER and "lost in the middle" benchmarks). Loading a 26B Gemma-derived model at its nominal 256K rarely buys real-world quality past 32-64K — wasted RAM either way.
+
+**Model selection gotcha.** Some MLX repacks (notably community Gemma variants like `gemma-4-26b-a4b-it-mlx`) silently dropped the tool-call branch from their chat template. When `tools` is in the request body the model emits zero output. Solrac's diagnostic catches this as `local.lmstudio_empty_stream` — see [RUNBOOK.md](./RUNBOOK.md#diagnosis). First-class OpenAI tool-calling models (Qwen 2.5 instruct, Llama 3.1 instruct) avoid this entirely.
+
 ## Example `.env`
 
 ```sh
