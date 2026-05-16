@@ -221,6 +221,7 @@ On boot, `solrac.boot` is logged with the non-secret summary:
   "ts": "...",
   "level": "info",
   "msg": "solrac.boot",
+  "version": "0.7.1",
   "transport": "poll",
   "defaultEngine": "local",
   "primaryModel": "claude-sonnet-4-6",
