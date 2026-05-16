@@ -416,11 +416,30 @@ function formatDriverError(err: LocalDriverError, timeoutMs: number): string {
   }
 }
 
+// Strip harmony-style control-token leaks from local models (gpt-oss and
+// similar variants surfaced via Ollama or LMStudio). Three passes:
+//   1. Paired blocks `<|name>...<name|>` — drop the whole header (channel
+//      name + markers).
+//   2. Unclosed opener `<|name>` at end of buffer — suppress until the
+//      closing marker arrives in a later streaming delta.
+//   3. Stray symmetric tokens (`<|start|>`, `<|end|>`, `<|message|>`) and
+//      orphan closers — drop the tokens themselves.
+// Display-only: applied at render time. The raw model output is preserved
+// in `audit.response` for forensics and in `recentChatTurns` history.
+export function scrubLocalControlTokens(text: string): string {
+  let out = text.replace(/<\|[^<>|]+>[\s\S]*?<[^<>|]+\|>/g, "");
+  const openerIdx = out.search(/<\|[^<>|]+>/);
+  if (openerIdx !== -1) out = out.slice(0, openerIdx);
+  out = out.replace(/<\|[^<>|]+\|>|<[^<>|]+\|>/g, "");
+  return out.replace(/^\s+/, "");
+}
+
 function renderStreamingStub(text: string): Rendered {
-  if (!text.trim()) return { html: THINKING_STUB, markdown: THINKING_STUB };
+  const scrubbed = scrubLocalControlTokens(text);
+  if (!scrubbed.trim()) return { html: THINKING_STUB, markdown: THINKING_STUB };
   return {
-    html: truncate(mdToTelegramHtml(text), TELEGRAM_TEXT_MAX),
-    markdown: text,
+    html: truncate(mdToTelegramHtml(scrubbed), TELEGRAM_TEXT_MAX),
+    markdown: scrubbed,
   };
 }
 
@@ -430,9 +449,10 @@ function renderFinal(
   model: string,
   elapsedSec: number,
 ): Rendered {
-  const hasText = text.trim().length > 0;
-  const htmlBody = hasText ? mdToTelegramHtml(text) : "(empty response)";
-  const mdBody = hasText ? text : "(empty response)";
+  const scrubbed = scrubLocalControlTokens(text);
+  const hasText = scrubbed.trim().length > 0;
+  const htmlBody = hasText ? mdToTelegramHtml(scrubbed) : "(empty response)";
+  const mdBody = hasText ? scrubbed : "(empty response)";
   const tag = `local:${backend}:${model}`;
   const htmlFooter = `<i>✅ ${htmlEscapeText(tag)} · ${elapsedSec.toFixed(1)}s</i>`;
   const mdFooter = `*✅ ${tag} · ${elapsedSec.toFixed(1)}s*`;
@@ -640,6 +660,7 @@ function renderToolLoopStub(
   text: string,
   toolNames: ReadonlyArray<string>,
 ): Rendered & { key: string } {
+  const scrubbed = scrubLocalControlTokens(text);
   const htmlParts: string[] = [];
   const mdParts: string[] = [];
   if (toolNames.length > 0) {
@@ -647,9 +668,9 @@ function renderToolLoopStub(
     htmlParts.push(`⚙️ <i>${htmlEscapeText(names)}</i>`);
     mdParts.push(`*⚙️ ${names}*`);
   }
-  if (text.trim()) {
-    htmlParts.push(mdToTelegramHtml(text));
-    mdParts.push(text);
+  if (scrubbed.trim()) {
+    htmlParts.push(mdToTelegramHtml(scrubbed));
+    mdParts.push(scrubbed);
   } else {
     htmlParts.push(THINKING_STUB);
     mdParts.push(THINKING_STUB);
@@ -667,9 +688,10 @@ function renderToolLoopFinal(
   toolsFired: number,
   iterationCapHit: boolean,
 ): Rendered {
-  const hasText = text.trim().length > 0;
-  const htmlBody = hasText ? mdToTelegramHtml(text) : "(empty response)";
-  const mdBody = hasText ? text : "(empty response)";
+  const scrubbed = scrubLocalControlTokens(text);
+  const hasText = scrubbed.trim().length > 0;
+  const htmlBody = hasText ? mdToTelegramHtml(scrubbed) : "(empty response)";
+  const mdBody = hasText ? scrubbed : "(empty response)";
   const capChip = iterationCapHit
     ? `⚠️ stopped after ${toolsFired} tool iterations · `
     : "";
