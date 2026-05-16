@@ -392,12 +392,36 @@ interface LmstudioSseFrame {
   model?: string;
   choices?: ReadonlyArray<LmstudioSseChoice>;
   usage?: { prompt_tokens?: number; completion_tokens?: number };
+  // LMStudio inlines errors inside the SSE stream rather than via HTTP status —
+  // e.g. context-length overruns arrive here with HTTP 200. Without surfacing
+  // this, the stream looks "empty" to the consumer and the user sees the
+  // generic "(empty response)" stub.
+  error?: { message?: string } | string;
 }
 
 interface ToolCallAccumulator {
   id?: string;
   name: string;
   argsBuffer: string;
+}
+
+// Caps on the empty-stream diagnostic buffer — bounded so a runaway stream
+// (huge content + zero parsed events somehow) can't blow up the log line.
+const RAW_FRAME_BUFFER_MAX = 30;
+const RAW_FRAME_TRUNC = 400;
+
+function maybeLogEmptyStream(args: {
+  model: string;
+  textCharsEmitted: number;
+  toolCallsEmitted: number;
+  rawFrameBuffer: ReadonlyArray<string>;
+}): void {
+  if (args.textCharsEmitted > 0 || args.toolCallsEmitted > 0) return;
+  log.warn("local.lmstudio_empty_stream", {
+    model: args.model,
+    frameCount: args.rawFrameBuffer.length,
+    frames: args.rawFrameBuffer,
+  });
 }
 
 function lmstudioSerializeMessage(m: LocalChatMessage): Record<string, unknown> {
@@ -537,6 +561,13 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
       // by stableStringify of `{name, args}` so re-ordered arg keys don't slip
       // through.
       const emittedDedup = new Set<string>();
+      // Diagnostic capture for the "empty stream" failure mode (some models
+      // close the SSE with `[DONE]` immediately when `tools` is in the body —
+      // template lacks tool branch). We buffer raw `data:` payloads and dump
+      // them on close iff zero text + zero tool calls were emitted.
+      const rawFrameBuffer: string[] = [];
+      let textCharsEmitted = 0;
+      let toolCallsEmitted = 0;
 
       function emitAccumulated(): LocalChatEvent[] {
         const events: LocalChatEvent[] = [];
@@ -595,9 +626,19 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
             }
             if (dataLines.length === 0) continue;
             const data = dataLines.join("\n");
+            if (rawFrameBuffer.length < RAW_FRAME_BUFFER_MAX) {
+              rawFrameBuffer.push(data.slice(0, RAW_FRAME_TRUNC));
+            }
             if (data === "[DONE]") {
-              // Emit any pending accumulated tool calls before done.
-              for (const evt of emitAccumulated()) yield evt;
+              const pending = emitAccumulated();
+              toolCallsEmitted += pending.length;
+              for (const evt of pending) yield evt;
+              maybeLogEmptyStream({
+                model: opts.model,
+                textCharsEmitted,
+                toolCallsEmitted,
+                rawFrameBuffer,
+              });
               yield { kind: "done", inputTokens, outputTokens };
               return;
             }
@@ -610,6 +651,14 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
                 data: data.slice(0, 120),
               });
               continue;
+            }
+            if (frame.error !== undefined) {
+              const msg =
+                typeof frame.error === "string"
+                  ? frame.error
+                  : (frame.error.message ?? "lmstudio returned an error frame");
+              yield { kind: "error", message: msg };
+              return;
             }
             if (!modelChecked && typeof frame.model === "string" && frame.model.length > 0) {
               modelChecked = true;
@@ -642,6 +691,7 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
             const delta = choice.delta;
             if (delta) {
               if (typeof delta.content === "string" && delta.content.length > 0) {
+                textCharsEmitted += delta.content.length;
                 yield { kind: "text", delta: delta.content };
               }
               if (Array.isArray(delta.tool_calls)) {
@@ -666,7 +716,9 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
             // one assistant message per streamed completion so in practice
             // this fires once near the end.
             if (choice.finish_reason) {
-              for (const evt of emitAccumulated()) yield evt;
+              const pending = emitAccumulated();
+              toolCallsEmitted += pending.length;
+              for (const evt of pending) yield evt;
             }
           }
         }
@@ -683,7 +735,15 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
 
       // Stream ended without a `[DONE]` line (some servers omit it). Flush
       // any pending tool calls and emit done with whatever usage we saw.
-      for (const evt of emitAccumulated()) yield evt;
+      const pending = emitAccumulated();
+      toolCallsEmitted += pending.length;
+      for (const evt of pending) yield evt;
+      maybeLogEmptyStream({
+        model: opts.model,
+        textCharsEmitted,
+        toolCallsEmitted,
+        rawFrameBuffer,
+      });
       yield { kind: "done", inputTokens, outputTokens };
     },
   };

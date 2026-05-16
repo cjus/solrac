@@ -368,6 +368,7 @@ Canonical event names:
 - `local.final_send_failed` — final fallback send (when the stub creation itself failed earlier)
 - `local.disabled_ack_failed` / `local.usage_ack_failed` — couldn't reply with the disabled / usage hint
 - `local.boot_health_failed` — backend health probe failed at boot (`/api/tags` for Ollama, `/v1/models` for LMStudio); non-fatal warn — daemon may come up after Solrac under systemd
+- `local.lmstudio_empty_stream` — LMStudio closed the SSE stream with zero text + zero tool-call events. Carries up to 30 raw `data:` payloads (truncated to 400 chars each) for diagnosis. Fires only when no events were yielded; happy path is silent. See [ARCHITECTURE.md tricky seam §10](./ARCHITECTURE.md#10-lmstudio-inline-error-sse-frames-http-200) and [RUNBOOK.md](./RUNBOOK.md#diagnosis) for triage steps.
 - `local.done` — per-turn summary (backend, model, elapsedSec, inputTokens, outputTokens, isError)
 
 ### Policy
