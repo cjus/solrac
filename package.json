@@ -1,6 +1,6 @@
 {
   "name": "solrac",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Self-hosted Claude-Code-style agent over Telegram (Bun runtime)",
   "license": "MIT",
   "author": "Carlos Justiniano <carlos@pnxstudios.com>",
