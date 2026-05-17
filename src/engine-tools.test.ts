@@ -1,35 +1,36 @@
 /**
- * @fileoverview Unit tests for `local-tools.ts`.
+ * @fileoverview Unit tests for `engine-tools.ts`.
  * @proves Schema converter shape, thought-fence stripper, and the
  *         multi-round `runToolLoop` driver behaviors that the
- *         `local-driver.test.ts` event-stream tests don't already cover.
+ *         `local-driver.test.ts` / `remote-driver.test.ts` event-stream
+ *         tests don't already cover.
  *
- * `runToolLoop` is tested via a hand-rolled fake `LocalDriver` that yields
- * scripted `LocalChatEvent` sequences — that isolates loop logic from
- * wire-format concerns (already covered in `local-driver.test.ts`).
+ * `runToolLoop` is tested via a hand-rolled fake `EngineDriver` that yields
+ * scripted `EngineChatEvent` sequences — that isolates loop logic from
+ * wire-format concerns (already covered in the driver-impl test files).
  */
 
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import {
-  type LocalChatEvent,
-  type LocalDriver,
-  type LocalStreamChatOpts,
-} from "./local-driver.ts";
+  type EngineChatEvent,
+  type EngineDriver,
+  type EngineStreamChatOpts,
+} from "./engine-driver.ts";
 import {
-  mcpToLocalTools,
+  mcpToEngineTools,
   runToolLoop,
   stripThoughts,
   TOOL_RESULT_MAX_LEN,
-} from "./local-tools.ts";
+} from "./engine-tools.ts";
 import { createLoopDetector, type ConfirmationBroker } from "./policy.ts";
 
 // ---------------------------------------------------------------------------
 // Pure converter tests
 // ---------------------------------------------------------------------------
 
-describe("mcpToLocalTools", () => {
+describe("mcpToEngineTools", () => {
   function makeTool(
     name: string,
     inputSchema: z.ZodRawShape,
@@ -44,7 +45,7 @@ describe("mcpToLocalTools", () => {
   }
 
   test("converts a simple object schema with required + optional fields", () => {
-    const out = mcpToLocalTools([
+    const out = mcpToEngineTools([
       makeTool("time_now", {
         tz: z.string().describe("IANA timezone"),
         format: z.enum(["iso", "human"]).optional(),
@@ -65,7 +66,7 @@ describe("mcpToLocalTools", () => {
   });
 
   test("preserves descriptions on individual fields", () => {
-    const out = mcpToLocalTools([
+    const out = mcpToEngineTools([
       makeTool("t", { foo: z.string().describe("the foo") }),
     ]);
     const params = out[0]!.function.parameters as Record<string, unknown>;
@@ -74,7 +75,7 @@ describe("mcpToLocalTools", () => {
   });
 
   test("empty tools list → empty output", () => {
-    expect(mcpToLocalTools([])).toEqual([]);
+    expect(mcpToEngineTools([])).toEqual([]);
   });
 });
 
@@ -115,14 +116,15 @@ describe("TOOL_RESULT_MAX_LEN", () => {
 // ---------------------------------------------------------------------------
 
 // Scriptable fake — each call to `streamChat` consumes the next event batch.
-function scriptedDriver(rounds: Array<LocalChatEvent[]>): LocalDriver {
+function scriptedDriver(rounds: Array<EngineChatEvent[]>): EngineDriver {
   let i = 0;
   return {
     backend: "ollama",
+    mode: "local",
     async probe() {
       return { ok: true };
     },
-    async *streamChat(_opts: LocalStreamChatOpts): AsyncIterable<LocalChatEvent> {
+    async *streamChat(_opts: EngineStreamChatOpts): AsyncIterable<EngineChatEvent> {
       const events = rounds[i++] ?? [];
       for (const evt of events) yield evt;
     },
@@ -142,7 +144,7 @@ describe("runToolLoop — single round, no tools", () => {
     const driver = scriptedDriver([
       [
         { kind: "text", delta: "hello world" },
-        { kind: "done", inputTokens: 5, outputTokens: 3 },
+        { kind: "done", inputTokens: 5, outputTokens: 3 , costUsd: null },
       ],
     ]);
     const result = await runToolLoop(
@@ -208,12 +210,12 @@ describe("runToolLoop — with tool calls", () => {
           kind: "tool_call",
           call: { id: "call_1", function: { name: "echo", arguments: { msg: "hi" } } },
         },
-        { kind: "done", inputTokens: 8, outputTokens: 4 },
+        { kind: "done", inputTokens: 8, outputTokens: 4 , costUsd: null },
       ],
       // Round 2: text-only finalization
       [
         { kind: "text", delta: "done!" },
-        { kind: "done", inputTokens: 20, outputTokens: 2 },
+        { kind: "done", inputTokens: 20, outputTokens: 2 , costUsd: null },
       ],
     ]);
 
@@ -235,7 +237,7 @@ describe("runToolLoop — with tool calls", () => {
         signal: new AbortController().signal,
         tools: new Map([["echo", echoTool]]),
         toolTiers: new Map([["echo", "auto"]]),
-        toolDefs: mcpToLocalTools([echoTool]),
+        toolDefs: mcpToEngineTools([echoTool]),
         broker: noopBroker,
         loopDetector: createLoopDetector(),
         maxIterations: 4,
@@ -263,11 +265,11 @@ describe("runToolLoop — with tool calls", () => {
           kind: "tool_call",
           call: { function: { name: "dangerous", arguments: {} } },
         },
-        { kind: "done", inputTokens: 5, outputTokens: 1 },
+        { kind: "done", inputTokens: 5, outputTokens: 1 , costUsd: null },
       ],
       [
         { kind: "text", delta: "ok, moving on" },
-        { kind: "done", inputTokens: 10, outputTokens: 3 },
+        { kind: "done", inputTokens: 10, outputTokens: 3 , costUsd: null },
       ],
     ]);
 
@@ -289,7 +291,7 @@ describe("runToolLoop — with tool calls", () => {
         signal: new AbortController().signal,
         tools: new Map([["dangerous", dangerousTool]]),
         toolTiers: new Map([["dangerous", "auto"]]),
-        toolDefs: mcpToLocalTools([dangerousTool]),
+        toolDefs: mcpToEngineTools([dangerousTool]),
         broker: noopBroker,
         loopDetector: createLoopDetector(),
         maxIterations: 4,
@@ -310,17 +312,17 @@ describe("runToolLoop — iteration cap", () => {
   test("cap hit fires the finalize round and sets iterationCapHit", async () => {
     // Build N+1 scripted rounds: N tool-calling rounds (cap) + 1 finalize round.
     const cap = 2;
-    const rounds: Array<LocalChatEvent[]> = [];
+    const rounds: Array<EngineChatEvent[]> = [];
     for (let i = 0; i < cap; i++) {
       rounds.push([
         { kind: "tool_call", call: { function: { name: "echo", arguments: { i } } } },
-        { kind: "done", inputTokens: i === 0 ? 5 : 30, outputTokens: 2 },
+        { kind: "done", inputTokens: i === 0 ? 5 : 30, outputTokens: 2 , costUsd: null },
       ]);
     }
     // The finalize round (after cap nudge).
     rounds.push([
       { kind: "text", delta: "best effort answer" },
-      { kind: "done", inputTokens: 40, outputTokens: 5 },
+      { kind: "done", inputTokens: 40, outputTokens: 5 , costUsd: null },
     ]);
     const driver = scriptedDriver(rounds);
 
@@ -340,7 +342,7 @@ describe("runToolLoop — iteration cap", () => {
         signal: new AbortController().signal,
         tools: new Map([["echo", echoTool]]),
         toolTiers: new Map([["echo", "auto"]]),
-        toolDefs: mcpToLocalTools([echoTool]),
+        toolDefs: mcpToEngineTools([echoTool]),
         broker: noopBroker,
         loopDetector: createLoopDetector(),
         maxIterations: cap,

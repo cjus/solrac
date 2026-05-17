@@ -76,13 +76,14 @@ import type { ChatHistoryRow, SolracDb } from "./db.ts";
 import type { IntegrationTier } from "./integrations.ts";
 import { log } from "./log.ts";
 import { mdToTelegramHtml } from "./markdown.ts";
-import { buildToolCapabilityNote } from "./local.ts";
 import {
-  type LocalChatMessage,
-  type LocalDriver,
-  LocalDriverError,
-} from "./local-driver.ts";
-import { mcpToLocalTools, runToolLoop } from "./local-tools.ts";
+  type EngineChatMessage,
+  type EngineDriver,
+  EngineDriverError,
+} from "./engine-driver.ts";
+import { buildLocalToolCapabilityNote } from "./local-driver.ts";
+import { buildRemoteToolCapabilityNote } from "./remote-driver.ts";
+import { mcpToEngineTools, runToolLoop } from "./engine-tools.ts";
 import {
   createLoopDetector,
   createPostToolUseHook,
@@ -340,15 +341,15 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-// Subset of LocalRunDeps the skill path needs. Skills don't reuse runLocalTurn
+// Subset of EngineRunDeps the skill path needs. Skills don't reuse runEngineTurn
 // because they don't carry history or SOLRAC.md overlays and have no streaming
 // stub — but they DO route through the same tool loop (`runToolLoop`) when
 // tool deps are wired, so the skill body can call `mcp__solrac__*` / `skills__*`
 // tools end-to-end. When tool deps are absent or `tools` is empty, `runSkillBare`
 // falls through to a single-shot driver call (preserving back-compat for pure
 // text-transform skills like `tldr`).
-export interface LocalSkillDeps {
-  driver: LocalDriver;
+export interface EngineSkillDeps {
+  driver: EngineDriver;
   model: string;
   timeoutMs: number;
   // SOUL.md text loaded once at boot. Sent as the system message so local
@@ -391,12 +392,17 @@ export interface RunCommandDeps {
   // `null` when the local engine isn't configured — a `tier: local` skill in
   // that case fails loud with a config error rather than silently routing to
   // Claude.
-  localSkillDeps: LocalSkillDeps | null;
-  // `/help` renders the engine section dynamically from these two fields so
+  localSkillDeps: EngineSkillDeps | null;
+  // `/help` renders the engine section dynamically from these fields so
   // the card matches the deploy. Static text would lie in three of four
-  // config combinations (default-local vs default-Claude × tools on/off).
+  // config combinations (default-local vs default-Claude × tools on/off ×
+  // local-mode vs remote-mode).
   defaultEngine: "local" | "primary" | "secondary";
   localToolsEnabled: boolean;
+  // Engine-slot mode. `null` when the slot is disabled (Claude-only deploy);
+  // `"local"` for on-host Ollama/LMStudio; `"remote"` for OpenRouter. Drives
+  // the help card's cost framing for the no-prefix path.
+  engineSlotMode?: "local" | "remote" | null;
   // Phase 2 — scheduled tasks operator surface. Both optional so deploys
   // with `SOLRAC_TASKS_ENABLED=false` can build the deps object without
   // dummy values; `/tasks` surfaces a "scheduler disabled" reply when the
@@ -1126,6 +1132,7 @@ async function runHelp(
   updateId: number,
 ): Promise<void> {
   const md = renderHelpMarkdown(deps.skillRegistry, {
+    engineSlotMode: deps.engineSlotMode,
     defaultEngine: deps.defaultEngine,
     localToolsEnabled: deps.localToolsEnabled,
   });
@@ -1136,19 +1143,26 @@ async function runHelp(
   writeSystemAudit(deps, msg, updateId, "help_shown", "ok");
 }
 
-// Engine section reads `defaultEngine` + `localToolsEnabled` and renders
-// one of the matrix-shaped descriptions. Static text would lie in three
-// of four deploys (default-Claude vs default-local, tools on/off); the
-// dynamic render is one config-read per `/help` call which is free.
+// Engine section reads `defaultEngine` + `localToolsEnabled` + engine-slot
+// mode and renders one of the matrix-shaped descriptions. Static text would
+// lie in many of these deploys (default-Claude vs default-engine-slot,
+// local vs remote mode, tools on/off); the dynamic render is one config-read
+// per `/help` call which is free.
 function renderEngineSection(opts: {
   defaultEngine: "local" | "primary" | "secondary";
   localToolsEnabled: boolean;
+  // null when the engine slot is disabled (no on-host LLM, no OpenRouter).
+  // `"local"` = Ollama/LMStudio on-host; `"remote"` = OpenRouter. The cost
+  // framing in the description differs — local is free, remote is billed.
+  engineSlotMode?: "local" | "remote" | null;
 }): string[] {
   const lines: string[] = ["**Engines** (first character of your message):", ""];
   if (opts.defaultEngine === "local") {
+    const mode = opts.engineSlotMode ?? "local";
+    const costFraming = mode === "remote" ? "per-token via OpenRouter" : "free";
     const localDesc = opts.localToolsEnabled
-      ? "local engine (free, with operator-authored tools)"
-      : "local engine (free, no tools)";
+      ? `${mode} engine (${costFraming}, with operator-authored tools)`
+      : `${mode} engine (${costFraming}, no tools)`;
     lines.push(`- plain text → ${localDesc} *(default)*`);
     lines.push("- `@` → primary Claude (Sonnet) — heavier reasoning");
     lines.push("- `!` → secondary Claude (Opus) — heaviest reasoning, costs more");
@@ -1191,6 +1205,7 @@ export function renderHelpMarkdown(
   opts: {
     defaultEngine: "local" | "primary" | "secondary";
     localToolsEnabled: boolean;
+    engineSlotMode?: "local" | "remote" | null;
   },
 ): string {
   const head = ["## 🤖 Solrac help", "", ...renderEngineSection(opts), "", HELP_COMMANDS_MD];
@@ -1523,7 +1538,7 @@ function writeSkillAudit(
 // (`runLocalSkill`) and the tool-call path (`skill-tools.ts::dispatch`) wrap
 // this with their own audit + reply / return-string handling.
 //
-// **RECURSION SAFETY INVARIANT** — when `LocalSkillDeps` is wired with
+// **RECURSION SAFETY INVARIANT** — when `EngineSkillDeps` is wired with
 // `tools/toolTiers/broker`, the skill body sees the full MCP catalog MINUS
 // its own `skills__<self>` entry (recursion guard). The regression test in
 // `skill-tools.test.ts` asserts that filter — keep both in sync.
@@ -1539,13 +1554,13 @@ export interface RunSkillBareResult {
 }
 
 export async function runSkillBare(
-  local: LocalSkillDeps,
+  local: EngineSkillDeps,
   skill: Skill,
   args: string,
 ): Promise<RunSkillBareResult> {
   // Tool surface wired → route through the tool loop so the body can call
   // `mcp__solrac__*` / `skills__*` exactly like a regular local turn.
-  // Mirrors the same gate in `runLocalTurn`.
+  // Mirrors the same gate in `runEngineTurn`.
   if (
     local.tools !== undefined &&
     local.tools.length > 0 &&
@@ -1556,7 +1571,7 @@ export async function runSkillBare(
   }
 
   const prompt = renderSkillTemplate(skill.body, args);
-  const messages: LocalChatMessage[] = [
+  const messages: EngineChatMessage[] = [
     { role: "system", content: local.soul },
     { role: "user", content: prompt },
   ];
@@ -1585,7 +1600,7 @@ export async function runSkillBare(
       }
     }
   } catch (err) {
-    if (err instanceof LocalDriverError) {
+    if (err instanceof EngineDriverError) {
       errorMessage = err.message;
     } else {
       errorMessage = `local unexpected error: ${(err as Error).message}`;
@@ -1616,7 +1631,7 @@ export async function runSkillBare(
 // runSkillBareWithTools — PR-skills-tools tool-loop path
 // ---------------------------------------------------------------------------
 //
-// Mirrors `runLocalTurnWithTools` (local.ts) but skill-shaped:
+// Mirrors `runEngineTurnWithTools` (engine.ts) but skill-shaped:
 //   - No history, no SOLRAC.md overlay, no streaming UX (skills already cap
 //     their reply by template; live rendering would muddy the operator's
 //     intent baked into the skill body).
@@ -1630,7 +1645,7 @@ export async function runSkillBare(
 // agent-driven invocations) is responsible for wrapping this in
 // `skillToolCtx.run(...)` so any nested `skills__*` calls have ALS context.
 async function runSkillBareWithTools(
-  local: LocalSkillDeps,
+  local: EngineSkillDeps,
   skill: Skill,
   args: string,
 ): Promise<RunSkillBareResult> {
@@ -1659,16 +1674,21 @@ async function runSkillBareWithTools(
   const selfToolName = `${SKILL_TOOL_PREFIX}${skill.name}`;
   const filteredTools = allTools.filter((t) => t.name !== selfToolName);
   const toolMap = new Map(filteredTools.map((t) => [t.name, t]));
-  const toolDefs = mcpToLocalTools(filteredTools);
+  const toolDefs = mcpToEngineTools(filteredTools);
   const toolNames = filteredTools.map((t) => t.name);
 
   const prompt = renderSkillTemplate(skill.body, args);
   // Skills are tier-stable (`tier: local` for tool-callable skills, per
   // skills.ts). Build the capability note as the default-engine variant —
-  // accurate when the skill body runs on the deploy's main local model.
-  const capabilityNote = buildToolCapabilityNote(toolNames, true);
+  // accurate when the skill body runs on the deploy's main engine slot.
+  // Dispatch on `driver.mode` so remote-backed engine slots get per-token
+  // cost framing instead of the "free" framing.
+  const capabilityNote =
+    local.driver.mode === "remote"
+      ? buildRemoteToolCapabilityNote(toolNames, true)
+      : buildLocalToolCapabilityNote(toolNames, true);
 
-  const initialMessages: LocalChatMessage[] = [
+  const initialMessages: EngineChatMessage[] = [
     { role: "system", content: `${local.soul}\n\n${capabilityNote}` },
     { role: "user", content: prompt },
   ];

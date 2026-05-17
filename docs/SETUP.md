@@ -22,15 +22,21 @@ curl -fsSL https://bun.sh/install | bash
 bun --version   # should be ≥1.3.0
 ```
 
-## 2. Prerequisites: local-model backend + model (recommended)
+## 2. Prerequisites: engine-slot backend + model (recommended)
 
-The recommended Solrac config sets `SOLRAC_DEFAULT_ENGINE=local`, which makes a local-model backend a hard boot requirement. No-prefix Telegram messages route to the local engine for free; `@`/`!` reach Anthropic Sonnet/Opus.
+The recommended Solrac config sets `SOLRAC_DEFAULT_ENGINE=local` (the "engine slot"), which makes a backend a hard boot requirement. No-prefix Telegram messages route to the engine slot; `@`/`!` reach Anthropic Sonnet/Opus.
 
-Pick a backend via `LOCAL_BACKEND`:
+You have three paths — pick one:
+
+1. **Local on-host backend (§2 below — this section)** — Ollama or LMStudio running on the same machine. Free; needs a GPU or decent CPU.
+2. **Remote OpenRouter backend (§2-remote)** — hosted models via OpenRouter. Per-token cost; no on-host GPU required. Same runtime UX as local mode.
+3. **Claude-only deploy (§2-alt)** — no engine slot at all; every no-prefix message hits Anthropic Sonnet directly.
+
+This section walks through path 1. For OpenRouter, skip to §2-remote. For Claude-only, skip to §2-alt.
+
+For path 1, pick a backend via `LOCAL_BACKEND`:
 - **`ollama`** ([ollama.com](https://ollama.com)) — daemon + CLI; default URL `:11434`; NDJSON wire format.
 - **`lmstudio`** ([lmstudio.ai](https://lmstudio.ai)) — desktop app with a built-in server; default URL `:1234`; OpenAI-compatible SSE wire format.
-
-Don't want either? Skip to **§2-alt** for the Claude-only fallback.
 
 ### 2.1 Install your chosen backend
 
@@ -91,10 +97,30 @@ If you can't run a local backend (no GPU/RAM, or air-gapped from local model hos
 ```sh
 SOLRAC_DEFAULT_ENGINE=primary    # no-prefix → Anthropic Sonnet
 LOCAL_ENABLED=false
+REMOTE_ENABLED=false
 LOCAL_TOOLS_ENABLED=false
 ```
 
 You'll lose the free local default path; every no-prefix message is an Anthropic call. `@` and `!` work as documented. The rest of this guide still applies.
+
+## 2-remote. Remote deploy via OpenRouter (skip if you completed §2 or §2-alt)
+
+If you can't run a local backend but want a non-Claude default engine, point the engine slot at OpenRouter. The runtime UX is identical to local mode (no-prefix routing, `/clear local` semantics, capability note) but per-token cost is captured into `audit.cost_usd` so the existing hourly caps gate burn.
+
+1. Get an OpenRouter API key at https://openrouter.ai/keys (the key prefix is typically `sk-or-`).
+2. Pick a model slug from https://openrouter.ai/models — e.g. `openai/gpt-4o-mini` (cheap chat), `anthropic/claude-3.5-sonnet` (parity with the `@` tier), or `meta-llama/llama-3.3-70b-instruct`.
+3. Add to your `.env`:
+
+```sh
+SOLRAC_DEFAULT_ENGINE=local       # the engine slot, served by OpenRouter
+LOCAL_ENABLED=false               # mutually exclusive with REMOTE_ENABLED
+REMOTE_ENABLED=true
+REMOTE_BACKEND=openrouter
+REMOTE_MODEL=openai/gpt-4o-mini
+REMOTE_API_KEY=sk-or-…
+```
+
+Boot logs the `remote (openrouter)` engine label and probes `GET /models` once with bearer auth — a bad API key surfaces as `auth_failed` at startup. The `@` (Sonnet) and `!` (Opus) prefixes still escalate to Claude tiers as in the local-mode deploy. The rest of this guide still applies.
 
 ## 3. Install Solrac
 

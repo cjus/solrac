@@ -1,65 +1,76 @@
 /**
- * @fileoverview Local-engine runner for Telegram messages routed to the
- *               `local` engine (default no-prefix path).
- * @purpose Stream a chat completion from a `LocalDriver` (Ollama or LMStudio)
- *          into the same Telegram throttled-edit UX that `agent.ts` uses for
- *          the Anthropic SDK path.
+ * @fileoverview Engine-slot runner for Telegram messages routed to the
+ *               `local` engine slot (default no-prefix path). Despite the slot
+ *               name, the runner is mode-polymorphic: both on-host backends
+ *               (Ollama, LMStudio — `driver.mode === "local"`) and hosted
+ *               providers (OpenRouter — `driver.mode === "remote"`) reach
+ *               Telegram through this path.
+ * @purpose Stream a chat completion from an `EngineDriver` into the same
+ *          Telegram throttled-edit UX that `agent.ts` uses for the Anthropic
+ *          SDK path.
  *
- * One call to `runLocalTurn` = one turn against the local model. The function:
- *   1. inserts the in-progress audit row tagged `model='local:<backend>:<name>'`;
+ * One call to `runEngineTurn` = one turn against the driver. The function:
+ *   1. inserts the in-progress audit row tagged
+ *      `model='<driver.mode>:<backend>:<name>'`;
  *   2. assembles a chat-style messages array — system prompt + capability note,
  *      optional SOLRAC.md overlay, prior history reconstructed from `audit`,
  *      current user prompt;
- *   3. iterates the driver's normalized `LocalChatEvent` stream — `text`,
+ *   3. iterates the driver's normalized `EngineChatEvent` stream — `text`,
  *      `tool_call` (single-shot path ignores them), `done`, `error`;
  *   4. throttle-edits the 💻 stub with rendered partial text;
- *   5. finalizes the audit row with token counts, `cost_usd = 0`,
+ *   5. finalizes the audit row with token counts, `cost_usd`,
  *      `agent_session_id = null`, `tool_calls = null`;
- *   6. on error, renders a clear failure (`❌ local unreachable`, etc.) and
+ *   6. on error, renders a clear failure (`❌ <backend> unreachable`, etc.) and
  *      writes `status='error'` with the diagnostic in `error_message`.
  *
  * Why a sibling module (not a branch in `agent.ts`):
  *   - The Anthropic SDK runner depends on `@anthropic-ai/claude-agent-sdk`,
  *     `policy.ts` hooks, the per-chat `SessionStore`, the SDK preset prompt,
- *     the SDK env scrub. The local path needs none of that.
+ *     the SDK env scrub. The engine-slot path needs none of that.
  *   - Pure inference (single-shot): no `canUseTool`, no `PreToolUse` hook,
- *     no `disallowedTools`. The cost cap is unaffected because local writes
- *     `cost_usd = 0`; the global cap query sums every row regardless.
+ *     no `disallowedTools`. For `mode === "local"`, `cost_usd` is always 0
+ *     and the global cap query sums every row regardless. For
+ *     `mode === "remote"`, the driver-reported cost is summed too.
  *
  * Stateful history: conversation continuity within a chat, across every engine
  * boundary. `db.recentChatTurns(chatId, limit)` returns the last N successful
  * turns in chronological order regardless of which engine produced them. Each
  * contributes a user/assistant pair before the current turn. Default limit is
- * `LOCAL_HISTORY_LIMIT=6` (three round-trips). Cross-engine means a local
+ * `LOCAL_HISTORY_LIMIT=6` (three round-trips). Cross-engine means an engine-slot
  * follow-up to a prior Claude exchange sees the Claude response.
  *
  * Position in the dependency graph:
- *   db + policy + telegram + log + local-driver → local → consumed by main
+ *   db + policy + telegram + log + engine-driver + local-driver + remote-driver
+ *     → engine → consumed by main
  *
  * Exports:
- *   - `runLocalTurn(deps, input)` — runs one local turn end-to-end.
- *   - `LocalRunDeps` — runtime deps (tg, db, driver, model, timeout, history).
- *   - `LocalRunInput` — per-turn input (chatId, fromId, updateId, prompt).
- *   - `buildLocalCapabilityNote` — engine-specific clause appended to SOUL.md
- *     before it ships as the first `system` message.
- *   - `buildToolCapabilityNote` — convenience for the tools-on path.
+ *   - `runEngineTurn(deps, input)` — runs one engine-slot turn end-to-end.
+ *   - `EngineRunDeps` — runtime deps (tg, db, driver, model, timeout, history).
+ *   - `EngineRunInput` — per-turn input (chatId, fromId, updateId, prompt).
+ *   - `buildToolCapabilityNote` — back-compat dispatcher that picks the
+ *     mode-specific tool-capability note (local/remote driver files own the
+ *     actual builders). Deletes when commands.ts migrates in Phase 5.
  *
  * Key invariants:
  *   - Audit row is inserted BEFORE the driver call (`status='in_progress'`)
  *     and updated to `'ok'`/`'error'` after; lifecycle drain prevents
  *     orphaned in-progress rows on graceful shutdown.
- *   - `cost_usd` is always `0` and `agent_session_id` is always `null`.
+ *   - For `mode === "local"`, `cost_usd` is always `0`; `agent_session_id`
+ *     is always `null`.
  *   - The streaming editor reuses the `lastEditedContent` no-op-edit guard
  *     and 1.5s throttle so the UX matches the Claude path.
- *   - The footer (`<i>✅ local:<backend>:<model> · Ns</i>`) is load-bearing —
- *     guarantees the final edit differs from any streaming render so Telegram
- *     doesn't 400 on a no-op.
+ *   - The footer (`<i>✅ <mode>:<backend>:<model> · Ns [· $C.CCCC]</i>`) is
+ *     load-bearing — guarantees the final edit differs from any streaming
+ *     render so Telegram doesn't 400 on a no-op. The cost segment appears
+ *     only in remote mode when the driver reported a cost (matches audit).
  *
  * Cross-references:
  *   - docs/ARCHITECTURE.md#local-routing — design discussion
  *   - policy.ts::parseEnginePrefix — engine prefix detection (called from main.ts)
- *   - main.ts::makeRunTurn — dispatcher between runAgent and runLocalTurn
- *   - local-driver.ts — wire-format abstraction (Ollama NDJSON / LMStudio SSE)
+ *   - main.ts::makeRunTurn — dispatcher between runAgent and runEngineTurn
+ *   - engine-driver.ts — shared wire-format-agnostic contract
+ *   - local-driver.ts — Ollama NDJSON / LMStudio SSE
+ *   - remote-driver.ts — OpenRouter SSE
  */
 
 import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
@@ -68,10 +79,18 @@ import type { SessionStore } from "./session.ts";
 import { readInstanceMd, wrapInstanceMd } from "./instance.ts";
 import type { IntegrationTier } from "./integrations.ts";
 import {
-  type LocalChatMessage,
-  type LocalDriver,
-  LocalDriverError,
+  type EngineChatMessage,
+  type EngineDriver,
+  EngineDriverError,
+} from "./engine-driver.ts";
+import {
+  buildLocalCapabilityNote,
+  buildLocalToolCapabilityNote,
 } from "./local-driver.ts";
+import {
+  buildRemoteCapabilityNote,
+  buildRemoteToolCapabilityNote,
+} from "./remote-driver.ts";
 import { log } from "./log.ts";
 import {
   createLoopDetector,
@@ -80,10 +99,10 @@ import {
 } from "./policy.ts";
 import { mdToTelegramHtml } from "./markdown.ts";
 import {
-  mcpToLocalTools,
+  mcpToEngineTools,
   runToolLoop,
   type RunToolLoopRenderer,
-} from "./local-tools.ts";
+} from "./engine-tools.ts";
 import { skillToolCtx } from "./skill-tools.ts";
 import { htmlEscapeText, type TelegramClient } from "./telegram.ts";
 
@@ -91,79 +110,19 @@ const TELEGRAM_TEXT_MAX = 3800;
 const EDIT_THROTTLE_MS = 1500;
 const THINKING_STUB = "💻 thinking…";
 
-/**
- * Engine-specific capability statement appended to SOUL.md before it ships
- * as the first `system` message. The appropriate cell is picked at boot from
- * `(toolsEnabled, isDefaultEngine)`. SOUL.md ships engine-agnostic so the
- * same file serves every engine path; this builder is where engine-specific
- * facts (tools surface, escalation prefixes) get layered in.
- *
- * Matrix:
- *   tools=off, default=local    → "you are the default; for tool-driven work prefix @ or !"
- *   tools=off, default=Claude   → "you do not have tools; redirect tool requests to @ or !"
- *   tools=on,  default=local    → "you are the default; you have these tools: <list>; escalate via @ / !"
- *   tools=on,  default=Claude   → unreachable (boot validation in config.ts rejects this combo);
- *                                 falls through to the tools-on default-engine cell defensively.
- */
-export interface LocalCapabilityNoteOpts {
-  toolsEnabled: boolean;
-  isDefaultEngine: boolean;
-  toolNames: ReadonlyArray<string>;
-}
-
-export function buildLocalCapabilityNote(opts: LocalCapabilityNoteOpts): string {
-  const { toolsEnabled, isDefaultEngine, toolNames } = opts;
-  if (toolsEnabled) {
-    const list = toolNames.join(", ");
-    return (
-      "You are the default chat engine; your replies cost the operator nothing. " +
-      `You have these tools available: ${list}. ` +
-      "Call them when the user's request needs information or actions you " +
-      "can't deliver from your training alone (current data, external APIs, " +
-      "operator-authored integrations). Tool results return into your " +
-      "context — never tell the user 'I cannot do that' if a listed tool can. " +
-      "If a request is too complex for these tools or for local reasoning, " +
-      "suggest the user re-send with `@` (Sonnet) or `!` (Opus) for heavier reasoning."
-    );
-  }
-  if (isDefaultEngine) {
-    return (
-      "You are the default chat engine; your replies cost the operator nothing. " +
-      "You do not have tools — answer from what you know. " +
-      "If the user asks for something that needs tools (file edits, API calls, " +
-      "web fetches), tell them to re-send the message prefixed with `@` (Sonnet) " +
-      "or `!` (Opus) to escalate to a Claude tier."
-    );
-  }
-  return (
-    "You do not have tools; answer from what you know. " +
-    "If the user asks for something that needs tools (file edits, API calls, " +
-    "web fetches), tell them to re-send the message prefixed with `@` (Sonnet) " +
-    "or `!` (Opus)."
-  );
-}
-
-/**
- * Convenience for the tools-on path. Defers to `buildLocalCapabilityNote` so
- * the matrix has a single source of truth. Exported so the skill tool-loop
- * runner in commands.ts can build the same capability note for skill bodies
- * without duplicating the matrix.
- */
-export function buildToolCapabilityNote(
-  toolNames: ReadonlyArray<string>,
-  isDefaultEngine: boolean,
-): string {
-  return buildLocalCapabilityNote({ toolsEnabled: true, isDefaultEngine, toolNames });
-}
-
-export interface LocalRunDeps {
+export interface EngineRunDeps {
   tg: TelegramClient;
   db: SolracDb;
   // `/clear local` cutoff store. Reads `getLocalCutoff(chatId)` once per
   // turn before assembling history. Optional for back-compat with tests that
   // construct deps inline; production wiring in main.ts always provides it.
   sessions?: SessionStore;
-  driver: LocalDriver;
+  // The driver is the single source of truth for engine mode — each impl
+  // sets `mode` (`createOllamaDriver`/`createLmstudioDriver` → "local";
+  // `createOpenrouterDriver` → "remote"). The runner reads `driver.mode`
+  // wherever it needs to branch: audit tag prefix, capability-note framing,
+  // cost-write decision.
+  driver: EngineDriver;
   model: string;
   timeoutMs: number;
   historyLimit: number;
@@ -176,18 +135,18 @@ export interface LocalRunDeps {
   // capability note's tone (default chat engine vs. tools-less escape hatch).
   isDefaultEngine?: boolean;
   // Tools surface. When `toolEnabled === true && tools.length > 0`,
-  // `runLocalTurn` dispatches through `runToolLoop` so the local model can
+  // `runEngineTurn` dispatches through `runToolLoop` so the model can
   // call the same `mcp__solrac__*` integrations Claude tiers see.
   toolEnabled?: boolean;
   tools?: ReadonlyArray<SdkMcpToolDefinition<any>>;
   toolTiers?: ReadonlyMap<string, IntegrationTier>;
   broker?: Pick<ConfirmationBroker, "request">;
-  // `LOCAL_MAX_TOOL_ITERATIONS`. Defaults to 8; only consulted when tools
-  // are enabled.
+  // `LOCAL_MAX_TOOL_ITERATIONS` / `REMOTE_MAX_TOOL_ITERATIONS`. Defaults to
+  // 8; only consulted when tools are enabled.
   maxToolIterations?: number;
 }
 
-export interface LocalRunInput {
+export interface EngineRunInput {
   chatId: number;
   fromId: number;
   // Nullable for synthesized scheduler updates — they don't ride the poll
@@ -200,24 +159,31 @@ export interface LocalRunInput {
   scheduledTaskName?: string | null;
 }
 
-export async function runLocalTurn(
-  deps: LocalRunDeps,
-  input: LocalRunInput,
+export async function runEngineTurn(
+  deps: EngineRunDeps,
+  input: EngineRunInput,
 ): Promise<void> {
   const backend = deps.driver.backend;
+  const mode = deps.driver.mode;
+  // Audit-tag prefix tracks `mode` (not backend) so cross-engine queries
+  // (`/clear local`, the bridge in `outOfBandForEngine`, `/status` counters)
+  // can pattern-match the engine SLOT, not the wire protocol. `remote:%`
+  // rows also carry real costs in `cost_usd` so the existing hourly caps
+  // gate them — `local:%` rows are always free (cost_usd = 0).
+  const modelTag = `${mode}:${backend}:${deps.model}`;
   const auditId = deps.db.insertAudit({
     chatId: input.chatId,
     fromId: input.fromId,
     updateId: input.updateId,
     prompt: truncateAuditPrompt(input.prompt),
     startedAt: Date.now(),
-    model: `local:${backend}:${deps.model}`,
+    model: modelTag,
     origin: input.scheduledTaskName ? "scheduled" : "user",
     taskName: input.scheduledTaskName ?? null,
   });
 
   const stub = await deps.tg.sendMessage(input.chatId, THINKING_STUB).catch((err) => {
-    log.warn("local.stub_send_failed", { auditId, error: (err as Error).message });
+    log.warn("engine.stub_send_failed", { auditId, error: (err as Error).message });
     return null;
   });
   const stubId = stub && typeof stub === "object" ? stub.message_id : null;
@@ -232,15 +198,19 @@ export async function runLocalTurn(
     deps.toolTiers !== undefined &&
     deps.broker !== undefined
   ) {
-    return runLocalTurnWithTools(deps, input, auditId, stubId);
+    return runEngineTurnWithTools(deps, input, auditId, stubId);
   }
 
-  const capabilityNote = buildLocalCapabilityNote({
+  const noteOpts = {
     toolsEnabled: false,
     isDefaultEngine: deps.isDefaultEngine === true,
     toolNames: [],
-  });
-  const messages: LocalChatMessage[] = [
+  };
+  const capabilityNote =
+    mode === "remote"
+      ? buildRemoteCapabilityNote(noteOpts)
+      : buildLocalCapabilityNote(noteOpts);
+  const messages: EngineChatMessage[] = [
     { role: "system", content: `${deps.soul}\n\n${capabilityNote}` },
   ];
   // Re-read SOLRAC.md per turn so operator edits land on the next message.
@@ -276,6 +246,12 @@ export async function runLocalTurn(
   let lastEditedContent = THINKING_STUB;
   let inputTokens: number | null = null;
   let outputTokens: number | null = null;
+  // Captured from the driver's done event. Distinct from the value written to
+  // `audit.cost_usd` — local mode writes 0 regardless of what the driver
+  // reported (always null in practice for on-host backends); remote mode
+  // writes this value, or null + a `remote.cost_missing` warn if the driver
+  // didn't report one. See the audit-write site below for the matrix.
+  let driverCostUsd: number | null = null;
   let isError = false;
   let errorMessage: string | null = null;
 
@@ -301,6 +277,7 @@ export async function runLocalTurn(
       } else if (evt.kind === "done") {
         inputTokens = evt.inputTokens;
         outputTokens = evt.outputTokens;
+        driverCostUsd = evt.costUsd;
       } else if (evt.kind === "error") {
         errorMessage = `local error: ${evt.message}`;
         isError = true;
@@ -310,7 +287,7 @@ export async function runLocalTurn(
       // didn't offer. Surface to logs but don't break — the model will likely
       // also produce text we can show.
       else if (evt.kind === "tool_call") {
-        log.warn("local.unexpected_tool_call_single_shot", {
+        log.warn("engine.unexpected_tool_call_single_shot", {
           auditId,
           tool: evt.call.function.name,
         });
@@ -318,9 +295,9 @@ export async function runLocalTurn(
     }
   } catch (err) {
     isError = true;
-    if (err instanceof LocalDriverError) {
+    if (err instanceof EngineDriverError) {
       errorMessage = formatDriverError(err, deps.timeoutMs);
-      log.error("local.driver_failed", {
+      log.error("engine.driver_failed", {
         auditId,
         backend,
         code: err.code,
@@ -329,8 +306,8 @@ export async function runLocalTurn(
       });
     } else {
       const e = err as Error;
-      errorMessage = `local unexpected error: ${e.message}`;
-      log.error("local.unexpected_error", {
+      errorMessage = `engine unexpected error: ${e.message}`;
+      log.error("engine.unexpected_error", {
         auditId,
         backend,
         error: e.message,
@@ -348,7 +325,7 @@ export async function runLocalTurn(
   const elapsedSec = (Date.now() - startedAt) / 1000;
   const finalRender: Rendered = isError
     ? renderError(errorMessage ?? "unknown")
-    : renderFinal(assistantText, backend, deps.model, elapsedSec);
+    : renderFinal(assistantText, mode, backend, deps.model, elapsedSec, driverCostUsd);
 
   if (stubId !== null) {
     if (finalRender.html !== lastEditedContent) {
@@ -358,7 +335,7 @@ export async function runLocalTurn(
         stubId,
         finalRender.html,
         finalRender.markdown,
-        "local.edit_final_failed",
+        "engine.edit_final_failed",
       );
     }
   } else if (!isError && assistantText.trim()) {
@@ -367,8 +344,19 @@ export async function runLocalTurn(
         parse_mode: "HTML",
         markdownSource: finalRender.markdown,
       })
-      .catch((err) => log.warn("local.final_send_failed", { error: (err as Error).message }));
+      .catch((err) => log.warn("engine.final_send_failed", { error: (err as Error).message }));
   }
+
+  // Cost-write matrix:
+  //   mode=local  → 0 (on-host backends are free; driverCostUsd ignored).
+  //   mode=remote && driverCostUsd != null → driverCostUsd (real billed cost).
+  //   mode=remote && driverCostUsd == null → null + remote.cost_missing warn.
+  // The third row writes `null` (NOT 0) because COALESCE(SUM(cost_usd), 0)
+  // in the cap query would treat 0 as "free" and silently bypass the cap.
+  // Writing null preserves the audit row but excludes it from the cap sum;
+  // operators see the warn and can react (capture from /generation lookup if
+  // OpenRouter ever stops including cost in the streaming chunk).
+  const costForAudit = resolveAuditCost(mode, driverCostUsd, auditId, backend);
 
   deps.db.updateAuditEnd({
     id: auditId,
@@ -379,23 +367,51 @@ export async function runLocalTurn(
     // Local engine doesn't expose cache telemetry — the API is stateless per call.
     cacheCreationInputTokens: null,
     cacheReadInputTokens: null,
-    costUsd: 0,
+    costUsd: costForAudit,
     agentSessionId: null,
     status: isError ? "error" : "ok",
     errorMessage,
     endedAt: Date.now(),
   });
 
-  log.info("local.done", {
+  log.info("engine.done", {
     auditId,
     chatId: input.chatId,
     backend,
+    mode,
     model: deps.model,
     elapsedSec,
     inputTokens,
     outputTokens,
+    costUsd: costForAudit,
     isError,
   });
+}
+
+/**
+ * Pick the value written to `audit.cost_usd` for an engine-slot turn.
+ * See the matrix comment at the call site for the rationale; this helper is
+ * extracted so the tools-on path reuses the same decision (and so a single
+ * future bug fix lands in one place).
+ */
+function resolveAuditCost(
+  mode: "local" | "remote",
+  driverCostUsd: number | null,
+  auditId: number,
+  backend: string,
+): number | null {
+  if (mode === "local") return 0;
+  if (driverCostUsd === null) {
+    log.warn("remote.cost_missing", {
+      auditId,
+      backend,
+      hint:
+        "driver returned no cost in the usage chunk; audit.cost_usd written as NULL " +
+        "to keep the row out of cap sums. Verify the backend still emits usage.cost.",
+    });
+    return null;
+  }
+  return driverCostUsd;
 }
 
 interface Rendered {
@@ -403,7 +419,7 @@ interface Rendered {
   markdown: string;
 }
 
-function formatDriverError(err: LocalDriverError, timeoutMs: number): string {
+function formatDriverError(err: EngineDriverError, timeoutMs: number): string {
   switch (err.code) {
     case "timeout":
       return `local timed out after ${(timeoutMs / 1000).toFixed(0)}s`;
@@ -445,17 +461,23 @@ function renderStreamingStub(text: string): Rendered {
 
 function renderFinal(
   text: string,
+  mode: "local" | "remote",
   backend: string,
   model: string,
   elapsedSec: number,
+  costUsd: number | null,
 ): Rendered {
   const scrubbed = scrubLocalControlTokens(text);
   const hasText = scrubbed.trim().length > 0;
   const htmlBody = hasText ? mdToTelegramHtml(scrubbed) : "(empty response)";
   const mdBody = hasText ? scrubbed : "(empty response)";
-  const tag = `local:${backend}:${model}`;
-  const htmlFooter = `<i>✅ ${htmlEscapeText(tag)} · ${elapsedSec.toFixed(1)}s</i>`;
-  const mdFooter = `*✅ ${tag} · ${elapsedSec.toFixed(1)}s*`;
+  // Footer tag mirrors the audit-row tag so operators reading either source
+  // see the same identifier — `remote:openrouter:anthropic/claude-3.5-sonnet`
+  // or `local:ollama:gemma3:4b` — and can grep across both surfaces.
+  const tag = `${mode}:${backend}:${model}`;
+  const costChip = formatFooterCost(mode, costUsd);
+  const htmlFooter = `<i>✅ ${htmlEscapeText(tag)} · ${elapsedSec.toFixed(1)}s${costChip}</i>`;
+  const mdFooter = `*✅ ${tag} · ${elapsedSec.toFixed(1)}s${costChip}*`;
   return {
     html: truncate(`${htmlBody}\n\n${htmlFooter}`, TELEGRAM_TEXT_MAX),
     markdown: `${mdBody}\n\n${mdFooter}`,
@@ -475,7 +497,7 @@ async function tryEdit(
   messageId: number,
   text: string,
   markdownSource: string | undefined,
-  errEvent: string = "local.edit_throttled",
+  errEvent: string = "engine.edit_throttled",
 ): Promise<void> {
   await tg
     .editMessageText(chatId, messageId, text, { parse_mode: "HTML", markdownSource })
@@ -486,15 +508,25 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "…";
 }
 
+// Cost chip for the engine-slot footer. Mirrors the audit-write matrix in
+// `resolveAuditCost`: local mode is always free (no chip even if a driver
+// erroneously reports cost); remote mode shows the chip only when the driver
+// surfaced a real number. A null in remote mode means OpenRouter omitted the
+// usage.cost field — `remote.cost_missing` already logs; the UI just stays quiet.
+function formatFooterCost(mode: "local" | "remote", costUsd: number | null): string {
+  if (mode !== "remote" || costUsd === null) return "";
+  return ` · $${costUsd.toFixed(4)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Tools-on path — dispatches through `runToolLoop`
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_TOOL_ITERATIONS = 8;
 
-async function runLocalTurnWithTools(
-  deps: LocalRunDeps,
-  input: LocalRunInput,
+async function runEngineTurnWithTools(
+  deps: EngineRunDeps,
+  input: EngineRunInput,
   auditId: number,
   stubId: number | null,
 ): Promise<void> {
@@ -503,16 +535,21 @@ async function runLocalTurnWithTools(
   const broker = deps.broker!;
   const maxIterations = deps.maxToolIterations ?? DEFAULT_MAX_TOOL_ITERATIONS;
   const backend = deps.driver.backend;
+  const mode = deps.driver.mode;
 
   const toolNames = tools.map((t) => t.name);
-  const capabilityNote = buildToolCapabilityNote(toolNames, deps.isDefaultEngine === true);
-  const toolDefs = mcpToLocalTools(tools);
+  const isDefault = deps.isDefaultEngine === true;
+  const capabilityNote =
+    mode === "remote"
+      ? buildRemoteToolCapabilityNote(toolNames, isDefault)
+      : buildLocalToolCapabilityNote(toolNames, isDefault);
+  const toolDefs = mcpToEngineTools(tools);
   const toolMap = new Map(tools.map((t) => [t.name, t]));
 
   // Build initial messages — same shape as the single-shot path, only the
   // capability note differs. Inlined rather than factored to keep the diff
   // for the tools-on path scoped.
-  const initialMessages: LocalChatMessage[] = [
+  const initialMessages: EngineChatMessage[] = [
     { role: "system", content: `${deps.soul}\n\n${capabilityNote}` },
   ];
   const instanceMd = readInstanceMd(deps.instanceMdPath);
@@ -589,11 +626,13 @@ async function runLocalTurnWithTools(
     ? renderError(result.errorMessage ?? "unknown")
     : renderToolLoopFinal(
         result.assistantText,
+        mode,
         backend,
         deps.model,
         elapsedSec,
         result.toolsFired,
         result.iterationCapHit,
+        result.costUsd,
       );
 
   if (stubId !== null) {
@@ -604,7 +643,7 @@ async function runLocalTurnWithTools(
         stubId,
         finalRender.html,
         finalRender.markdown,
-        "local.edit_final_failed",
+        "engine.edit_final_failed",
       );
     }
   } else if (!isError && result.assistantText.trim()) {
@@ -614,9 +653,17 @@ async function runLocalTurnWithTools(
         markdownSource: finalRender.markdown,
       })
       .catch((err) =>
-        log.warn("local.final_send_failed", { error: (err as Error).message }),
+        log.warn("engine.final_send_failed", { error: (err as Error).message }),
       );
   }
+
+  // Tool-loop cost: under remote mode, each round writes its own usage chunk
+  // with its own per-round cost. `runToolLoop` only surfaces the FINAL round's
+  // costUsd (via `result.costUsd`), which would undercount multi-round remote
+  // turns. The fix lives in `local-tools.ts` (sum costs across rounds);
+  // here we pass the summed value through the same `resolveAuditCost` matrix
+  // as the single-shot path.
+  const costForAudit = resolveAuditCost(mode, result.costUsd, auditId, backend);
 
   deps.db.updateAuditEnd({
     id: auditId,
@@ -629,21 +676,23 @@ async function runLocalTurnWithTools(
     outputTokens: result.outputTokens,
     cacheCreationInputTokens: null,
     cacheReadInputTokens: null,
-    costUsd: 0,
+    costUsd: costForAudit,
     agentSessionId: null,
     status: isError ? "error" : "ok",
     errorMessage: result.errorMessage,
     endedAt: Date.now(),
   });
 
-  log.info("local.done", {
+  log.info("engine.done", {
     auditId,
     chatId: input.chatId,
     backend,
+    mode,
     model: deps.model,
     elapsedSec,
     inputTokens: result.inputTokens,
     outputTokens: result.outputTokens,
+    costUsd: costForAudit,
     toolsFired: result.toolsFired,
     iterationCapHit: result.iterationCapHit,
     isError,
@@ -682,11 +731,13 @@ function renderToolLoopStub(
 
 function renderToolLoopFinal(
   text: string,
+  mode: "local" | "remote",
   backend: string,
   model: string,
   elapsedSec: number,
   toolsFired: number,
   iterationCapHit: boolean,
+  costUsd: number | null,
 ): Rendered {
   const scrubbed = scrubLocalControlTokens(text);
   const hasText = scrubbed.trim().length > 0;
@@ -696,9 +747,10 @@ function renderToolLoopFinal(
     ? `⚠️ stopped after ${toolsFired} tool iterations · `
     : "";
   const toolsChip = toolsFired > 0 ? `${toolsFired} tools · ` : "";
-  const tag = `local:${backend}:${model}`;
-  const htmlFooter = `<i>✅ ${htmlEscapeText(tag)} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s</i>`;
-  const mdFooter = `*✅ ${tag} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s*`;
+  const tag = `${mode}:${backend}:${model}`;
+  const costChip = formatFooterCost(mode, costUsd);
+  const htmlFooter = `<i>✅ ${htmlEscapeText(tag)} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s${costChip}</i>`;
+  const mdFooter = `*✅ ${tag} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s${costChip}*`;
   return {
     html: truncate(`${htmlBody}\n\n${htmlFooter}`, TELEGRAM_TEXT_MAX),
     markdown: `${mdBody}\n\n${mdFooter}`,

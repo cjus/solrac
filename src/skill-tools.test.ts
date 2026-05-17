@@ -2,22 +2,23 @@
  * @fileoverview Unit tests for skill-as-tool dispatcher.
  * @proves Tool definition shape, naming, registry filtering, audit-row tag.
  *
- * Wire-format edge cases live in `local-driver.test.ts`. Tool-loop logic
- * lives in `local-tools.test.ts`. This file scopes to skill-tools shape
- * + filtering invariants that survive the driver abstraction.
+ * Wire-format edge cases live in `local-driver.test.ts` /
+ * `remote-driver.test.ts`. Tool-loop logic lives in `engine-tools.test.ts`.
+ * This file scopes to skill-tools shape + filtering invariants that survive
+ * the driver abstraction.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { LocalSkillDeps } from "./commands.ts";
+import type { EngineSkillDeps } from "./commands.ts";
 import { openDb, type SolracDb } from "./db.ts";
 import {
-  type LocalChatEvent,
-  type LocalDriver,
-  type LocalStreamChatOpts,
-} from "./local-driver.ts";
+  type EngineChatEvent,
+  type EngineDriver,
+  type EngineStreamChatOpts,
+} from "./engine-driver.ts";
 import {
   buildSkillErrorPayload,
   buildSkillTools,
@@ -78,19 +79,20 @@ function makeRegistry(skills: ReadonlyArray<Skill>): SkillRegistry {
   }) as unknown as SkillRegistry;
 }
 
-function noopDriver(): LocalDriver {
+function noopDriver(): EngineDriver {
   return {
     backend: "ollama",
+    mode: "local",
     async probe() {
       return { ok: true };
     },
-    async *streamChat(_opts: LocalStreamChatOpts): AsyncIterable<LocalChatEvent> {
-      yield { kind: "done", inputTokens: null, outputTokens: null };
+    async *streamChat(_opts: EngineStreamChatOpts): AsyncIterable<EngineChatEvent> {
+      yield { kind: "done", inputTokens: null, outputTokens: null , costUsd: null };
     },
   };
 }
 
-function makeDeps(): LocalSkillDeps {
+function makeDeps(): EngineSkillDeps {
   return {
     driver: noopDriver(),
     model: "test-m",

@@ -1,10 +1,12 @@
 /**
- * @fileoverview Unit tests for `local-driver.ts` — both backends.
+ * @fileoverview Unit tests for `local-driver.ts` — on-host backends only
+ *               (Ollama + LMStudio). OpenRouter tests live in
+ *               `remote-driver.test.ts`.
  * @proves NDJSON and SSE wire-format parsing, partial-line buffering,
  *         multi-event-per-chunk, tool-call arg-delta accumulation,
  *         Gemma-4 dedup, usage-chunk capture, error paths.
  *
- * Both drivers ship with handwritten-fake fetches (no mocking framework,
+ * Drivers ship with handwritten-fake fetches (no mocking framework,
  * per CLAUDE.md Testing Philosophy). Each test constructs a `Response` with
  * a `ReadableStream` body so the driver consumes real chunk boundaries —
  * partial-line / partial-event behavior is exercised by hand-splitting the
@@ -13,11 +15,10 @@
 
 import { describe, expect, test } from "bun:test";
 import {
-  createLmstudioDriver,
-  createOllamaDriver,
-  LocalDriverError,
-  type LocalChatEvent,
-} from "./local-driver.ts";
+  EngineDriverError,
+  type EngineChatEvent,
+} from "./engine-driver.ts";
+import { createLmstudioDriver, createOllamaDriver } from "./local-driver.ts";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -49,9 +50,9 @@ function fakeFetch(
 }
 
 async function collectEvents(
-  iter: AsyncIterable<LocalChatEvent>,
-): Promise<LocalChatEvent[]> {
-  const out: LocalChatEvent[] = [];
+  iter: AsyncIterable<EngineChatEvent>,
+): Promise<EngineChatEvent[]> {
+  const out: EngineChatEvent[] = [];
   for await (const evt of iter) out.push(evt);
   return out;
 }
@@ -119,7 +120,7 @@ describe("OllamaDriver — streamChat text", () => {
     );
     expect(events).toEqual([
       { kind: "text", delta: "hello" },
-      { kind: "done", inputTokens: 5, outputTokens: 3 },
+      { kind: "done", inputTokens: 5, outputTokens: 3 , costUsd: null },
     ]);
   });
 
@@ -140,9 +141,9 @@ describe("OllamaDriver — streamChat text", () => {
     const events = await collectEvents(
       driver.streamChat({ model: "m", messages: [{ role: "user", content: "hi" }] }),
     );
-    const texts = events.filter((e): e is LocalChatEvent & { kind: "text" } => e.kind === "text").map((e) => e.delta);
+    const texts = events.filter((e): e is EngineChatEvent & { kind: "text" } => e.kind === "text").map((e) => e.delta);
     expect(texts.join("")).toBe("hello");
-    expect(events.at(-1)).toEqual({ kind: "done", inputTokens: 1, outputTokens: 2 });
+    expect(events.at(-1)).toEqual({ kind: "done", inputTokens: 1, outputTokens: 2 , costUsd: null });
   });
 
   test("tool_calls on final frame produces tool_call events", async () => {
@@ -165,7 +166,7 @@ describe("OllamaDriver — streamChat text", () => {
     const events = await collectEvents(
       driver.streamChat({ model: "m", messages: [{ role: "user", content: "what time?" }] }),
     );
-    const toolEvt = events.find((e): e is LocalChatEvent & { kind: "tool_call" } => e.kind === "tool_call");
+    const toolEvt = events.find((e): e is EngineChatEvent & { kind: "tool_call" } => e.kind === "tool_call");
     expect(toolEvt?.call.function.name).toBe("time_now");
     expect(toolEvt?.call.function.arguments).toEqual({ tz: "UTC" });
   });
@@ -203,7 +204,7 @@ describe("OllamaDriver — streamChat text", () => {
 });
 
 describe("OllamaDriver — streamChat errors", () => {
-  test("HTTP 404 → LocalDriverError model_missing with pull hint", async () => {
+  test("HTTP 404 → EngineDriverError model_missing with pull hint", async () => {
     const fetch = fakeFetch(
       () => new Response(JSON.stringify({ error: "model not found" }), { status: 404 }),
     );
@@ -214,13 +215,13 @@ describe("OllamaDriver — streamChat errors", () => {
       );
       throw new Error("expected throw");
     } catch (err) {
-      expect(err).toBeInstanceOf(LocalDriverError);
-      expect((err as LocalDriverError).code).toBe("model_missing");
-      expect((err as LocalDriverError).message).toMatch(/ollama pull gemma3:e4b/);
+      expect(err).toBeInstanceOf(EngineDriverError);
+      expect((err as EngineDriverError).code).toBe("model_missing");
+      expect((err as EngineDriverError).message).toMatch(/ollama pull gemma3:e4b/);
     }
   });
 
-  test("HTTP 500 → LocalDriverError http_error", async () => {
+  test("HTTP 500 → EngineDriverError http_error", async () => {
     const fetch = fakeFetch(() => new Response("oom", { status: 500 }));
     const driver = createOllamaDriver({ url: "http://x", fetch });
     try {
@@ -229,13 +230,13 @@ describe("OllamaDriver — streamChat errors", () => {
       );
       throw new Error("expected throw");
     } catch (err) {
-      expect(err).toBeInstanceOf(LocalDriverError);
-      expect((err as LocalDriverError).code).toBe("http_error");
-      expect((err as LocalDriverError).status).toBe(500);
+      expect(err).toBeInstanceOf(EngineDriverError);
+      expect((err as EngineDriverError).code).toBe("http_error");
+      expect((err as EngineDriverError).status).toBe(500);
     }
   });
 
-  test("network error → LocalDriverError unreachable", async () => {
+  test("network error → EngineDriverError unreachable", async () => {
     const fetch = (() => Promise.reject(new TypeError("fetch failed"))) as unknown as typeof globalThis.fetch;
     const driver = createOllamaDriver({ url: "http://x", fetch });
     try {
@@ -244,12 +245,12 @@ describe("OllamaDriver — streamChat errors", () => {
       );
       throw new Error("expected throw");
     } catch (err) {
-      expect(err).toBeInstanceOf(LocalDriverError);
-      expect((err as LocalDriverError).code).toBe("unreachable");
+      expect(err).toBeInstanceOf(EngineDriverError);
+      expect((err as EngineDriverError).code).toBe("unreachable");
     }
   });
 
-  test("AbortSignal pre-fetch → LocalDriverError timeout", async () => {
+  test("AbortSignal pre-fetch → EngineDriverError timeout", async () => {
     const fetch = ((_url: string, init?: RequestInit) => {
       const e = new Error("aborted");
       e.name = "AbortError";
@@ -270,8 +271,8 @@ describe("OllamaDriver — streamChat errors", () => {
       );
       throw new Error("expected throw");
     } catch (err) {
-      expect(err).toBeInstanceOf(LocalDriverError);
-      expect((err as LocalDriverError).code).toBe("timeout");
+      expect(err).toBeInstanceOf(EngineDriverError);
+      expect((err as EngineDriverError).code).toBe("timeout");
     }
   });
 });
@@ -323,9 +324,9 @@ describe("LmstudioDriver — streamChat text", () => {
     const events = await collectEvents(
       driver.streamChat({ model: "m", messages: [{ role: "user", content: "hi" }] }),
     );
-    const texts = events.filter((e) => e.kind === "text") as Array<LocalChatEvent & { kind: "text" }>;
+    const texts = events.filter((e) => e.kind === "text") as Array<EngineChatEvent & { kind: "text" }>;
     expect(texts.map((t) => t.delta).join("")).toBe("hello world");
-    expect(events.at(-1)).toEqual({ kind: "done", inputTokens: null, outputTokens: null });
+    expect(events.at(-1)).toEqual({ kind: "done", inputTokens: null, outputTokens: null , costUsd: null });
   });
 
   test("multiple SSE events in one chunk are all parsed", async () => {
@@ -340,7 +341,7 @@ describe("LmstudioDriver — streamChat text", () => {
     const events = await collectEvents(
       driver.streamChat({ model: "m", messages: [{ role: "user", content: "hi" }] }),
     );
-    const texts = events.filter((e) => e.kind === "text") as Array<LocalChatEvent & { kind: "text" }>;
+    const texts = events.filter((e) => e.kind === "text") as Array<EngineChatEvent & { kind: "text" }>;
     expect(texts.map((t) => t.delta).join("")).toBe("abc");
   });
 
@@ -358,7 +359,7 @@ describe("LmstudioDriver — streamChat text", () => {
     const events = await collectEvents(
       driver.streamChat({ model: "m", messages: [{ role: "user", content: "hi" }] }),
     );
-    const texts = events.filter((e) => e.kind === "text") as Array<LocalChatEvent & { kind: "text" }>;
+    const texts = events.filter((e) => e.kind === "text") as Array<EngineChatEvent & { kind: "text" }>;
     expect(texts.map((t) => t.delta).join("")).toBe("hello");
   });
 
@@ -371,7 +372,7 @@ describe("LmstudioDriver — streamChat text", () => {
     const events = await collectEvents(
       driver.streamChat({ model: "m", messages: [{ role: "user", content: "hi" }] }),
     );
-    const text = (events.find((e) => e.kind === "text") as LocalChatEvent & { kind: "text" }).delta;
+    const text = (events.find((e) => e.kind === "text") as EngineChatEvent & { kind: "text" }).delta;
     expect(text).toBe("ok");
   });
 
@@ -387,7 +388,7 @@ describe("LmstudioDriver — streamChat text", () => {
     const events = await collectEvents(
       driver.streamChat({ model: "m", messages: [{ role: "user", content: "hi" }] }),
     );
-    expect(events.at(-1)).toEqual({ kind: "done", inputTokens: 12, outputTokens: 4 });
+    expect(events.at(-1)).toEqual({ kind: "done", inputTokens: 12, outputTokens: 4 , costUsd: null });
   });
 
   test("missing usage chunk → null token counts", async () => {
@@ -401,7 +402,7 @@ describe("LmstudioDriver — streamChat text", () => {
     const events = await collectEvents(
       driver.streamChat({ model: "m", messages: [{ role: "user", content: "hi" }] }),
     );
-    expect(events.at(-1)).toEqual({ kind: "done", inputTokens: null, outputTokens: null });
+    expect(events.at(-1)).toEqual({ kind: "done", inputTokens: null, outputTokens: null , costUsd: null });
   });
 });
 
@@ -437,7 +438,7 @@ describe("LmstudioDriver — tool calls", () => {
       driver.streamChat({ model: "m", messages: [{ role: "user", content: "hi" }] }),
     );
     const calls = events.filter((e) => e.kind === "tool_call") as Array<
-      LocalChatEvent & { kind: "tool_call" }
+      EngineChatEvent & { kind: "tool_call" }
     >;
     expect(calls).toHaveLength(1);
     expect(calls[0]!.call.id).toBe("call_abc");
@@ -560,7 +561,7 @@ describe("LmstudioDriver — tool calls", () => {
 });
 
 describe("LmstudioDriver — streamChat errors", () => {
-  test("HTTP 404 → LocalDriverError model_missing", async () => {
+  test("HTTP 404 → EngineDriverError model_missing", async () => {
     const fetch = fakeFetch(
       () =>
         new Response(JSON.stringify({ error: { message: "model not loaded" } }), { status: 404 }),
@@ -572,12 +573,12 @@ describe("LmstudioDriver — streamChat errors", () => {
       );
       throw new Error("expected throw");
     } catch (err) {
-      expect(err).toBeInstanceOf(LocalDriverError);
-      expect((err as LocalDriverError).code).toBe("model_missing");
+      expect(err).toBeInstanceOf(EngineDriverError);
+      expect((err as EngineDriverError).code).toBe("model_missing");
     }
   });
 
-  test("HTTP 500 → LocalDriverError http_error", async () => {
+  test("HTTP 500 → EngineDriverError http_error", async () => {
     const fetch = fakeFetch(() => new Response("oom", { status: 500 }));
     const driver = createLmstudioDriver({ url: "http://x", fetch });
     try {
@@ -586,9 +587,9 @@ describe("LmstudioDriver — streamChat errors", () => {
       );
       throw new Error("expected throw");
     } catch (err) {
-      expect(err).toBeInstanceOf(LocalDriverError);
-      expect((err as LocalDriverError).code).toBe("http_error");
-      expect((err as LocalDriverError).status).toBe(500);
+      expect(err).toBeInstanceOf(EngineDriverError);
+      expect((err as EngineDriverError).code).toBe("http_error");
+      expect((err as EngineDriverError).status).toBe(500);
     }
   });
 
@@ -612,11 +613,11 @@ describe("LmstudioDriver — streamChat errors", () => {
       );
       throw new Error("expected throw");
     } catch (err) {
-      expect(err).toBeInstanceOf(LocalDriverError);
-      expect((err as LocalDriverError).code).toBe("model_missing");
-      expect((err as LocalDriverError).message).toContain("requested-but-not-loaded");
-      expect((err as LocalDriverError).message).toContain("actually-loaded-model");
-      expect((err as LocalDriverError).message).toContain("lms load");
+      expect(err).toBeInstanceOf(EngineDriverError);
+      expect((err as EngineDriverError).code).toBe("model_missing");
+      expect((err as EngineDriverError).message).toContain("requested-but-not-loaded");
+      expect((err as EngineDriverError).message).toContain("actually-loaded-model");
+      expect((err as EngineDriverError).message).toContain("lms load");
     }
   });
 
@@ -630,7 +631,7 @@ describe("LmstudioDriver — streamChat errors", () => {
     const events = await collectEvents(
       driver.streamChat({ model: "qwen", messages: [{ role: "user", content: "hi" }] }),
     );
-    const texts = events.filter((e) => e.kind === "text") as Array<LocalChatEvent & { kind: "text" }>;
+    const texts = events.filter((e) => e.kind === "text") as Array<EngineChatEvent & { kind: "text" }>;
     expect(texts.map((t) => t.delta).join("")).toBe("hi");
     expect(events.at(-1)?.kind).toBe("done");
   });
@@ -655,7 +656,7 @@ describe("LmstudioDriver — streamChat errors", () => {
         messages: [{ role: "user", content: "hi" }],
       }),
     );
-    const texts = events.filter((e) => e.kind === "text") as Array<LocalChatEvent & { kind: "text" }>;
+    const texts = events.filter((e) => e.kind === "text") as Array<EngineChatEvent & { kind: "text" }>;
     expect(texts.map((t) => t.delta).join("")).toBe("ok");
     expect(events.at(-1)?.kind).toBe("done");
   });
@@ -675,8 +676,9 @@ describe("LmstudioDriver — streamChat errors", () => {
       );
       throw new Error("expected throw");
     } catch (err) {
-      expect(err).toBeInstanceOf(LocalDriverError);
-      expect((err as LocalDriverError).code).toBe("model_missing");
+      expect(err).toBeInstanceOf(EngineDriverError);
+      expect((err as EngineDriverError).code).toBe("model_missing");
     }
   });
 });
+

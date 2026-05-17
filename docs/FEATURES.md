@@ -4,9 +4,10 @@ The complete feature list, grouped by theme. See [../README.md](../README.md) fo
 
 ## Engines & routing
 
-- **Local-first engine routing** — *Claude only when explicitly requested.* No-prefix messages route to the local engine (free) by default; `@` escalates to Sonnet, `!` escalates to Opus. Pinable via `SOLRAC_DEFAULT_ENGINE` (`local` | `primary` | `secondary`) for Claude-only deploys. Boot validation rejects unreachable combinations.
+- **BYO-model engine slot — local OR remote** — *Claude only when explicitly requested.* No-prefix messages route to a single engine slot you wire at deploy time: on-host via `LOCAL_ENABLED=true` (Ollama / LMStudio), or hosted via `REMOTE_ENABLED=true` (OpenRouter). Mutually exclusive at boot. `@` escalates to Sonnet, `!` escalates to Opus. Pinable via `SOLRAC_DEFAULT_ENGINE` (`local` | `primary` | `secondary`) for Claude-only deploys. Boot validation rejects unreachable combinations.
 - **Multi-backend local engine with tool support** — `LOCAL_BACKEND` selects the wire protocol: `ollama` (NDJSON `/api/chat`) or `lmstudio` (SSE `/v1/chat/completions`). When `LOCAL_TOOLS_ENABLED=true`, the local model (e.g. `gemma4:e4b`, `qwen2.5-7b`) calls the same `mcp__solrac__*` integrations the Claude tiers see. Multi-round tool loop with shared loop detector, broker UX, and iteration cap (`LOCAL_MAX_TOOL_ITERATIONS=8`). Cross-engine context bridge means switching between local and Claude preserves the conversation thread.
-- **Dual-Claude tier routing** — `@` → primary tier (Sonnet by default), `!` → secondary tier (Opus by default). Each tier keeps its own SDK session id so prompt caching survives same-tier turns. Per-tier thinking-stub emoji (💻 local / 🙂 primary / 🤔 secondary) makes the routing visible in chat.
+- **Remote engine via OpenRouter (no on-host GPU required)** — `REMOTE_BACKEND=openrouter` points the engine slot at OpenRouter's catalog (`anthropic/claude-3.5-sonnet`, `openai/gpt-4o-mini`, `meta-llama/llama-3.3-70b-instruct`, … browse at [openrouter.ai/models](https://openrouter.ai/models)). Same runtime UX as local mode (no-prefix routing, `/clear local` semantics, capability note, tool-loop wiring via `LOCAL_TOOLS_ENABLED=true`) but per-token cost is captured from OpenRouter's streaming `usage.cost` chunk into `audit.cost_usd` — so the existing `HOURLY_COST_CAP_USD` + `GLOBAL_HOURLY_COST_CAP_USD` ceilings gate remote burn automatically, no new knob needed. `REMOTE_API_KEY` is scrubbed from the Claude SDK subprocess env (prefix-match `REMOTE_*`) so a compromised model can't exfiltrate the billed credential.
+- **Dual-Claude tier routing** — `@` → primary tier (Sonnet by default), `!` → secondary tier (Opus by default). Each tier keeps its own SDK session id so prompt caching survives same-tier turns. Per-tier thinking-stub emoji (💻 engine slot / 🙂 primary / 🤔 secondary) makes the routing visible in chat.
 
 ## Persona, commands & extensions
 
@@ -25,7 +26,7 @@ The complete feature list, grouped by theme. See [../README.md](../README.md) fo
 - **Three-tier permission policy** — auto-allow / auto-deny / Telegram-inline-keyboard-confirm. Configurable rule tables.
 - **Per-chat hourly cost cap** — sliding 60-minute window over the audit log. Default $1.00/chat/hour.
 - **Loop detector** — denies the third call to the same `(toolName, input)` within a turn. Order-insensitive over JSON keys.
-- **Persistent audit trail** — every turn (allowed, denied, queue-full) writes a SQLite row with prompt, response, tool calls, cost, tokens, session id, status, **and engine** (`claude:primary:<modelId>` / `claude:secondary:<modelId>` / `local:<backend>:<modelId>`).
+- **Persistent audit trail** — every turn (allowed, denied, queue-full) writes a SQLite row with prompt, response, tool calls, cost, tokens, session id, status, **and engine** (`claude:primary:<modelId>` / `claude:secondary:<modelId>` / `local:<backend>:<modelId>` / `remote:openrouter:<modelId>`).
 - **Session resume across restarts** — SDK session ids persisted per chat **and per tier**; conversations survive process death.
 - **Inline-keyboard confirm UX** — 60-second timeout, fail-closed on send failure, verdict stamped into chat history after tap.
 - **Sub-agent default-deny** — `Agent`/`Task` tools disabled at SDK + policy layers.

@@ -23,20 +23,25 @@
  *   LMStudio emits a parsable-after-prefix-strip JSON line — what's different?"
  *
  * Position in the dependency graph:
- *   log → local-driver → local, local-tools
+ *   log + engine-driver → local-driver → engine-tools, engine
+ *
+ * Shared types (`EngineBackend`, `EngineDriver`, `EngineChatEvent`,
+ * `EngineDriverError`, …) and the cross-driver helpers (`stableStringify`,
+ * `maybeLogEmptyStream`) live in `engine-driver.ts`. This file imports them
+ * under local-flavored aliases for internal readability — the engine union
+ * has only two backends here, so the local-vs-remote distinction stays
+ * visually clear without re-stating the slot semantics.
  *
  * Exports:
- *   - `LocalBackend` — `"ollama" | "lmstudio"`.
- *   - `LocalChatRole`, `LocalChatMessage`, `LocalToolCallRef`, `LocalToolDef`.
- *   - `LocalChatEvent` — `text | tool_call | done | error`.
- *   - `LocalProbeResult` — `{ ok; reason?; modelMissing? }`.
- *   - `LocalDriver` — interface (`backend`, `probe`, `streamChat`).
- *   - `LocalDriverError` — typed error for connection/HTTP failures.
- *   - `createOllamaDriver(opts)`, `createLmstudioDriver(opts)` — factories.
+ *   - `createOllamaDriver(opts)`, `createLmstudioDriver(opts)`,
+ *     `createLocalDriver(backend, opts)`.
+ *   - `buildLocalCapabilityNote(opts)`, `buildLocalToolCapabilityNote(...)`
+ *     — local-mode framing ("free"). Remote-mode counterparts live in
+ *     `remote-driver.ts`.
  *
  * Key invariants:
  *   - `streamChat` ALWAYS resolves the async iterable, even on errors —
- *     errors surface as `kind: "error"` events OR throw `LocalDriverError`
+ *     errors surface as `kind: "error"` events OR throw `EngineDriverError`
  *     for network-level failures (connection refused, timeout, 4xx/5xx).
  *   - The Ollama driver's tool-call extraction reads `message.tool_calls`
  *     from any frame (Ollama emits them on the final `done:true` frame
@@ -47,7 +52,7 @@
  *   - Tool-call dedup (Gemma-4 workaround) compares stableStringify-ed
  *     `(name, args)` pairs; identical duplicates within one assistant
  *     message are skipped silently.
- *   - `LocalDriverError` carries a `code` discriminant so callers can
+ *   - `EngineDriverError` carries a `code` discriminant so callers can
  *     render different UX for `unreachable` vs `model_missing` vs
  *     `timeout` vs `http_error`.
  *
@@ -63,122 +68,20 @@
  *     a trailing newline — driver tolerates.
  */
 
+import {
+  type EngineChatEvent as LocalChatEvent,
+  type EngineChatMessage as LocalChatMessage,
+  type EngineDriver as LocalDriver,
+  type EngineProbeResult as LocalProbeResult,
+  type EngineToolDef as LocalToolDef,
+  type DriverOpts,
+  EngineDriverError as LocalDriverError,
+  RAW_FRAME_BUFFER_MAX,
+  RAW_FRAME_TRUNC,
+  maybeLogEmptyStream,
+  stableStringify,
+} from "./engine-driver.ts";
 import { log } from "./log.ts";
-
-export type LocalBackend = "ollama" | "lmstudio";
-
-export type LocalChatRole = "system" | "user" | "assistant" | "tool";
-
-/**
- * Reference to one tool call emitted by an assistant message. `id` is set
- * by backends that namespace calls (LMStudio); for Ollama, the consumer
- * synthesizes one (`call_<round>_<idx>`) so cross-backend message arrays
- * carry a stable identifier.
- */
-export interface LocalToolCallRef {
-  id?: string;
-  function: { name: string; arguments: unknown };
-}
-
-/**
- * Unified chat message shape. Each driver maps to its backend's wire shape:
- *   - Ollama matches tool results by `tool_name`.
- *   - LMStudio matches by `tool_call_id`.
- * Consumers populate both on tool-result messages; drivers pick what they
- * need. Extra fields are harmless on either wire.
- */
-export interface LocalChatMessage {
-  role: LocalChatRole;
-  content: string;
-  tool_calls?: ReadonlyArray<LocalToolCallRef>;
-  tool_call_id?: string;
-  tool_name?: string;
-}
-
-/**
- * Wire-shape tool definition shared by both backends — Ollama adopted OpenAI's
- * function-calling JSON Schema directly; LMStudio is OpenAI-compatible.
- */
-export interface LocalToolDef {
-  readonly type: "function";
-  readonly function: {
-    readonly name: string;
-    readonly description: string;
-    readonly parameters: Readonly<Record<string, unknown>>;
-  };
-}
-
-/**
- * One event from `LocalDriver.streamChat`. Driver consumers iterate until the
- * stream ends or a `done`/`error` event arrives.
- */
-export type LocalChatEvent =
-  | { kind: "text"; delta: string }
-  | { kind: "tool_call"; call: LocalToolCallRef }
-  | { kind: "done"; inputTokens: number | null; outputTokens: number | null }
-  | { kind: "error"; message: string };
-
-export interface LocalProbeResult {
-  ok: boolean;
-  reason?: string;
-  modelMissing?: boolean;
-}
-
-export interface LocalStreamChatOpts {
-  model: string;
-  messages: ReadonlyArray<LocalChatMessage>;
-  tools?: ReadonlyArray<LocalToolDef>;
-  signal?: AbortSignal;
-}
-
-export interface LocalDriver {
-  readonly backend: LocalBackend;
-  probe(model: string, signal?: AbortSignal): Promise<LocalProbeResult>;
-  streamChat(opts: LocalStreamChatOpts): AsyncIterable<LocalChatEvent>;
-}
-
-/**
- * Typed error surface for `streamChat` and `probe`. `code` lets callers
- * render distinct UX for "ollama daemon not running" (`unreachable`) vs
- * "model not pulled" (`model_missing`) without parsing the message.
- */
-export class LocalDriverError extends Error {
-  readonly backend: LocalBackend;
-  readonly code: "unreachable" | "timeout" | "model_missing" | "http_error";
-  readonly status?: number;
-  constructor(
-    backend: LocalBackend,
-    code: "unreachable" | "timeout" | "model_missing" | "http_error",
-    message: string,
-    status?: number,
-  ) {
-    super(message);
-    this.name = "LocalDriverError";
-    this.backend = backend;
-    this.code = code;
-    this.status = status;
-  }
-}
-
-export interface DriverOpts {
-  url: string; // base, no trailing slash
-  fetch?: typeof fetch;
-}
-
-// ---------------------------------------------------------------------------
-// Stable stringify (tool-call dedup key)
-// ---------------------------------------------------------------------------
-
-// Order-insensitive JSON stringify so `{a:1,b:2}` and `{b:2,a:1}` hash to the
-// same dedup key. Used by the LMStudio driver to suppress duplicate tool calls
-// inside one assistant message (Gemma-4 `parallel_tool_calls: false` bug).
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
-}
 
 // ---------------------------------------------------------------------------
 // Ollama driver — NDJSON
@@ -215,6 +118,7 @@ export function createOllamaDriver(opts: DriverOpts): LocalDriver {
 
   return {
     backend: "ollama",
+    mode: "local",
 
     async probe(model, signal): Promise<LocalProbeResult> {
       let res: Response;
@@ -313,7 +217,7 @@ export function createOllamaDriver(opts: DriverOpts): LocalDriver {
             try {
               frame = JSON.parse(line) as OllamaFrame;
             } catch (parseErr) {
-              log.warn("local.ollama_bad_frame", {
+              log.warn("ollama.bad_frame", {
                 error: (parseErr as Error).message,
                 line: line.slice(0, 120),
               });
@@ -358,7 +262,7 @@ export function createOllamaDriver(opts: DriverOpts): LocalDriver {
         throw new LocalDriverError("ollama", "unreachable", `stream failed: ${e.message}`);
       }
 
-      yield { kind: "done", inputTokens, outputTokens };
+      yield { kind: "done", inputTokens, outputTokens, costUsd: null };
     },
   };
 }
@@ -391,7 +295,16 @@ interface LmstudioSseFrame {
   // requested model on the first chunk to catch mid-session model swaps.
   model?: string;
   choices?: ReadonlyArray<LmstudioSseChoice>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  // OpenAI's streaming usage shape. LMStudio populates prompt/completion
+  // tokens only; OpenRouter also populates `cost` (USD) and `is_byok`. The
+  // shared typedef keeps both drivers' SSE parsers single-source — backends
+  // that don't emit a field simply leave it undefined.
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    cost?: number;
+    is_byok?: boolean;
+  };
   // LMStudio inlines errors inside the SSE stream rather than via HTTP status —
   // e.g. context-length overruns arrive here with HTTP 200. Without surfacing
   // this, the stream looks "empty" to the consumer and the user sees the
@@ -403,25 +316,6 @@ interface ToolCallAccumulator {
   id?: string;
   name: string;
   argsBuffer: string;
-}
-
-// Caps on the empty-stream diagnostic buffer — bounded so a runaway stream
-// (huge content + zero parsed events somehow) can't blow up the log line.
-const RAW_FRAME_BUFFER_MAX = 30;
-const RAW_FRAME_TRUNC = 400;
-
-function maybeLogEmptyStream(args: {
-  model: string;
-  textCharsEmitted: number;
-  toolCallsEmitted: number;
-  rawFrameBuffer: ReadonlyArray<string>;
-}): void {
-  if (args.textCharsEmitted > 0 || args.toolCallsEmitted > 0) return;
-  log.warn("local.lmstudio_empty_stream", {
-    model: args.model,
-    frameCount: args.rawFrameBuffer.length,
-    frames: args.rawFrameBuffer,
-  });
 }
 
 function lmstudioSerializeMessage(m: LocalChatMessage): Record<string, unknown> {
@@ -450,6 +344,7 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
 
   return {
     backend: "lmstudio",
+    mode: "local",
 
     async probe(model, signal): Promise<LocalProbeResult> {
       let res: Response;
@@ -587,7 +482,7 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
           }
           const dedupKey = stableStringify({ name: acc.name, args: parsedArgs });
           if (emittedDedup.has(dedupKey)) {
-            log.info("local.lmstudio_tool_call_deduped", { name: acc.name });
+            log.info("lmstudio.tool_call_deduped", { name: acc.name });
             continue;
           }
           emittedDedup.add(dedupKey);
@@ -638,15 +533,16 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
                 textCharsEmitted,
                 toolCallsEmitted,
                 rawFrameBuffer,
+                logEvent: "lmstudio.empty_stream",
               });
-              yield { kind: "done", inputTokens, outputTokens };
+              yield { kind: "done", inputTokens, outputTokens, costUsd: null };
               return;
             }
             let frame: LmstudioSseFrame;
             try {
               frame = JSON.parse(data) as LmstudioSseFrame;
             } catch (parseErr) {
-              log.warn("local.lmstudio_bad_frame", {
+              log.warn("lmstudio.bad_frame", {
                 error: (parseErr as Error).message,
                 data: data.slice(0, 120),
               });
@@ -743,20 +639,107 @@ export function createLmstudioDriver(opts: DriverOpts): LocalDriver {
         textCharsEmitted,
         toolCallsEmitted,
         rawFrameBuffer,
+        logEvent: "lmstudio.empty_stream",
       });
-      yield { kind: "done", inputTokens, outputTokens };
+      yield { kind: "done", inputTokens, outputTokens, costUsd: null };
     },
   };
 }
 
+// OpenRouter driver moved to `src/remote-driver.ts` in Phase 2 of the
+// engine-driver refactor. Local-mode drivers (Ollama, LMStudio) stay here;
+// remote-mode drivers live there. Boot wiring in `main.ts` dispatches per
+// `LOCAL_ENABLED` vs `REMOTE_ENABLED`. A back-compat re-export of
+// `createOpenrouterDriver` + `OpenrouterDriverOpts` at the top of this file
+// keeps existing tests in `local-driver.test.ts` compiling until Phase 6
+// moves them into `remote-driver.test.ts`.
+
 /**
- * Pick the driver implementation for the configured backend. Centralized so
- * callers (main.ts boot wiring, test harness) don't duplicate the switch.
+ * Pick the local-mode driver implementation for the configured backend.
+ * Centralized so callers (main.ts boot wiring, test harness) don't
+ * duplicate the switch.
+ *
+ * Remote-mode dispatch lives in `remote-driver.ts::createRemoteDriver`.
+ * `main.ts` calls one factory or the other based on `LOCAL_ENABLED` vs
+ * `REMOTE_ENABLED` (mutually exclusive at boot per `config.ts`).
  */
 export function createLocalDriver(
-  backend: LocalBackend,
+  backend: "ollama" | "lmstudio",
   opts: DriverOpts,
 ): LocalDriver {
   if (backend === "ollama") return createOllamaDriver(opts);
   return createLmstudioDriver(opts);
+}
+
+// ---------------------------------------------------------------------------
+// Capability note (local-mode system-prompt clause)
+// ---------------------------------------------------------------------------
+
+/**
+ * Local-mode capability statement appended to SOUL.md before it ships as the
+ * first `system` message. Always frames the cost as "free" because on-host
+ * backends (Ollama, LMStudio) don't bill per token. Remote-mode (OpenRouter)
+ * has a parallel `buildRemoteCapabilityNote` in `remote-driver.ts` that
+ * frames cost as per-token. The runner in `engine.ts` picks the right
+ * builder from `driver.mode`.
+ *
+ * Matrix:
+ *   tools=off, default=local   → "you are the default; for tool-driven work prefix @ or !"
+ *   tools=off, default=Claude  → "you do not have tools; redirect tool requests to @ or !"
+ *   tools=on,  default=local   → "you are the default; you have these tools: <list>; escalate via @ / !"
+ *   tools=on,  default=Claude  → unreachable (boot validation in config.ts rejects this combo);
+ *                                 falls through to the tools-on default-engine cell defensively.
+ */
+export interface LocalCapabilityNoteOpts {
+  toolsEnabled: boolean;
+  isDefaultEngine: boolean;
+  toolNames: ReadonlyArray<string>;
+}
+
+export function buildLocalCapabilityNote(opts: LocalCapabilityNoteOpts): string {
+  const { toolsEnabled, isDefaultEngine, toolNames } = opts;
+  const costClause = "your replies cost the operator nothing";
+  if (toolsEnabled) {
+    const list = toolNames.join(", ");
+    return (
+      `You are the default chat engine; ${costClause}. ` +
+      `You have these tools available: ${list}. ` +
+      "Call them when the user's request needs information or actions you " +
+      "can't deliver from your training alone (current data, external APIs, " +
+      "operator-authored integrations). Tool results return into your " +
+      "context — never tell the user 'I cannot do that' if a listed tool can. " +
+      "If a request is too complex for these tools or for local reasoning, " +
+      "suggest the user re-send with `@` (Sonnet) or `!` (Opus) for heavier reasoning."
+    );
+  }
+  if (isDefaultEngine) {
+    return (
+      `You are the default chat engine; ${costClause}. ` +
+      "You do not have tools — answer from what you know. " +
+      "If the user asks for something that needs tools (file edits, API calls, " +
+      "web fetches), tell them to re-send the message prefixed with `@` (Sonnet) " +
+      "or `!` (Opus) to escalate to a Claude tier."
+    );
+  }
+  return (
+    "You do not have tools; answer from what you know. " +
+    "If the user asks for something that needs tools (file edits, API calls, " +
+    "web fetches), tell them to re-send the message prefixed with `@` (Sonnet) " +
+    "or `!` (Opus)."
+  );
+}
+
+/**
+ * Convenience for the tools-on path. Defers to `buildLocalCapabilityNote` so
+ * the matrix has a single source of truth.
+ */
+export function buildLocalToolCapabilityNote(
+  toolNames: ReadonlyArray<string>,
+  isDefaultEngine: boolean,
+): string {
+  return buildLocalCapabilityNote({
+    toolsEnabled: true,
+    isDefaultEngine,
+    toolNames,
+  });
 }

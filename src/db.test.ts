@@ -633,6 +633,64 @@ describe("openDb engine-scoped helpers (PNX-167)", () => {
     expect(db.hasLocalTurnsSince(1, 100)).toBe(false);
   });
 
+  test("hasLocalTurnsSince triple-pattern: also matches remote:% (OpenRouter) rows", async () => {
+    // OpenRouter-only deploys never write local:% rows; `/clear local` must
+    // still report "Already clean" correctly by recognizing remote:%.
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    seedTurns(db, [
+      {
+        chatId: 1,
+        model: "remote:openrouter:anthropic/claude-3.5-sonnet",
+        startedAt: 100,
+        response: "hi",
+        cost: 0.00007,
+        status: "ok",
+      },
+    ]);
+    expect(db.hasLocalTurnsSince(1, 0)).toBe(true);
+    expect(db.hasLocalTurnsSince(1, 100)).toBe(false);
+  });
+
+  test("outOfBandForEngine triple-pattern: remote:% rows hidden by local cutoff", async () => {
+    // Claude reading the engine-slot bridge must see remote turns as part
+    // of the local-cutoff scope — otherwise `/clear local` clears Ollama
+    // history but Claude still recites the freshly-cleared OpenRouter turns.
+    const dir = newDir();
+    const db = await openDb(dir);
+    dbs.push(db);
+    seedTurns(db, [
+      {
+        chatId: 1,
+        model: "remote:openrouter:openai/gpt-4o-mini",
+        startedAt: 100,
+        response: "remote-pre",
+        cost: 0.00005,
+        status: "ok",
+      },
+      {
+        chatId: 1,
+        model: "claude:secondary:m",
+        startedAt: 150,
+        response: "opus",
+        cost: 0.02,
+        status: "ok",
+      },
+    ]);
+    // Without cutoff: both rows appear out-of-band for the primary tier.
+    const all = db
+      .outOfBandForEngine(1, "claude:primary:%", 10)
+      .map((r) => r.response);
+    expect(all).toContain("remote-pre");
+    // With cutoff at 150: remote:% pre-cutoff row is hidden.
+    const filtered = db
+      .outOfBandForEngine(1, "claude:primary:%", 10, 150)
+      .map((r) => r.response);
+    expect(filtered).not.toContain("remote-pre");
+    expect(filtered).toContain("opus");
+  });
+
   test("sumChatBytesForEngine totals prompt+response over status='ok' rows", async () => {
     const dir = newDir();
     const db = await openDb(dir);

@@ -78,7 +78,7 @@ import {
   BOT_COMMAND_REGISTRY,
   parseCommand,
   runCommand,
-  type LocalSkillDeps,
+  type EngineSkillDeps,
   type RunCommandDeps,
 } from "./commands.ts";
 import { loadConfig, type Config } from "./config.ts";
@@ -92,11 +92,13 @@ import {
 } from "./instance.ts";
 import { installShutdown } from "./lifecycle.ts";
 import { log } from "./log.ts";
-import { runLocalTurn, type LocalRunDeps } from "./local.ts";
 import {
-  createLocalDriver,
-  type LocalDriver,
-} from "./local-driver.ts";
+  runEngineTurn,
+  type EngineRunDeps,
+} from "./engine.ts";
+import type { EngineDriver } from "./engine-driver.ts";
+import { createLocalDriver } from "./local-driver.ts";
+import { createRemoteDriver } from "./remote-driver.ts";
 import { acquirePidFile, startPolling } from "./poll.ts";
 import {
   createConfirmationBroker,
@@ -173,9 +175,9 @@ interface RunTurnDeps {
     pendingHandles: Map<string, ConfirmHandle>;
   }) => CanUseTool;
   // Present iff `LOCAL_ENABLED=true`. When set, no-prefix messages route to
-  // runLocalTurn instead of runAgent. Both paths share the queue, mutex,
+  // runEngineTurn instead of runAgent. Both paths share the queue, mutex,
   // semaphore, and tracker drain — dispatch happens inside the queued worker.
-  localDeps: LocalRunDeps | null;
+  localDeps: EngineRunDeps | null;
   // PNX-167 — slash command surface. `commandDeps` carries the dispatcher's
   // dependencies (allowlist, queue snapshot, startedAt, etc.) so the
   // command path stays self-contained. `botUsername` is the cached lowercase
@@ -261,7 +263,7 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
         await deps.tg
           .sendMessage(msg.chat.id, "local engine disabled in this deployment")
           .catch((err) =>
-            log.warn("local.disabled_ack_failed", { error: (err as Error).message }),
+            log.warn("engine.disabled_ack_failed", { error: (err as Error).message }),
           );
         log.info("turn.done", {
           update_id: update.update_id,
@@ -273,7 +275,7 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
       // Empty body is unreachable on Telegram (the platform rejects empty
       // messages) and the web UI guards against it. Send the user's text
       // straight to the runner.
-      await runLocalTurn(deps.localDeps, {
+      await runEngineTurn(deps.localDeps, {
         chatId: msg.chat.id,
         fromId: msg.from.id,
         updateId: scheduledCtx ? null : update.update_id,
@@ -486,13 +488,18 @@ export function auditQueueFull(update: Update, db: SolracDb, tg: TelegramClient,
 // Operator-readable label for the web UI's default-engine pill. The pill
 // itself ships with the empty `data-prefix=""`, but the title attr is
 // substituted at serve time so the user hovers over a label matching the
-// deploy. Local-engine deploys carry the backend name in parentheses so
-// the operator sees which backend served the turn at a glance.
+// deploy. Engine-slot deploys carry the mode + backend in parentheses
+// (e.g. `local (ollama)`, `remote (openrouter)`) so the operator sees which
+// backend served the turn at a glance.
 function defaultEngineLabel(
   engine: "local" | "primary" | "secondary",
   localBackend: "ollama" | "lmstudio" | null,
+  remoteBackend: "openrouter" | null,
 ): string {
-  if (engine === "local") return `local (${localBackend ?? "?"})`;
+  if (engine === "local") {
+    if (remoteBackend) return `remote (${remoteBackend})`;
+    return `local (${localBackend ?? "?"})`;
+  }
   if (engine === "primary") return "primary Claude (Sonnet)";
   return "secondary Claude (Opus)";
 }
@@ -503,19 +510,19 @@ function defaultEngineLabel(
 // turn will succeed once the daemon is reachable. Delegates the probe to
 // the driver so each backend hits its own probe URL (`/api/tags` for Ollama,
 // `/v1/models` for LMStudio).
-async function probeLocalHealth(driver: LocalDriver, model: string): Promise<void> {
+async function probeEngineHealth(driver: EngineDriver, model: string): Promise<void> {
   const backend = driver.backend;
   try {
     const result = await driver.probe(model, AbortSignal.timeout(5_000));
     if (!result.ok) {
       if (result.modelMissing) {
-        log.warn("local.boot_health_model_missing", {
+        log.warn("engine.boot_health_model_missing", {
           backend,
           model,
           hint: result.reason,
         });
       } else {
-        log.warn("local.boot_health_failed", {
+        log.warn("engine.boot_health_failed", {
           backend,
           model,
           hint: result.reason,
@@ -523,9 +530,9 @@ async function probeLocalHealth(driver: LocalDriver, model: string): Promise<voi
       }
       return;
     }
-    log.info("local.boot_health_ok", { backend, model });
+    log.info("engine.boot_health_ok", { backend, model });
   } catch (err) {
-    log.warn("local.boot_health_failed", {
+    log.warn("engine.boot_health_failed", {
       backend,
       model,
       error: (err as Error).message,
@@ -559,6 +566,10 @@ async function main(): Promise<void> {
     localBackend: config.localBackend,
     localModel: config.localModel,
     localUrl: config.localUrl,
+    remoteEnabled: config.remoteEnabled,
+    remoteBackend: config.remoteBackend,
+    remoteModel: config.remoteModel,
+    remoteBaseUrl: config.remoteBaseUrl,
   });
   // One-release-cycle silent-flip guard. Operators upgrading without setting
   // `SOLRAC_DEFAULT_ENGINE` would see no-prefix messages start hitting the
@@ -611,7 +622,7 @@ async function main(): Promise<void> {
     // wins on tool-name collisions so a stale operator copy can't shadow a
     // blessed integration. Tools registered here surface to Claude tiers as
     // `mcp__solrac__<name>`. Local path does NOT see integrations on the
-    // tools-off branch — see local.ts.
+    // tools-off branch — see engine.ts.
     let integrationsMcpServer: McpSdkServerConfigWithInstance | null = null;
     let integrationToolTiers: ReadonlyMap<string, "auto" | "confirm"> = new Map();
     let integrationConfirmFormatters: ReadonlyMap<string, ConfirmFormatter> = new Map();
@@ -655,24 +666,48 @@ async function main(): Promise<void> {
       }
     }
 
-    // Local-engine driver — backend selected per `LOCAL_BACKEND`. Built once
-    // at boot and shared by every consumer (run path, skill path, scheduler).
-    // `null` when the local engine is disabled.
-    const localDriver: LocalDriver | null =
-      config.localEnabled && config.localBackend && config.localModel
-        ? createLocalDriver(config.localBackend, { url: config.localUrl })
-        : null;
+    // Engine-slot driver — backend selected per `LOCAL_BACKEND` (local mode)
+    // OR `REMOTE_BACKEND` (remote mode). The two modes are mutually exclusive
+    // at boot (config.ts validates), so at most one constructor fires. The
+    // resulting driver fills the same `local` engine slot — runner picks the
+    // mode-aware behavior via the `mode` field on EngineRunDeps.
+    let localDriver: EngineDriver | null = null;
+    let localSlotMode: "local" | "remote" = "local";
+    let localSlotModel: string | null = null;
+    let localSlotTimeoutMs = 60_000;
+    let localSlotHistoryLimit = 6;
+    let localSlotMaxToolIterations = 8;
+    if (config.localEnabled && config.localBackend && config.localModel) {
+      localDriver = createLocalDriver(config.localBackend, { url: config.localUrl });
+      localSlotMode = "local";
+      localSlotModel = config.localModel;
+      localSlotTimeoutMs = config.localTimeoutMs;
+      localSlotHistoryLimit = config.localHistoryLimit;
+      localSlotMaxToolIterations = config.localMaxToolIterations;
+    } else if (config.remoteEnabled && config.remoteBackend && config.remoteModel && config.remoteApiKey) {
+      localDriver = createRemoteDriver(config.remoteBackend, {
+        url: config.remoteBaseUrl,
+        apiKey: config.remoteApiKey,
+        referer: config.remoteHttpReferer,
+        title: config.remoteXTitle,
+      });
+      localSlotMode = "remote";
+      localSlotModel = config.remoteModel;
+      localSlotTimeoutMs = config.remoteTimeoutMs;
+      localSlotHistoryLimit = config.remoteHistoryLimit;
+      localSlotMaxToolIterations = config.remoteMaxToolIterations;
+    }
 
     // Skill-side local deps (one-shot, no tool loop, no streaming). Built
     // from config directly (not derived from `localDeps` below) so it's
     // available for `buildSkillTools` before the main `localDeps` is
     // assembled. Both consumers see the same driver instance.
-    const localSkillDeps: LocalSkillDeps | null =
-      localDriver && config.localModel
+    const localSkillDeps: EngineSkillDeps | null =
+      localDriver && localSlotModel
         ? {
             driver: localDriver,
-            model: config.localModel,
-            timeoutMs: config.localTimeoutMs,
+            model: localSlotModel,
+            timeoutMs: localSlotTimeoutMs,
             soul,
           }
         : null;
@@ -717,7 +752,7 @@ async function main(): Promise<void> {
     // a typo broke every module. Fail-soft (start anyway) but make the
     // misconfiguration loud in the boot log.
     if (config.localToolsEnabled && integrationTools.length === 0) {
-      log.warn("local.tools_enabled_but_zero_loaded", {
+      log.warn("engine.tools_enabled_but_zero_loaded", {
         integrationsDir: config.integrationsDir,
         hint: "set SOLRAC_INTEGRATIONS_DIR or add modules under integrations-builtin/",
       });
@@ -754,27 +789,32 @@ async function main(): Promise<void> {
         pendingHandles,
       });
     };
-    // Local-engine deps are constructed once iff the feature is on. When
-    // off, dispatch in makeRunTurn falls through to a "disabled" reply.
+    // Engine-slot deps are constructed once iff the feature is on. When off,
+    // dispatch in makeRunTurn falls through to a "disabled" reply.
     //
     // Tool-loop wiring: when BOTH `localToolsEnabled=true` AND we actually
     // loaded integration tools, surface the tools + tier map + broker into
-    // the deps so `runLocalTurn` dispatches through the tool-loop driver.
+    // the deps so `runEngineTurn` dispatches through the tool-loop driver.
     // When tools are off (or zero loaded), the same deps shape carries
     // `toolEnabled: false` and the single-shot path runs.
+    //
+    // `LOCAL_TOOLS_ENABLED` gates the tool-loop for BOTH local and remote
+    // mode — the env-var name predates the remote mode but the code path is
+    // identical. (Renaming to `BYO_TOOLS_ENABLED` is a v0.7.0-class hard
+    // cutover and out of scope for this PR.)
     const localToolsActive =
       config.localToolsEnabled && integrationTools.length > 0;
     const localIsDefault = config.defaultEngine === "local";
-    const localDeps: LocalRunDeps | null =
-      localDriver && config.localModel
+    const localDeps: EngineRunDeps | null =
+      localDriver && localSlotModel
         ? {
             tg,
             db,
             sessions,
             driver: localDriver,
-            model: config.localModel,
-            timeoutMs: config.localTimeoutMs,
-            historyLimit: config.localHistoryLimit,
+            model: localSlotModel,
+            timeoutMs: localSlotTimeoutMs,
+            historyLimit: localSlotHistoryLimit,
             soul,
             instanceMdPath: solracMdPath,
             isDefaultEngine: localIsDefault,
@@ -782,21 +822,20 @@ async function main(): Promise<void> {
             tools: localToolsActive ? integrationTools : undefined,
             toolTiers: localToolsActive ? integrationToolTiers : undefined,
             broker: localToolsActive ? broker : undefined,
-            maxToolIterations: config.localMaxToolIterations,
+            maxToolIterations: localSlotMaxToolIterations,
           }
         : null;
     if (localDeps && localDriver) {
-      log.info("local.boot", {
+      log.info("engine.boot", {
         backend: localDriver.backend,
-        url: config.localUrl,
-        model: config.localModel,
+        mode: localSlotMode,
+        url: localSlotMode === "local" ? config.localUrl : config.remoteBaseUrl,
+        model: localSlotModel,
         isDefaultEngine: localIsDefault,
         toolsEnabled: localToolsActive,
         toolCount: localToolsActive ? integrationTools.length : 0,
-        maxToolIterations: localToolsActive
-          ? config.localMaxToolIterations
-          : null,
-        timeoutMs: config.localTimeoutMs,
+        maxToolIterations: localToolsActive ? localSlotMaxToolIterations : null,
+        timeoutMs: localSlotTimeoutMs,
       });
     }
     // Attach the tool surface to localSkillDeps AFTER integrationTools/
@@ -808,13 +847,12 @@ async function main(): Promise<void> {
       localSkillDeps.toolTiers = integrationToolTiers;
       localSkillDeps.broker = broker;
     }
-    // The local engine is the recommended default; probe the backend at boot
-    // so operators see a misconfiguration immediately (vs. on first user
-    // turn). Non-fatal: a slow-starting daemon may not be ready yet under
-    // systemd, and crashing Solrac because of a transient probe failure is
-    // worse than logging it.
-    if (localIsDefault && localDeps && localDriver && config.localModel) {
-      void probeLocalHealth(localDriver, config.localModel);
+    // Engine-slot health probe — runs for whichever backend (local or remote)
+    // is wired and selected as the default. Non-fatal: a slow-starting daemon
+    // may not be ready yet under systemd, and a transient OpenRouter network
+    // blip shouldn't crash Solrac.
+    if (localIsDefault && localDeps && localDriver && localSlotModel) {
+      void probeEngineHealth(localDriver, localSlotModel);
     }
     // PNX-167 — boot-time bot identity for `/cmd@<bot>` group-chat targeting.
     // Failure is non-fatal: we proceed with `botUsername=null`, which causes
@@ -883,6 +921,9 @@ async function main(): Promise<void> {
       localSkillDeps,
       defaultEngine: config.defaultEngine,
       localToolsEnabled: config.localToolsEnabled,
+      // null when neither LOCAL_ENABLED nor REMOTE_ENABLED — `/help` then
+      // renders the Claude-only engine section without a cost-framing chip.
+      engineSlotMode: localDeps ? localSlotMode : null,
       taskRegistry,
       triggerScheduledTask: (name) =>
         schedulerRef
@@ -899,13 +940,13 @@ async function main(): Promise<void> {
     // events flow through one subscriber set.
     const webClient: WebClient | null = tgWebClient;
     let webCommandDeps: RunCommandDeps | null = null;
-    let webLocalDeps: LocalRunDeps | null = null;
+    let webLocalDeps: EngineRunDeps | null = null;
     if (webClient) {
       // Web-routed /<skill> invocations: rewrite the broker so confirm
       // prompts ride the SSE bus rather than Telegram (mirrors the
       // webLocalDeps swap below). `tools` and `toolTiers` are unchanged —
       // only the broker differs per transport.
-      const webLocalSkillDeps: LocalSkillDeps | null = commandDeps.localSkillDeps
+      const webEngineSkillDeps: EngineSkillDeps | null = commandDeps.localSkillDeps
         ? {
             ...commandDeps.localSkillDeps,
             broker:
@@ -917,7 +958,7 @@ async function main(): Promise<void> {
       webCommandDeps = {
         ...commandDeps,
         tg: webClient,
-        localSkillDeps: webLocalSkillDeps,
+        localSkillDeps: webEngineSkillDeps,
       };
       // Local-engine-on-web path needs the web broker (not the Telegram
       // broker) so confirm prompts ride the SSE bus to the operator's
@@ -1007,7 +1048,11 @@ async function main(): Promise<void> {
         token: config.webToken,
         webChatId: config.webChatId,
         webClient,
-        defaultEngineLabel: defaultEngineLabel(config.defaultEngine, config.localBackend),
+        defaultEngineLabel: defaultEngineLabel(
+          config.defaultEngine,
+          config.localBackend,
+          config.remoteBackend,
+        ),
         onMessage: (text) => {
           const id = nextWebUpdateId++;
           const update: Update = {
