@@ -59,9 +59,10 @@
  *     is always `null`.
  *   - The streaming editor reuses the `lastEditedContent` no-op-edit guard
  *     and 1.5s throttle so the UX matches the Claude path.
- *   - The footer (`<i>✅ <mode>:<backend>:<model> · Ns</i>`) is load-bearing —
- *     guarantees the final edit differs from any streaming render so Telegram
- *     doesn't 400 on a no-op.
+ *   - The footer (`<i>✅ <mode>:<backend>:<model> · Ns [· $C.CCCC]</i>`) is
+ *     load-bearing — guarantees the final edit differs from any streaming
+ *     render so Telegram doesn't 400 on a no-op. The cost segment appears
+ *     only in remote mode when the driver reported a cost (matches audit).
  *
  * Cross-references:
  *   - docs/ARCHITECTURE.md#local-routing — design discussion
@@ -324,7 +325,7 @@ export async function runEngineTurn(
   const elapsedSec = (Date.now() - startedAt) / 1000;
   const finalRender: Rendered = isError
     ? renderError(errorMessage ?? "unknown")
-    : renderFinal(assistantText, mode, backend, deps.model, elapsedSec);
+    : renderFinal(assistantText, mode, backend, deps.model, elapsedSec, driverCostUsd);
 
   if (stubId !== null) {
     if (finalRender.html !== lastEditedContent) {
@@ -464,6 +465,7 @@ function renderFinal(
   backend: string,
   model: string,
   elapsedSec: number,
+  costUsd: number | null,
 ): Rendered {
   const scrubbed = scrubLocalControlTokens(text);
   const hasText = scrubbed.trim().length > 0;
@@ -473,8 +475,9 @@ function renderFinal(
   // see the same identifier — `remote:openrouter:anthropic/claude-3.5-sonnet`
   // or `local:ollama:gemma3:4b` — and can grep across both surfaces.
   const tag = `${mode}:${backend}:${model}`;
-  const htmlFooter = `<i>✅ ${htmlEscapeText(tag)} · ${elapsedSec.toFixed(1)}s</i>`;
-  const mdFooter = `*✅ ${tag} · ${elapsedSec.toFixed(1)}s*`;
+  const costChip = formatFooterCost(mode, costUsd);
+  const htmlFooter = `<i>✅ ${htmlEscapeText(tag)} · ${elapsedSec.toFixed(1)}s${costChip}</i>`;
+  const mdFooter = `*✅ ${tag} · ${elapsedSec.toFixed(1)}s${costChip}*`;
   return {
     html: truncate(`${htmlBody}\n\n${htmlFooter}`, TELEGRAM_TEXT_MAX),
     markdown: `${mdBody}\n\n${mdFooter}`,
@@ -503,6 +506,16 @@ async function tryEdit(
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
+
+// Cost chip for the engine-slot footer. Mirrors the audit-write matrix in
+// `resolveAuditCost`: local mode is always free (no chip even if a driver
+// erroneously reports cost); remote mode shows the chip only when the driver
+// surfaced a real number. A null in remote mode means OpenRouter omitted the
+// usage.cost field — `remote.cost_missing` already logs; the UI just stays quiet.
+function formatFooterCost(mode: "local" | "remote", costUsd: number | null): string {
+  if (mode !== "remote" || costUsd === null) return "";
+  return ` · $${costUsd.toFixed(4)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +632,7 @@ async function runEngineTurnWithTools(
         elapsedSec,
         result.toolsFired,
         result.iterationCapHit,
+        result.costUsd,
       );
 
   if (stubId !== null) {
@@ -723,6 +737,7 @@ function renderToolLoopFinal(
   elapsedSec: number,
   toolsFired: number,
   iterationCapHit: boolean,
+  costUsd: number | null,
 ): Rendered {
   const scrubbed = scrubLocalControlTokens(text);
   const hasText = scrubbed.trim().length > 0;
@@ -733,8 +748,9 @@ function renderToolLoopFinal(
     : "";
   const toolsChip = toolsFired > 0 ? `${toolsFired} tools · ` : "";
   const tag = `${mode}:${backend}:${model}`;
-  const htmlFooter = `<i>✅ ${htmlEscapeText(tag)} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s</i>`;
-  const mdFooter = `*✅ ${tag} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s*`;
+  const costChip = formatFooterCost(mode, costUsd);
+  const htmlFooter = `<i>✅ ${htmlEscapeText(tag)} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s${costChip}</i>`;
+  const mdFooter = `*✅ ${tag} · ${capChip}${toolsChip}${elapsedSec.toFixed(1)}s${costChip}*`;
   return {
     html: truncate(`${htmlBody}\n\n${htmlFooter}`, TELEGRAM_TEXT_MAX),
     markdown: `${mdBody}\n\n${mdFooter}`,

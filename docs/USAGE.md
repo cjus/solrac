@@ -142,7 +142,7 @@ The default-engine identity is server-resolved from `SOLRAC_DEFAULT_ENGINE`. Whe
 
 **Engine-slot details (remote mode):**
 - **Per-token billed** — `cost_usd` is captured from OpenRouter's streaming `usage.cost` chunk into the audit row. The existing `HOURLY_COST_CAP_USD` + `GLOBAL_HOURLY_COST_CAP_USD` ceilings gate this burn alongside any Claude tier spend.
-- **Footer** — `<i>✅ remote:openrouter:openai/gpt-4o-mini · 1.2s</i>`. The mode prefix (`remote:`) matches the audit-row tag so log-grepping and chat-footer comparison are symmetric.
+- **Footer** — `<i>✅ remote:openrouter:openai/gpt-4o-mini · 1.2s · $0.0042</i>`. The mode prefix (`remote:`) matches the audit-row tag so log-grepping and chat-footer comparison are symmetric. The trailing `$X.XXXX` chip is the per-turn OpenRouter cost; it appears only in remote mode and only when the driver reported a number (mirroring the audit-write decision). If OpenRouter ever omits `usage.cost`, the chip is silently dropped and `remote.cost_missing` logs at warn — UI stays clean, the gap shows up in the operator's log feed.
 - **Tools** — `LOCAL_TOOLS_ENABLED=true` works the same way (the runner is mode-agnostic; tool-loop summation correctly accumulates per-round cost from OpenRouter).
 - **Cross-engine context** — sees prior Claude turns AND prior local turns (same audit-table query path).
 
