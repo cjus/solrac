@@ -64,17 +64,21 @@ src/
 ├── integrations.ts   — operator-authored TS modules + blessed built-ins;
 │                       returns SDK MCP tool definitions + tier map
 ├── agent.ts          — wires Claude Agent SDK; runs one turn
-├── local.ts          — local-engine runner; single-shot + tool-loop dispatcher
-│                       (consumes driver events from local-driver.ts)
-├── local-driver.ts   — backend driver abstraction; createOllamaDriver (NDJSON)
-│                       + createLmstudioDriver (SSE); emits LocalChatEvent union
-├── local-tools.ts    — local-engine tool-loop driver (mcpToLocalTools, runToolLoop,
+├── engine.ts         — engine-slot runner; single-shot + tool-loop dispatcher
+│                       (consumes driver events from local-driver / remote-driver)
+├── engine-driver.ts  — shared backend abstraction (EngineDriver, EngineChatEvent,
+│                       EngineDriverError); driver.mode = "local" | "remote"
+├── local-driver.ts   — on-host backends: createOllamaDriver (NDJSON)
+│                       + createLmstudioDriver (SSE); driver.mode = "local"
+├── remote-driver.ts  — hosted backends: createOpenrouterDriver (SSE +
+│                       auth headers + cost capture); driver.mode = "remote"
+├── engine-tools.ts   — engine-slot tool-loop driver (mcpToEngineTools, runToolLoop,
 │                       executeToolCall — policy + broker per call)
 │
 ├── commands.ts       — slash command parser + dispatcher
 │                       (/clear, /compact, /context, /help, /status, /tasks)
 ├── skills.ts         — load SKILL.md files; expose as /<name> commands
-├── skill-tools.ts    — bridge tool:true skills to the local tool catalog as
+├── skill-tools.ts    — bridge tool:true skills to the engine-slot tool catalog as
 │                       skills__<name>; AsyncLocalStorage for per-turn context
 ├── scheduler.ts      — load TASK.md files; fire on schedule via the queue
 │
@@ -106,10 +110,13 @@ markdown           →  telegram (htmlEscape only)
 policy             →  db + telegram + log + config
 integrations       →  log
 agent              →  session + policy + telegram + log + markdown + instance
-local-driver       →  log
-local-tools        →  policy + log + telegram (types) + integrations + local-driver
-local              →  session + policy + telegram + log + markdown +
-                      local-driver + local-tools + skill-tools + integrations + instance
+engine-driver      →  log
+local-driver       →  log + engine-driver
+remote-driver      →  log + engine-driver
+engine-tools       →  policy + log + telegram (types) + integrations + engine-driver
+engine             →  session + policy + telegram + log + markdown + instance +
+                      engine-driver + local-driver + remote-driver +
+                      engine-tools + skill-tools + integrations
 poll               →  telegram + db + log
 skills             →  log + telegram (types)
 commands           →  agent + policy + db + telegram + skills + scheduler
@@ -265,7 +272,7 @@ The body is a prompt template; `{{args}}` is the only placeholder and is replace
 
 - **Claude tiers (`primary` / `secondary`).** `runSkill` in `commands.ts`. Pre-flight cost cap (chat + global; cap-rejected skills cost $0), then `query()` with `maxTurns: skill.maxTurns`, no `resume` (fresh isolated turn), `tools: { type: "preset", preset: "claude_code" }`, `disallowedTools: ["Agent","Task"]` (sub-agents off; belt-and-suspenders with `policy.ts::SUBAGENT_DENY_TOOLS`). The interactive `canUseTool` factory + `PreToolUse` / `PostToolUse` / `PostToolUseFailure` hooks come from `deps.createCanUseTool` / `policy.ts` — same instances `runAgent` uses, so cost cap, loop detector, and the Telegram-confirm UX behave identically inside a skill. When integrations are loaded, `deps.mcpServer` is wired so the body sees `mcp__solrac__<name>` tools too. Audit row tagged `claude:<tier>:<model>:skill:<name>`; mid-turn cap or loop denials get promoted into `error_message` as `policy_deny:<reason>: …`.
 - **Local tier.** `runLocalSkill` (and the bare `runSkillBare` helper) in `commands.ts`. The helper dispatches on whether `LocalSkillDeps` has `tools + toolTiers + broker` wired:
-  - **Tools wired** → `runSkillBareWithTools` routes the body through the same `runToolLoop` driver that `runLocalTurnWithTools` uses. `maxIterations = skill.maxTurns`, fresh loop detector, full `mcp__solrac__*` + `skills__*` catalog with the skill's own `skills__<self>` entry filtered out (recursion guard — see below). No history, no SOLRAC.md overlay, no streaming stub.
+  - **Tools wired** → `runSkillBareWithTools` routes the body through the same `runToolLoop` driver that `runEngineTurnWithTools` uses. `maxIterations = skill.maxTurns`, fresh loop detector, full `mcp__solrac__*` + `skills__*` catalog with the skill's own `skills__<self>` entry filtered out (recursion guard — see below). No history, no SOLRAC.md overlay, no streaming stub.
   - **Tools absent** → fall through to a single-shot backend round trip (`stream: false`; NDJSON `/api/chat` for Ollama, SSE `/v1/chat/completions` for LMStudio). Preserves pure text-transform skills (no `requires:`, `max_turns: 1`) at minimum latency.
   Either way: audit row tagged `local:<backend>:<model>:skill:<name>` with `cost_usd: 0`. Pre-flight Claude cap is skipped (a chat throttled by Claude burn shouldn't lose access to free local inference).
 
@@ -274,7 +281,7 @@ Reply for both: model output verbatim, HTML-escaped, truncated to ≈3,500 chars
 **Skills as tools (Phase 1: local engine only).** Distinct axis from "skills using tools" above — *that* is shipped on both tiers. *This* is whether the local agent can call a skill **by name** as a tool entry in its catalog. A skill with `tool: true` is exposed as a callable MCP tool to the local agent (`skill-tools.ts::buildSkillTools`). The model sees it in its tool catalog as `mcp__solrac__skills__<name>` (wire format on the local engine: `skills__<name>`) with the operator-authored description. Tool dispatch:
 
 1. **Catalog merge.** At boot, eligible skills (`tool: true && tier: local`) become `SdkMcpToolDefinition` entries with input schema `{ args: string }`. They're merged into `integrationTools` and `integrationToolTiers` (all `auto`-allow) before `localDeps` is constructed.
-2. **Per-turn context propagation.** `runLocalTurnWithTools` wraps the loop in `skillToolCtx.run({chatId, fromId, updateId, parentAuditId}, () => runToolLoop(...))`. The skill handler reads the store via `AsyncLocalStorage.getStore()` — needed because the SDK tool-handler signature `(args, extra) => ...` leaves no slot for chat context, and concurrent turns require race-free context (the queue runs N chats in parallel). ALS is the standard Node primitive for this.
+2. **Per-turn context propagation.** `runEngineTurnWithTools` wraps the loop in `skillToolCtx.run({chatId, fromId, updateId, parentAuditId}, () => runToolLoop(...))`. The skill handler reads the store via `AsyncLocalStorage.getStore()` — needed because the SDK tool-handler signature `(args, extra) => ...` leaves no slot for chat context, and concurrent turns require race-free context (the queue runs N chats in parallel). ALS is the standard Node primitive for this.
 3. **Handler.** Reads ALS context, calls `runSkillBare`, writes a fresh audit row with `origin='tool_call'` so operators can distinguish agent-driven invocations from operator-typed `/<skill>` calls (`origin='user'`). Returns the model's text as the tool result; the parent local turn composes its final user-facing reply on top.
 4. **Permission tier.** Auto-allow. Cost cap is the backstop (Phase 1 local-tier skills are free; Phase 2 unlocks Claude-tier skills with a per-skill cost cap).
 
@@ -421,12 +428,12 @@ Tools surface to the model as `mcp__solrac__<name>`. The full picture:
 
 ### Local-engine scope
 
-`runLocalTurn` in `local.ts` branches on `LOCAL_TOOLS_ENABLED`. The wire-format work lives in `local-driver.ts`'s `LocalDriver` interface — `createOllamaDriver` (NDJSON `/api/chat`) and `createLmstudioDriver` (SSE `/v1/chat/completions`, with `parallel_tool_calls: false` Gemma-4 workaround + tool-call arg-delta accumulation + `[DONE]` terminator handling). Both drivers emit a uniform `LocalChatEvent` union (`{ kind: "text" | "tool_call" | "done" | "error", ... }`); `local.ts` and `local-tools.ts` are wire-format-agnostic above that line.
+`runEngineTurn` in `engine.ts` branches on `LOCAL_TOOLS_ENABLED`. The wire-format work lives behind the `EngineDriver` interface in `engine-driver.ts`, implemented by `local-driver.ts` (`createOllamaDriver` — NDJSON `/api/chat`; `createLmstudioDriver` — SSE `/v1/chat/completions`, with `parallel_tool_calls: false` Gemma-4 workaround + tool-call arg-delta accumulation + `[DONE]` terminator handling) and `remote-driver.ts` (`createOpenrouterDriver` — SSE with auth + attribution headers + trailing `cost` capture). All three drivers emit a uniform `EngineChatEvent` union (`{ kind: "text" | "tool_call" | "done" | "error", ... }`); `engine.ts` and `engine-tools.ts` are wire-format-agnostic above that line.
 
-- **Tools off (default for Claude-only deploys):** single-shot streaming through the driver. No tools exposed; `audit.tool_calls` is `null`. The capability note (`local.ts::buildLocalCapabilityNote`) tells the model it has no tools and nudges users toward `@`/`!` for tool-shaped requests.
-- **Tools on (recommended for the local-default deploy; precondition: `SOLRAC_INTEGRATIONS_ENABLED=true`):** multi-round tool loop in `src/local-tools.ts::runToolLoop`. The local model receives the same `mcp__solrac__*` integration tools the Claude tiers see, with per-call gating reused from `policy.ts` (`classifyToolWithIntegrations`, the `LoopDetector`, the `ConfirmationBroker`). `LOCAL_MAX_TOOL_ITERATIONS` (default 8) backstops a single shared `AbortSignal` covering every fetch in the turn. `audit.tool_calls` records the executed calls. The capability note advertises the loaded tool names so the model knows what it can call.
+- **Tools off (default for Claude-only deploys):** single-shot streaming through the driver. No tools exposed; `audit.tool_calls` is `null`. The capability note (`local-driver.ts::buildLocalCapabilityNote` for local mode, `remote-driver.ts::buildRemoteCapabilityNote` for remote mode; selected by `driver.mode`) tells the model it has no tools and nudges users toward `@`/`!` for tool-shaped requests.
+- **Tools on (recommended for the local-default deploy; precondition: `SOLRAC_INTEGRATIONS_ENABLED=true`):** multi-round tool loop in `src/engine-tools.ts::runToolLoop`. The engine-slot model receives the same `mcp__solrac__*` integration tools the Claude tiers see, with per-call gating reused from `policy.ts` (`classifyToolWithIntegrations`, the `LoopDetector`, the `ConfirmationBroker`). `LOCAL_MAX_TOOL_ITERATIONS` (default 8) backstops a single shared `AbortSignal` covering every fetch in the turn. `audit.tool_calls` records the executed calls. The capability note advertises the loaded tool names so the model knows what it can call.
 
-Both paths share the audit row format, the streaming stub UX, the cost-cap-doesn't-apply rule (`cost_usd = 0`), the cross-engine context bridge, and the `disallowedTools` belt-and-suspenders (`LOCAL_DENY_TOOLS` mirrors `agent.ts`'s SDK-level `disallowedTools: ["Agent","Task"]`). Reliability of local-engine tool-calling varies sharply by model — `gemma4:e4b` (Ollama) is the recommended baseline; LMStudio additionally needs the driver's identical-`(name, args)` dedup to work around Gemma-4's duplicate-tool-call quirk (lmstudio-bug-tracker #1756).
+Both paths share the audit row format, the streaming stub UX, the cross-engine context bridge, and the `disallowedTools` belt-and-suspenders (`ENGINE_DENY_TOOLS` in `engine-tools.ts` mirrors `agent.ts`'s SDK-level `disallowedTools: ["Agent","Task"]`). Local-mode rows write `cost_usd = 0` and bypass the cap window; remote-mode rows carry driver-reported cost and gate against the same per-chat + global caps as Claude. Reliability of engine-slot tool-calling varies sharply by model — `gemma4:e4b` (Ollama) is the recommended local baseline; LMStudio additionally needs the driver's identical-`(name, args)` dedup to work around Gemma-4's duplicate-tool-call quirk (lmstudio-bug-tracker #1756). On OpenRouter, every frontier model handles tool-calling cleanly (Claude, GPT-4o, Gemini, Llama 3.3 70B).
 
 ---
 
@@ -687,7 +694,7 @@ Global is checked first because if the host is over its absolute budget, every c
 
 **v1 limitation:** both caps measure Anthropic API spend only. Tools that call paid third-party APIs (e.g. a `replicate` CLI) aren't measured; auto-deny rules in the classifier are the v1 mitigation. See [`ROADMAP.md` OQ#5 — cost surprises beyond Anthropic](./ROADMAP.md#oq5-cost-surprises-beyond-anthropic).
 
-**Local-engine tool calls are NOT gated by either cost cap.** The local engine is free; the cap exists to bound Anthropic spend. The `LOCAL_MAX_TOOL_ITERATIONS` ceiling and the per-turn loop detector are the runaway-loop defenses for the local path. Confirm-tier tools still go through the same `ConfirmationBroker` regardless of engine.
+**Engine-slot tool calls in local mode are NOT gated by either cost cap.** Local-mode rows write `cost_usd = 0`; the cap exists to bound paid spend. The `LOCAL_MAX_TOOL_ITERATIONS` ceiling and the per-turn loop detector are the runaway-loop defenses for the local path. In remote mode, OpenRouter cost lands in `audit.cost_usd` and participates in the same per-chat + global hourly caps as Claude burn. Confirm-tier tools still go through the same `ConfirmationBroker` regardless of engine or mode.
 
 ---
 
@@ -695,33 +702,40 @@ Global is checked first because if the host is over its absolute budget, every c
 
 ## Engine routing (prefix table)
 
-The first non-whitespace character of `msg.text` picks the engine; with no prefix, `SOLRAC_DEFAULT_ENGINE` (default `local`) decides. The default routes no-prefix messages to the local-engine path, so Anthropic burn happens only on a deliberate `@` (Sonnet) or `!` (Opus). The local backend is picked at deploy time via `LOCAL_BACKEND` (`ollama` | `lmstudio`); the engine layer is backend-agnostic.
+The first non-whitespace character of `msg.text` picks the engine; with no prefix, `SOLRAC_DEFAULT_ENGINE` (default `local`) decides. The default routes no-prefix messages to the engine-slot path (Ollama / LMStudio / OpenRouter), so Anthropic burn happens only on a deliberate `@` (Sonnet) or `!` (Opus). The engine-slot backend is picked at deploy time via `LOCAL_BACKEND` (`ollama` | `lmstudio`) **or** `REMOTE_BACKEND` (`openrouter`); the engine layer is backend-agnostic.
 
 | Prefix | Engine label | Model | Tools | Audit `model` value |
 |--------|--------------|-------|-------|---------------------|
-| (none) | depends on `SOLRAC_DEFAULT_ENGINE` (`local` by default) | `LOCAL_MODEL` on `LOCAL_BACKEND` for default-local; otherwise the matching tier model | integrations only on the local engine (when `LOCAL_TOOLS_ENABLED=true`); `claude_code` preset + integrations on Claude | matches the resolved engine |
+| (none), local mode | engine slot served by `LOCAL_BACKEND` (Ollama / LMStudio) | `LOCAL_MODEL` | integrations when `LOCAL_TOOLS_ENABLED=true` | `local:<backend>:<modelId>` |
+| (none), remote mode | engine slot served by `REMOTE_BACKEND` (OpenRouter) | `REMOTE_MODEL` (`<provider>/<model>` slug) | integrations when `LOCAL_TOOLS_ENABLED=true` | `remote:<backend>:<modelId>` |
 | `@` | `primary` (Claude) — escalation | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | `claude_code` preset + integrations | `claude:primary:<modelId>` |
 | `!` | `secondary` (Claude) — heaviest | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | `claude_code` preset + integrations | `claude:secondary:<modelId>` |
 
-There is no `>`-style escape prefix. A leading `>` is literal user text routed via no-prefix → `defaultEngine`. The local-engine path is reached only when it is the default engine.
+There is no `>`-style escape prefix. A leading `>` is literal user text routed via no-prefix → `defaultEngine`. The engine slot is reached only when it is the default engine.
 
 `policy.ts::parseEnginePrefix(text, defaultEngine)` returns `{ engine, explicit, prompt }`. `explicit` is true only when an actual prefix character (`@` or `!`) was consumed; `main.ts` uses it to render usage hints on empty explicit-prefix payloads.
 
-**Design rationale.** *Claude only when explicitly requested.* Anthropic burn happens on a deliberate `@` or `!`; everything else stays local and free. The integration surface (operator-authored + blessed `mcp__solrac__*` tools) is shared across all three engines — the local engine gets it via `LOCAL_TOOLS_ENABLED=true`, both Claude tiers get it via the `claude_code` preset.
+**Local vs remote mode.** The internal `Engine = "primary" | "secondary" | "local"` union is unchanged — adding OpenRouter did NOT add a new engine. Each `EngineDriver` carries a `mode: "local" | "remote"` field set by its factory (`createOllamaDriver`/`createLmstudioDriver` → `"local"`; `createOpenrouterDriver` → `"remote"`). `runEngineTurn` reads `driver.mode` directly — there's no parallel `mode` field on the deps. Mode drives three behaviors: audit-tag prefix (`local:` vs `remote:`), capability-note cost framing (free vs per-token), and the `cost_usd` write decision (always 0 for local; driver-reported for remote; `null` + `remote.cost_missing` warn if the driver returned no cost). The runner has one code path; mode is a one-line discriminator on the driver.
+
+**Design rationale.** *Claude only when explicitly requested.* Anthropic burn happens on a deliberate `@` or `!`; everything else stays in the engine slot (free on local mode, per-token on remote mode). The integration surface (operator-authored + blessed `mcp__solrac__*` tools) is shared across all three engines — the engine slot gets it via `LOCAL_TOOLS_ENABLED=true` regardless of mode, both Claude tiers get it via the `claude_code` preset.
 
 **Boot validation enforces reachability:**
 
-- `defaultEngine === "local" && !localEnabled` → throw (the default would error every turn).
-- `defaultEngine !== "local" && localToolsEnabled` → throw (the local engine runs only as the default; tools-on without it being the default would load tool schemas no engine can call).
+- `defaultEngine === "local" && !localEnabled && !remoteEnabled` → throw (the default would error every turn).
+- `defaultEngine !== "local" && localToolsEnabled` → throw (the engine slot runs only as the default; tools-on without it being the default would load tool schemas no engine can call).
+- `localEnabled && remoteEnabled` → throw (mutually exclusive — the engine slot has one driver per boot).
 - `localEnabled === true && (!localBackend || !localModel)` → throw (the backend driver can't be constructed).
+- `remoteEnabled === true && (!remoteBackend || !remoteModel || !remoteApiKey)` → throw.
 - `SOLRAC_DEFAULT_ENGINE=ollama` (legacy) → throw with a rename hint pointing at `local` + `LOCAL_BACKEND=ollama`. Same for every legacy `OLLAMA_*` env var.
 
-When `defaultEngine === "local"`, boot fires a one-shot backend health probe via `driver.probe()` (`/api/tags` for Ollama, `/v1/models` for LMStudio); failures are logged (`local.boot_health_failed`) but non-fatal — the backend may come up after Solrac under systemd, and we don't want to crash the unit on a transient.
+When `defaultEngine === "local"`, boot fires a one-shot health probe via `driver.probe()` against whichever backend is wired (`/api/tags` for Ollama, `/v1/models` for LMStudio, `/models` with bearer for OpenRouter); failures are logged (`engine.boot_health_failed`) but non-fatal — the backend may come up after Solrac under systemd, and we don't want to crash the unit on a transient.
+
+**Cost capture (remote mode).** OpenRouter's streaming SSE response includes a `cost` (USD) field in the trailing usage chunk automatically — no opt-in required as of 2026 ([OpenRouter docs](https://openrouter.ai/docs/guides/administration/usage-accounting)). `EngineChatEvent.done` carries `costUsd: number | null`; `engine.ts::resolveAuditCost` writes it to `audit.cost_usd`. The existing `HOURLY_COST_CAP_USD` + `GLOBAL_HOURLY_COST_CAP_USD` queries sum `cost_usd` indiscriminately, so remote burn is gated alongside Claude burn — no new cost-cap knob. Defensive: if the driver returns `null` (field disappeared, parse error), the runner writes `null` (NOT 0) so the cap query's `COALESCE(SUM(cost_usd), 0)` doesn't silently treat the row as free. A `remote.cost_missing` warn fires on every such row.
 
 ```
 poll → gate → throttle → queue.enqueue
                           └─ runTurn (queued)
-                              ├─ engine === 'local'     → runLocalTurn
+                              ├─ engine === 'local'     → runEngineTurn
                               └─ 'primary' | 'secondary' → runAgent({engine, ...})
 ```
 
@@ -799,11 +813,12 @@ Pre-tier rows ran on the then-default `SOLRAC_MODEL=claude-opus-4-7`, which is n
 
 The local engine is the default in the recommended config (`SOLRAC_DEFAULT_ENGINE=local`). No-prefix messages route here; Claude tiers are reached via explicit `@` / `!`. There is no `>`-style escape prefix — the local engine runs only as the default, so an extra prefix character would be redundant.
 
-Backend selection sits one layer below the engine. `LOCAL_BACKEND` (`ollama` | `lmstudio`) picks the wire driver in `local-driver.ts`:
+Backend selection sits one layer below the engine. `LOCAL_BACKEND` (`ollama` | `lmstudio`) picks the on-host wire driver in `local-driver.ts`; `REMOTE_BACKEND=openrouter` picks the hosted driver in `remote-driver.ts`:
 - `ollama` — NDJSON `/api/chat`, probe `/api/tags`; default port 11434.
 - `lmstudio` — SSE `/v1/chat/completions` (with `parallel_tool_calls: false` Gemma-4 workaround + tool-call argument-delta accumulation + `[DONE]` terminator + optional trailing `usage` chunk), probe `/v1/models`; default port 1234.
+- `openrouter` — SSE `/v1/chat/completions` (OpenAI-compatible; bearer auth + `HTTP-Referer`/`X-Title` attribution headers; trailing `usage.cost` chunk captured to `audit.cost_usd`), probe `/v1/models`.
 
-The `LocalDriver.streamChat` interface emits a uniform `LocalChatEvent` union (`{ kind: "text" | "tool_call" | "done" | "error", ... }`); everything above the driver layer (`local.ts`, `local-tools.ts`, `skill-tools.ts`) is wire-format-agnostic. Adding a third backend (vLLM, llama.cpp) means writing one more `create<Backend>Driver` and registering it in the factory.
+The `EngineDriver.streamChat` interface (defined in `engine-driver.ts`) emits a uniform `EngineChatEvent` union (`{ kind: "text" | "tool_call" | "done" | "error", ... }`); everything above the driver layer (`engine.ts`, `engine-tools.ts`, `skill-tools.ts`) is wire-format-agnostic. Adding a fourth backend (vLLM, llama.cpp, Together.ai) means writing one more `create<Backend>Driver` setting `mode: "local" | "remote"` accordingly and registering it in the matching factory.
 
 Motivation: (1) most casual chat doesn't need Claude's reasoning, so the free local path becomes the workhorse; (2) when `LOCAL_TOOLS_ENABLED=true`, the local model can call the same `mcp__solrac__*` integrations Claude does — the operator's tool surface is what makes default-local useful for tool-driven work.
 
@@ -818,8 +833,8 @@ Motivation: (1) most casual chat doesn't need Claude's reasoning, so the free lo
 
 - **No `canUseTool` / `PreToolUse` SDK hooks**: the SDK isn't in the loop. With `LOCAL_TOOLS_ENABLED=true`, the same gates run inside `runToolLoop` (cost cap doesn't apply since cost is zero, but `LoopDetector` and `ConfirmationBroker` do). With tools off, no gates run at all — there are no tool calls to gate.
 - **No `SessionStore` resume**: the backend chat endpoint is stateless per call (both Ollama and LMStudio). Conversation continuity comes from history reconstruction, not session IDs.
-- **No `claude_code` system-prompt preset**: local backends don't know it. The first `system` message is `${soul}\n\n${capabilityNote}` — the operator-editable `SOUL.md` text plus a one-line engine-specific clause built by `local.ts::buildLocalCapabilityNote` (which adapts based on whether tools are on, and whether the local engine is the default vs. an explicit escalation target). When `SOLRAC.md` is present and activated, its content ships as a second `system` message wrapped in `<solrac-md>` (a separate turn rather than concatenated, since local models lack RLHF on instruction hierarchy).
-- **`cost_usd = 0`** in audit rows. Cost-cap queries sum over all rows so the local engine doesn't pollute the cap window — the per-chat and global cost caps are unaffected.
+- **No `claude_code` system-prompt preset**: engine-slot backends don't know it. The first `system` message is `${soul}\n\n${capabilityNote}` — the operator-editable `SOUL.md` text plus a one-line clause built by `local-driver.ts::buildLocalCapabilityNote` (mode = "local", "free" framing) or `remote-driver.ts::buildRemoteCapabilityNote` (mode = "remote", "per-token via OpenRouter" framing). Each builder adapts based on whether tools are on and whether the engine slot is the default vs. an explicit escalation target. The runner picks the right builder via `driver.mode`. When `SOLRAC.md` is present and activated, its content ships as a second `system` message wrapped in `<solrac-md>` (a separate turn rather than concatenated, since these models lack RLHF on instruction hierarchy).
+- **`cost_usd = 0` in local mode**; **driver-reported cost in remote mode**. Cost-cap queries sum over all rows; local-mode rows are free (0), remote-mode rows carry OpenRouter's per-call cost so remote burn participates in the same per-chat + global hourly caps as Claude burn.
 - **`agent_session_id = null`** and **`tool_calls = null`** in audit rows when tools are off.
 
 ### Stateful conversation history
@@ -852,7 +867,7 @@ Default `LOCAL_HISTORY_LIMIT=6` = 3 round-trips. At 256-char truncated prompts �
 - **OQ-A**: history is per-chat across all local models. If we later add `>gemma3 ...` vs `>qwen2.5 ...` model selection, the query needs `AND model = ?`.
 - **OQ-B**: history is capped by *count*, not tokens. A 2k-context model will silently truncate.
 - **OQ-C**: per-local-engine concurrency cap. Today the local engine shares the global `MAX_CONCURRENT_TURNS=4` semaphore with Claude. Local inference is GPU-bound; 4 simultaneous local streams thrash a single GPU. Add a separate `MAX_CONCURRENT_LOCAL_TURNS` semaphore in front of the local path if measured.
-- **OQ-D**: no inference-budget cap. The local engine is free, but a flooder could pin the GPU. Allowlist gates strangers.
+- **OQ-D**: no inference-budget cap. The engine slot in local mode is free, but a flooder could pin the GPU. Allowlist gates strangers. Remote-mode OpenRouter burn is already gated by the per-chat + global hourly cost caps.
 
 ---
 
@@ -1062,11 +1077,11 @@ If we reordered (offset before claim), a crash between steps 2 and 3 would re-pr
 
 **Problem.** Ollama signals request-level errors via HTTP status codes (caught by `LocalDriverError` in `streamChat`'s pre-stream `res.ok` check). **LMStudio does not.** Context-length overruns, prompt-template mismatches, and similar server-side rejections arrive with **HTTP 200** and a single SSE frame shaped `{"error":{"message":"…"},"message":"…"}`, often followed by `[DONE]` or an immediate stream close. The driver's frame parser previously only knew about `model`/`choices`/`usage`, so these frames fell through, the consumer saw zero events, and the UI rendered `(empty response)` with no diagnostic — a silent failure where the operator had no way to know LMStudio actually told us what went wrong.
 
-**Solution.** `LmstudioSseFrame` has an `error?: { message?: string } | string` field; the parse loop in `createLmstudioDriver` checks `frame.error` immediately after JSON-parsing each frame and yields `{ kind: "error", message }` (mirroring the Ollama-side `frame.error` branch at the top of `streamChat`). `runStreamingRound` then breaks on `kind:"error"` and the message propagates through `errorMessage` to the `local.done` audit row and the rendered `❌ error: …` reply.
+**Solution.** `LmstudioSseFrame` has an `error?: { message?: string } | string` field; the parse loop in `createLmstudioDriver` checks `frame.error` immediately after JSON-parsing each frame and yields `{ kind: "error", message }` (mirroring the Ollama-side `frame.error` branch at the top of `streamChat`). `runStreamingRound` then breaks on `kind:"error"` and the message propagates through `errorMessage` to the `engine.done` audit row and the rendered `❌ error: …` reply.
 
-**Diagnostic layer.** A separate guard, `maybeLogEmptyStream` in `local-driver.ts`, captures up to 30 raw `data:` payloads (truncated to 400 chars each) and emits `local.lmstudio_empty_stream` at warn level if both text and tool-call counters end at zero. This is the safety net for *future* unknown frame shapes — if LMStudio adds a new error envelope or content channel, the raw frames land in the log so the cause is recoverable without a wire-capture rerun. Happy path is silent; only fires when no events were yielded.
+**Diagnostic layer.** A separate guard, `maybeLogEmptyStream` in `engine-driver.ts` (shared between local + remote drivers), captures up to 30 raw `data:` payloads (truncated to 400 chars each) and emits `<backend>.empty_stream` at warn level — `lmstudio.empty_stream` from `local-driver.ts`, `openrouter.empty_stream` from `remote-driver.ts` — if both text and tool-call counters end at zero. This is the safety net for *future* unknown frame shapes — if LMStudio or OpenRouter adds a new error envelope or content channel, the raw frames land in the log so the cause is recoverable without a wire-capture rerun. Happy path is silent; only fires when no events were yielded.
 
-**Implication.** Adding a new LMStudio response shape requires either (a) extending `LmstudioSseFrame` with the new field and adding a parse branch, or (b) extending the error detection. Either way, when a turn fails, **check `local.lmstudio_empty_stream` warns first** — they're the canary for protocol drift between releases.
+**Implication.** Adding a new LMStudio response shape requires either (a) extending `LmstudioSseFrame` with the new field and adding a parse branch, or (b) extending the error detection. Either way, when a turn fails, **check `lmstudio.empty_stream` warns first** — they're the canary for protocol drift between releases.
 
 ---
 
@@ -1151,7 +1166,7 @@ Off by default. Enabled via `SOLRAC_WEB_ENABLED=true` plus a token. Brings a bro
 
 ### How it preserves the existing path
 
-`agent.ts` and `local.ts` already accept any `TelegramClient`. main.ts builds a parallel `WebClient`, a parallel `commandDeps` (with `tg = webClient`), a parallel `LocalRunDeps`, and a parallel `ConfirmationBroker` (also pointed at `webClient`). The single turn queue's `runTurn` dispatches to the web variants when the synthetic `webChatId` is on the update; otherwise the Telegram path runs unchanged.
+`agent.ts` and `engine.ts` already accept any `TelegramClient`. main.ts builds a parallel `WebClient`, a parallel `commandDeps` (with `tg = webClient`), a parallel `EngineRunDeps`, and a parallel `ConfirmationBroker` (also pointed at `webClient`). The single turn queue's `runTurn` dispatches to the web variants when the synthetic `webChatId` is on the update; otherwise the Telegram path runs unchanged.
 
 ```
 Browser ──HTTP──▶ web.ts (Bun.serve, separate port)
@@ -1165,7 +1180,7 @@ Browser ──HTTP──▶ web.ts (Bun.serve, separate port)
    │                  │ runTurn dispatches by chatId → webRunTurn / tgRunTurn
    ◀──events────  WebClient (TelegramClient impl)
                        │
-                       └─▶ runAgent / runLocalTurn (tg = webClient)
+                       └─▶ runAgent / runEngineTurn (tg = webClient)
                               audit row written, cost cap, policy hooks — all unchanged
 ```
 
@@ -1173,7 +1188,7 @@ Browser ──HTTP──▶ web.ts (Bun.serve, separate port)
 
 Telegram's HTML parse_mode supports a small subset (`<b> <i> <s> <a> <code> <pre> <blockquote>`). `agent.ts:495` previously emitted `htmlEscapeText(text)` on Claude's body, which preserved markdown syntax as literal characters in Telegram. The fix:
 
-- `agent.ts` and `local.ts` now run the response body through `mdToTelegramHtml(text)` for Telegram (proper bold, italic, code blocks; lists flattened to `• item`; headers to `<b>`; tables to ASCII inside `<pre>`).
+- `agent.ts` and `engine.ts` now run the response body through `mdToTelegramHtml(text)` for Telegram (proper bold, italic, code blocks; lists flattened to `• item`; headers to `<b>`; tables to ASCII inside `<pre>`).
 - `SendMessageOpts` and `EditMessageTextOpts` carry an optional `markdownSource: string` sidecar. The real Telegram client (`telegram.ts:205-215`) destructures-and-drops it before `tgCall` — never hits the wire.
 - `WebClient` reads `markdownSource` preferentially; consumer (browser) renders it with `marked` + `sanitizeHtml`. If absent, the html-fallback (already sanitized at the SSE boundary) is used.
 

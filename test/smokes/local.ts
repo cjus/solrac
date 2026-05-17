@@ -1,9 +1,9 @@
-// Live smoke: drives runLocalTurn against a real local backend (Ollama or
-// LMStudio) with a stub Telegram client. Proves the whole pipeline end-to-end
-// without touching the live bot or .env:
+// Live smoke: drives runEngineTurn against a real engine-slot backend (Ollama,
+// LMStudio, or OpenRouter) with a stub Telegram client. Proves the whole
+// pipeline end-to-end without touching the live bot or .env:
 //   1. Driver event-stream parsing matches what the real backend emits.
-//   2. Audit row finalizes correctly (model='local:<backend>:<name>',
-//      cost_usd=0, tokens populated).
+//   2. Audit row finalizes correctly (model='<mode>:<backend>:<name>',
+//      cost_usd matches the mode: 0 for local, > 0 for remote, tokens populated).
 //   3. History reconstruction (turn 2 sees turn 1's prompt+response).
 //   4. Telegram render path (stub-then-edit) produces sensible final text.
 //   5. (tools-on) A time_now tool call round-trips via runToolLoop; audit
@@ -15,16 +15,17 @@
 //   LOCAL_BACKEND=ollama LOCAL_MODEL=gemma4:e4b npm run smoke:local
 //   LOCAL_BACKEND=lmstudio LOCAL_MODEL=qwen2.5-7b npm run smoke:local
 //
+// OpenRouter (remote) mode — requires REMOTE_API_KEY; charges per-token:
+//   LOCAL_BACKEND=openrouter LOCAL_MODEL=openai/gpt-4o-mini REMOTE_API_KEY=sk-or-… npm run smoke:local
+//
 // To exercise the tools-on path:
 //   LOCAL_TOOLS_ENABLED=true npm run smoke:local
 
 import type { Message } from "@grammyjs/types";
-import { runLocalTurn } from "../../src/local.ts";
-import {
-  createLocalDriver,
-  type LocalBackend,
-  type LocalDriver,
-} from "../../src/local-driver.ts";
+import { runEngineTurn } from "../../src/engine.ts";
+import type { EngineBackend, EngineDriver } from "../../src/engine-driver.ts";
+import { createLocalDriver } from "../../src/local-driver.ts";
+import { createRemoteDriver } from "../../src/remote-driver.ts";
 import type { ConfirmationBroker } from "../../src/policy.ts";
 import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import timeIntegration from "../../src/integrations-builtin/time/index.ts";
@@ -33,20 +34,50 @@ import type { TelegramClient } from "../../src/telegram.ts";
 import { openTestDb, reportAndExit, type Phase } from "./harness.ts";
 
 const BACKEND = parseBackend(process.env.LOCAL_BACKEND);
+// Remote mode kicks in only when LOCAL_BACKEND=openrouter. The same env knob
+// covers all three backends to keep the smoke surface small.
+const MODE: "local" | "remote" = BACKEND === "openrouter" ? "remote" : "local";
+const REMOTE_API_KEY = process.env.REMOTE_API_KEY ?? "";
 const URL =
   process.env.LOCAL_URL ??
-  (BACKEND === "lmstudio" ? "http://localhost:1234" : "http://localhost:11434");
+  (BACKEND === "openrouter"
+    ? "https://openrouter.ai/api/v1"
+    : BACKEND === "lmstudio"
+      ? "http://localhost:1234"
+      : "http://localhost:11434");
 const MODEL =
-  process.env.LOCAL_MODEL ?? (BACKEND === "lmstudio" ? "qwen2.5-7b" : "gemma4:e4b");
+  process.env.LOCAL_MODEL ??
+  (BACKEND === "openrouter"
+    ? "openai/gpt-4o-mini"
+    : BACKEND === "lmstudio"
+      ? "qwen2.5-7b"
+      : "gemma4:e4b");
 
-function parseBackend(raw: string | undefined): LocalBackend {
+function parseBackend(raw: string | undefined): EngineBackend {
   if (raw === "lmstudio") return "lmstudio";
+  if (raw === "openrouter") return "openrouter";
   return "ollama";
 }
 
 // Backend-specific hint substring expected in error messages for the
 // bad-model phase. Each backend has its own "model missing" copy.
-const PULL_HINT = BACKEND === "lmstudio" ? "lms load" : "ollama pull";
+const PULL_HINT =
+  BACKEND === "openrouter"
+    ? "openrouter"
+    : BACKEND === "lmstudio"
+      ? "lms load"
+      : "ollama pull";
+
+// Hard-skip OpenRouter without a key — the smoke makes real billed API
+// calls. Print a clear message + exit 0 so CI / sweep runs don't break.
+if (BACKEND === "openrouter" && !REMOTE_API_KEY) {
+  // eslint-disable-next-line no-console
+  console.log(
+    "local-smoke: BACKEND=openrouter requested but REMOTE_API_KEY is not set. " +
+      "Skipping (this smoke makes real billed API calls; set REMOTE_API_KEY to run).",
+  );
+  process.exit(0);
+}
 
 interface CapturedTg extends TelegramClient {
   sent: { chatId: number; text: string }[];
@@ -82,7 +113,10 @@ async function main(): Promise<void> {
 
   const { db } = await openTestDb("local-smoke");
   const tg = makeCapturedTg();
-  const driver: LocalDriver = createLocalDriver(BACKEND, { url: URL });
+  const driver: EngineDriver =
+    BACKEND === "openrouter"
+      ? createRemoteDriver(BACKEND, { url: URL, apiKey: REMOTE_API_KEY })
+      : createLocalDriver(BACKEND, { url: URL });
   const deps = {
     tg,
     db,
@@ -99,11 +133,11 @@ async function main(): Promise<void> {
   const phases: Phase[] = [];
   const CHAT = 8001;
   const FROM = 9001;
-  const EXPECTED_MODEL_TAG = `local:${BACKEND}:${MODEL}`;
+  const EXPECTED_MODEL_TAG = `${MODE}:${BACKEND}:${MODEL}`;
 
   // ── Turn 1: cold call. No history, just system + user. ────────────────────
   const t0 = Date.now();
-  await runLocalTurn(deps, {
+  await runEngineTurn(deps, {
     chatId: CHAT,
     fromId: FROM,
     updateId: 1001,
@@ -135,16 +169,26 @@ async function main(): Promise<void> {
     pass: row1.status === "ok",
   });
   phases.push({
-    name: "turn 1: model column tagged local:<backend>:<name>",
+    name: `turn 1: model column tagged ${MODE}:<backend>:<name>`,
     expected: `model=${EXPECTED_MODEL_TAG}`,
     actual: `model=${row1.model}`,
     pass: row1.model === EXPECTED_MODEL_TAG,
   });
+  // Cost expectation forks on mode:
+  //   local  → exactly 0 (on-host backends are free).
+  //   remote → > 0 (OpenRouter bills per turn; the streaming usage.cost
+  //            field flowed through resolveAuditCost into audit.cost_usd).
   phases.push({
-    name: "turn 1: cost_usd is 0 (local engine is free)",
-    expected: "cost_usd=0",
+    name:
+      MODE === "remote"
+        ? "turn 1: cost_usd > 0 (remote mode captures OpenRouter cost)"
+        : "turn 1: cost_usd is 0 (local engine is free)",
+    expected: MODE === "remote" ? "cost_usd > 0" : "cost_usd=0",
     actual: `cost_usd=${row1.cost_usd}`,
-    pass: row1.cost_usd === 0,
+    pass:
+      MODE === "remote"
+        ? typeof row1.cost_usd === "number" && row1.cost_usd > 0
+        : row1.cost_usd === 0,
   });
   phases.push({
     name: "turn 1: agent_session_id null (local engine is sessionless)",
@@ -202,7 +246,7 @@ async function main(): Promise<void> {
 
   // ── Turn 2: follow-up. recentChatTurns now returns turn 1. ────────────────
   const tg2 = makeCapturedTg();
-  await runLocalTurn(
+  await runEngineTurn(
     { ...deps, tg: tg2 },
     {
       chatId: CHAT,
@@ -221,7 +265,7 @@ async function main(): Promise<void> {
     pass: row2.status === "ok",
   });
   phases.push({
-    name: "turn 2: model column tagged local:<backend>:<name>",
+    name: `turn 2: model column tagged ${MODE}:<backend>:<name>`,
     expected: `model=${EXPECTED_MODEL_TAG}`,
     actual: `model=${row2.model}`,
     pass: row2.model === EXPECTED_MODEL_TAG,
@@ -240,7 +284,7 @@ async function main(): Promise<void> {
 
   // ── Error path: bad model name → audit row status='error' with hint ───────
   const tg3 = makeCapturedTg();
-  await runLocalTurn(
+  await runEngineTurn(
     { ...deps, tg: tg3, model: "definitely-not-a-real-model" },
     {
       chatId: CHAT,
@@ -291,7 +335,7 @@ async function main(): Promise<void> {
     };
 
     const tg4 = makeCapturedTg();
-    await runLocalTurn(
+    await runEngineTurn(
       {
         ...deps,
         tg: tg4,
@@ -327,7 +371,7 @@ async function main(): Promise<void> {
       pass: row4.status === "ok",
     });
     phases.push({
-      name: "tools-on: model column tagged local:<backend>:<name>",
+      name: `tools-on: model column tagged ${MODE}:<backend>:<name>`,
       expected: `model=${EXPECTED_MODEL_TAG}`,
       actual: `model=${row4.model}`,
       pass: row4.model === EXPECTED_MODEL_TAG,

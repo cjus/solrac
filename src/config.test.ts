@@ -486,3 +486,155 @@ describe("loadConfig — solracHome resolution", () => {
     expect(cfg.dataDir).toBe(`${TEST_HOME}/mydata`);
   });
 });
+
+describe("loadConfig — REMOTE_* (OpenRouter)", () => {
+  test("default: remoteEnabled=false, no provider, defaults populated", () => {
+    const cfg = loadConfig({ ...baseEnv });
+    expect(cfg.remoteEnabled).toBe(false);
+    expect(cfg.remoteBackend).toBe(null);
+    expect(cfg.remoteModel).toBe(null);
+    expect(cfg.remoteApiKey).toBe(null);
+    // The base URL is empty when remote is disabled (no backend selected to
+    // resolve a default for); validation only runs on enabled paths.
+    expect(cfg.remoteBaseUrl).toBe("");
+    expect(cfg.remoteHttpReferer).toBe("https://github.com/cjus/solrac");
+    expect(cfg.remoteXTitle).toBe("solrac");
+  });
+
+  test("REMOTE_ENABLED=true requires REMOTE_BACKEND", () => {
+    expect(() =>
+      loadConfig({ ...baseEnv, REMOTE_ENABLED: "true" }),
+    ).toThrow(/REMOTE_BACKEND is required/);
+  });
+
+  test("REMOTE_ENABLED=true requires REMOTE_MODEL", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        REMOTE_ENABLED: "true",
+        REMOTE_BACKEND: "openrouter",
+        REMOTE_API_KEY: "sk-or-test",
+      }),
+    ).toThrow(/REMOTE_MODEL is required/);
+  });
+
+  test("REMOTE_ENABLED=true requires REMOTE_API_KEY", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        REMOTE_ENABLED: "true",
+        REMOTE_BACKEND: "openrouter",
+        REMOTE_MODEL: "anthropic/claude-3.5-sonnet",
+      }),
+    ).toThrow(/REMOTE_API_KEY is required/);
+  });
+
+  test("invalid REMOTE_BACKEND value throws", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        REMOTE_ENABLED: "true",
+        REMOTE_BACKEND: "totally-real-provider",
+      }),
+    ).toThrow(/REMOTE_BACKEND must be "openrouter"/);
+  });
+
+  test("full REMOTE_* config + SOLRAC_DEFAULT_ENGINE=local passes", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      SOLRAC_DEFAULT_ENGINE: "local",
+      REMOTE_ENABLED: "true",
+      REMOTE_BACKEND: "openrouter",
+      REMOTE_MODEL: "anthropic/claude-3.5-sonnet",
+      REMOTE_API_KEY: "sk-or-test",
+    });
+    expect(cfg.remoteEnabled).toBe(true);
+    expect(cfg.remoteBackend).toBe("openrouter");
+    expect(cfg.remoteModel).toBe("anthropic/claude-3.5-sonnet");
+    expect(cfg.remoteApiKey).toBe("sk-or-test");
+    expect(cfg.remoteBaseUrl).toBe("https://openrouter.ai/api/v1");
+    expect(cfg.defaultEngine).toBe("local");
+  });
+
+  test("REMOTE_BASE_URL override strips trailing slash", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      REMOTE_ENABLED: "true",
+      REMOTE_BACKEND: "openrouter",
+      REMOTE_MODEL: "x/y",
+      REMOTE_API_KEY: "k",
+      REMOTE_BASE_URL: "https://proxy.example.com/api/v1/",
+    });
+    expect(cfg.remoteBaseUrl).toBe("https://proxy.example.com/api/v1");
+  });
+
+  test("malformed REMOTE_BASE_URL throws at boot", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        REMOTE_ENABLED: "true",
+        REMOTE_BACKEND: "openrouter",
+        REMOTE_MODEL: "x/y",
+        REMOTE_API_KEY: "k",
+        REMOTE_BASE_URL: "openrouter.ai/api/v1",
+      }),
+    ).toThrow(/REMOTE_BASE_URL/);
+  });
+
+  test("LOCAL_ENABLED + REMOTE_ENABLED both true is mutually exclusive", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        LOCAL_ENABLED: "true",
+        LOCAL_BACKEND: "ollama",
+        LOCAL_MODEL: "gemma3",
+        REMOTE_ENABLED: "true",
+        REMOTE_BACKEND: "openrouter",
+        REMOTE_MODEL: "anthropic/claude-3.5-sonnet",
+        REMOTE_API_KEY: "k",
+      }),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  test("SOLRAC_DEFAULT_ENGINE=local works with REMOTE_ENABLED=true (no on-host LLM)", () => {
+    // The user's stated framing: a host that can't run a local LLM still
+    // gets a default-engine option via OpenRouter.
+    const cfg = loadConfig({
+      ...baseEnv,
+      SOLRAC_DEFAULT_ENGINE: "local",
+      REMOTE_ENABLED: "true",
+      REMOTE_BACKEND: "openrouter",
+      REMOTE_MODEL: "openai/gpt-4o-mini",
+      REMOTE_API_KEY: "k",
+    });
+    expect(cfg.defaultEngine).toBe("local");
+    expect(cfg.localEnabled).toBe(false);
+    expect(cfg.remoteEnabled).toBe(true);
+  });
+
+  test("SOLRAC_DEFAULT_ENGINE=local with neither LOCAL nor REMOTE enabled throws", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        SOLRAC_DEFAULT_ENGINE: "local",
+      }),
+    ).toThrow(/requires LOCAL_ENABLED=true.*or REMOTE_ENABLED=true/s);
+  });
+
+  test("REMOTE_HTTP_REFERER + REMOTE_X_TITLE overrides are accepted", () => {
+    const cfg = loadConfig({
+      ...baseEnv,
+      REMOTE_HTTP_REFERER: "https://my-fork.example",
+      REMOTE_X_TITLE: "my-solrac-fork",
+    });
+    expect(cfg.remoteHttpReferer).toBe("https://my-fork.example");
+    expect(cfg.remoteXTitle).toBe("my-solrac-fork");
+  });
+
+  test("REMOTE_TIMEOUT_MS / REMOTE_HISTORY_LIMIT / REMOTE_MAX_TOOL_ITERATIONS defaults", () => {
+    const cfg = loadConfig({ ...baseEnv });
+    expect(cfg.remoteTimeoutMs).toBe(60_000);
+    expect(cfg.remoteHistoryLimit).toBe(6);
+    expect(cfg.remoteMaxToolIterations).toBe(8);
+  });
+});

@@ -601,6 +601,13 @@ export function sanitizedSubprocessEnv(): Record<string, string | undefined> {
     // network topology (e.g. http://lmstudio.internal:1234) via an
     // auto-allowed Bash(echo $LOCAL_URL).
     if (key.startsWith("LOCAL_")) continue;
+    // REMOTE_* mirrors the LOCAL_* rationale for the OpenRouter path.
+    // REMOTE_API_KEY in particular is a billed credential — exfiltration via
+    // Bash(echo $REMOTE_API_KEY) would let a compromised model burn the
+    // operator's OpenRouter balance. The whole prefix is scrubbed so any
+    // future REMOTE_* secret (additional providers, BYO keys, etc.) is
+    // covered without needing to revisit this list.
+    if (key.startsWith("REMOTE_")) continue;
     if (key === "STATS_BEARER_TOKEN") continue;
     if (key === "ALLOWLIST_BOOTSTRAP") continue;
     if (key === "NOTION_API_KEY") continue;

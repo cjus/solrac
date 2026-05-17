@@ -548,15 +548,20 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   // engine naturally sees an empty window because the cutoff has advanced.
   // Excludes 'system' rows (denials/queue-full).
   //
-  // The cutoff clause matches BOTH `local:%` (post-migration) AND `ollama:%`
-  // (legacy, pre-migration) so a partial migration / rollback still hides
-  // pre-cutoff local-engine rows. The legacy clause is removed in a
-  // follow-up release once the migration has propagated.
+  // The cutoff clause matches THREE engine-slot patterns:
+  //   - `local:%`  (current local-mode tag — Ollama, LMStudio)
+  //   - `ollama:%` (legacy, pre-v0.7.0; removed in a follow-up release)
+  //   - `remote:%` (current remote-mode tag — OpenRouter)
+  // `/clear local` wipes the engine slot for ALL of these in one shot via
+  // `local_cutoff_ms`. The legacy `ollama:%` row remains in the clause until
+  // the v0.7.0 cleanup ships; the `remote:%` row is added here so cross-engine
+  // bridge queries (Claude reading prior engine-slot turns) honor the cutoff
+  // for remote turns too.
   const stOutOfBandOther = db.prepare(
     "SELECT prompt, response, model FROM audit " +
       "WHERE chat_id = ? AND model NOT LIKE ? AND status = 'ok' " +
       "AND prompt IS NOT NULL AND response IS NOT NULL " +
-      "AND ((model NOT LIKE 'local:%' AND model NOT LIKE 'ollama:%') OR started_at > ?) " +
+      "AND ((model NOT LIKE 'local:%' AND model NOT LIKE 'ollama:%' AND model NOT LIKE 'remote:%') OR started_at > ?) " +
       "AND started_at > COALESCE(" +
       "  (SELECT MAX(started_at) FROM audit WHERE chat_id = ? AND model LIKE ? AND status = 'ok'), " +
       "  0" +
@@ -564,10 +569,12 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
       "ORDER BY started_at ASC LIMIT ?",
   );
   // Existence probe used by `/clear local` for the "Already clean" reply.
-  // Dual-pattern: matches both `local:%` and legacy `ollama:%`.
+  // Triple-pattern: matches `local:%`, legacy `ollama:%`, and `remote:%` so
+  // an engine-slot deploy on OpenRouter (no local Ollama/LMStudio rows ever)
+  // still reports "Already clean" correctly after the cutoff is bumped.
   const stHasLocalSince = db.prepare(
     "SELECT 1 FROM audit " +
-      "WHERE chat_id = ? AND (model LIKE 'local:%' OR model LIKE 'ollama:%') AND status = 'ok' " +
+      "WHERE chat_id = ? AND (model LIKE 'local:%' OR model LIKE 'ollama:%' OR model LIKE 'remote:%') AND status = 'ok' " +
       "AND prompt IS NOT NULL AND response IS NOT NULL " +
       "AND started_at > ? LIMIT 1",
   );

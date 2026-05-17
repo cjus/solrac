@@ -62,6 +62,13 @@ export type DefaultEngine = "local" | "primary" | "secondary";
 // (driver factory, UI label) only runs in the enabled path.
 export type LocalBackend = "ollama" | "lmstudio";
 
+// Backend driver behind the `remote` engine slot. Mutually exclusive with
+// `LocalBackend` at the operator-config level — only one of LOCAL_ENABLED /
+// REMOTE_ENABLED may be true per boot. Today `openrouter` is the only value;
+// the type is kept open for future remote providers (vLLM/Anyscale/Together/
+// Groq), which all share the OpenAI-compatible wire shape.
+export type RemoteBackend = "openrouter";
+
 // Cap on prompt text persisted to the audit table. A single user can flood
 // strings of arbitrary length; truncating before insert bounds per-row size.
 // Not env-tunable in v1 — the value is a defensive constant, not policy.
@@ -128,6 +135,34 @@ export interface Config {
   // infinite-loop bug too much rope. Loop detector bites earlier on duplicate
   // calls.
   readonly localMaxToolIterations: number;
+  // Remote-engine routing — mutually exclusive with `localEnabled`. When true,
+  // the `local` Engine slot dispatches to a hosted provider (OpenRouter) via
+  // the same runner + history + cost-cap path that backs Ollama/LMStudio.
+  // Boot validation rejects `localEnabled && remoteEnabled`. The runner
+  // distinguishes the two via a `mode: "local" | "remote"` flag — the audit
+  // tag becomes `remote:<backend>:<model>` and per-turn cost is captured from
+  // the backend's usage chunk so the existing per-chat + global hourly caps
+  // gate it without additional plumbing.
+  readonly remoteEnabled: boolean;
+  // Provider — `null` when remote is disabled.
+  readonly remoteBackend: RemoteBackend | null;
+  // OpenRouter's base URL already contains `/api/v1`; trailing slash stripped
+  // by the parser so endpoint composition (`${url}/chat/completions`) is
+  // unambiguous.
+  readonly remoteBaseUrl: string;
+  readonly remoteModel: string | null;
+  // `null` when remote is disabled. Subprocess scrub (`agent.ts::
+  // sanitizedSubprocessEnv`) removes `REMOTE_*` keys from the Claude SDK's
+  // env so the per-token API key never leaks to the SDK subprocess.
+  readonly remoteApiKey: string | null;
+  readonly remoteTimeoutMs: number;
+  readonly remoteHistoryLimit: number;
+  readonly remoteMaxToolIterations: number;
+  // OpenRouter attribution headers. Defaults send the public solrac repo URL
+  // and "solrac" title so usage shows up correctly on OpenRouter's per-model
+  // leaderboard; operators with branded forks override.
+  readonly remoteHttpReferer: string;
+  readonly remoteXTitle: string;
   // PNX-167.1 — operator-defined skills loaded from the filesystem at boot.
   // `skillsEnabled` is the master switch; `skillsDir` is resolved from cwd
   // so the same Solrac binary can ship to multiple operators each with their
@@ -236,6 +271,13 @@ function parseLocalBackend(raw: string | undefined): LocalBackend | null {
   const v = raw.trim().toLowerCase();
   if (v === "ollama" || v === "lmstudio") return v;
   throw new Error(`LOCAL_BACKEND must be "ollama" or "lmstudio", got "${raw}"`);
+}
+
+function parseRemoteBackend(raw: string | undefined): RemoteBackend | null {
+  if (raw === undefined || raw.trim() === "") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "openrouter") return v;
+  throw new Error(`REMOTE_BACKEND must be "openrouter", got "${raw}"`);
 }
 
 /**
@@ -404,25 +446,111 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
+  // Remote-engine parsing — read alongside local so the cross-mode validations
+  // (mutex, default-engine requires one) have both values in scope. The
+  // `REMOTE_*` namespace is provider-neutral; today only OpenRouter is
+  // supported behind `REMOTE_BACKEND=openrouter`.
+  const remoteEnabled = parseBoolean("REMOTE_ENABLED", env.REMOTE_ENABLED, false);
+  const remoteBackend = parseRemoteBackend(env.REMOTE_BACKEND);
+  if (remoteEnabled && remoteBackend === null) {
+    throw new Error(
+      'REMOTE_BACKEND is required when REMOTE_ENABLED=true (set to "openrouter")',
+    );
+  }
+  const remoteModel =
+    env.REMOTE_MODEL && env.REMOTE_MODEL.trim() !== "" ? env.REMOTE_MODEL.trim() : null;
+  if (remoteEnabled && !remoteModel) {
+    throw new Error(
+      "REMOTE_MODEL is required when REMOTE_ENABLED=true " +
+        "(OpenRouter slug, e.g. anthropic/claude-3.5-sonnet, openai/gpt-4o-mini)",
+    );
+  }
+  const remoteApiKey =
+    env.REMOTE_API_KEY && env.REMOTE_API_KEY.trim() !== "" ? env.REMOTE_API_KEY.trim() : null;
+  if (remoteEnabled && !remoteApiKey) {
+    throw new Error(
+      "REMOTE_API_KEY is required when REMOTE_ENABLED=true " +
+        "(get one at https://openrouter.ai/keys)",
+    );
+  }
+  // Backend-aware base-URL default. OpenRouter's `/api/v1` is the canonical
+  // root; operator-set `REMOTE_BASE_URL` always wins (e.g. for an internal
+  // proxy or a staging environment).
+  const remoteBaseUrlDefault =
+    remoteBackend === "openrouter" ? "https://openrouter.ai/api/v1" : "";
+  const remoteBaseUrl =
+    env.REMOTE_BASE_URL && env.REMOTE_BASE_URL.trim() !== ""
+      ? env.REMOTE_BASE_URL.trim().replace(/\/$/, "")
+      : remoteBaseUrlDefault;
+  if (remoteEnabled) {
+    let remoteProtocol: string;
+    try {
+      remoteProtocol = new URL(remoteBaseUrl).protocol;
+    } catch {
+      throw new Error(`REMOTE_BASE_URL is not a valid URL: "${remoteBaseUrl}"`);
+    }
+    if (remoteProtocol !== "http:" && remoteProtocol !== "https:") {
+      throw new Error(
+        `REMOTE_BASE_URL must use http:// or https://, got "${remoteProtocol}//" in "${remoteBaseUrl}"`,
+      );
+    }
+  }
+  // Mutual exclusion — the operator must pick exactly one BYO model source.
+  // Boot-time enforcement is structural: the `local` engine slot has one
+  // driver per boot. Allowing both would force a per-message backend-pick
+  // surface (a new prefix? a config key?) that this PR explicitly avoided.
+  if (localEnabled && remoteEnabled) {
+    throw new Error(
+      "LOCAL_ENABLED and REMOTE_ENABLED are mutually exclusive — set exactly one. " +
+        "Local mode runs an on-host LLM (Ollama/LMStudio); " +
+        "remote mode dispatches to OpenRouter.",
+    );
+  }
+  const remoteTimeoutDefault = localToolsEnabled ? 120_000 : 60_000;
+  const remoteTimeoutMs = parsePositiveInt(
+    "REMOTE_TIMEOUT_MS",
+    env.REMOTE_TIMEOUT_MS,
+    remoteTimeoutDefault,
+  );
+  const remoteHistoryLimit = parsePositiveInt(
+    "REMOTE_HISTORY_LIMIT",
+    env.REMOTE_HISTORY_LIMIT,
+    6,
+  );
+  const remoteMaxToolIterations = parsePositiveInt(
+    "REMOTE_MAX_TOOL_ITERATIONS",
+    env.REMOTE_MAX_TOOL_ITERATIONS,
+    8,
+  );
+  const remoteHttpReferer =
+    env.REMOTE_HTTP_REFERER && env.REMOTE_HTTP_REFERER.trim() !== ""
+      ? env.REMOTE_HTTP_REFERER.trim()
+      : "https://github.com/cjus/solrac";
+  const remoteXTitle =
+    env.REMOTE_X_TITLE && env.REMOTE_X_TITLE.trim() !== ""
+      ? env.REMOTE_X_TITLE.trim()
+      : "solrac";
+
   // Default-engine validation. Two cells of the capability matrix are
   // unreachable; refuse them at boot rather than letting them run with
-  // confusing UX (local engine unreachable, or a default engine that errors
+  // confusing UX (engine slot unreachable, or a default engine that errors
   // every turn).
   const defaultEngine = parseDefaultEngine(env.SOLRAC_DEFAULT_ENGINE);
   const defaultEngineExplicit =
     env.SOLRAC_DEFAULT_ENGINE !== undefined && env.SOLRAC_DEFAULT_ENGINE.trim() !== "";
-  if (defaultEngine === "local" && !localEnabled) {
+  if (defaultEngine === "local" && !localEnabled && !remoteEnabled) {
     throw new Error(
-      "SOLRAC_DEFAULT_ENGINE=local requires LOCAL_ENABLED=true; " +
-        "set LOCAL_ENABLED=true (and LOCAL_BACKEND=ollama|lmstudio, LOCAL_MODEL=<model>) " +
-        "to run the local engine as the default, or " +
-        "SOLRAC_DEFAULT_ENGINE=primary to make Anthropic Sonnet the default",
+      "SOLRAC_DEFAULT_ENGINE=local requires LOCAL_ENABLED=true (on-host) " +
+        "or REMOTE_ENABLED=true (OpenRouter); " +
+        "set LOCAL_ENABLED=true (with LOCAL_BACKEND + LOCAL_MODEL) for an on-host LLM, " +
+        "REMOTE_ENABLED=true (with REMOTE_BACKEND + REMOTE_MODEL + REMOTE_API_KEY) for OpenRouter, " +
+        "or SOLRAC_DEFAULT_ENGINE=primary to make Anthropic Sonnet the default",
     );
   }
   if (defaultEngine !== "local" && localToolsEnabled) {
     throw new Error(
       `SOLRAC_DEFAULT_ENGINE=${defaultEngine} with LOCAL_TOOLS_ENABLED=true is unreachable: ` +
-        "the local engine only runs when it's the default. " +
+        "the local engine slot only runs when it's the default. " +
         "Set LOCAL_TOOLS_ENABLED=false or SOLRAC_DEFAULT_ENGINE=local",
     );
   }
@@ -499,6 +627,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     localHistoryLimit,
     localToolsEnabled,
     localMaxToolIterations,
+    remoteEnabled,
+    remoteBackend,
+    remoteBaseUrl,
+    remoteModel,
+    remoteApiKey,
+    remoteTimeoutMs,
+    remoteHistoryLimit,
+    remoteMaxToolIterations,
+    remoteHttpReferer,
+    remoteXTitle,
     skillsEnabled: parseBoolean("SOLRAC_SKILLS_ENABLED", env.SOLRAC_SKILLS_ENABLED, false),
     skillsDir: resolveAgainstHome(solracHome, skillsDirRaw),
     tasksEnabled: parseBoolean("SOLRAC_TASKS_ENABLED", env.SOLRAC_TASKS_ENABLED, false),

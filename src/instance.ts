@@ -9,10 +9,11 @@
  *
  *   - `SOUL.md` — voice, stance, safety. Read once at boot via `loadSoul`;
  *     hard-fails if missing or empty. Joined into Claude's
- *     `systemPrompt.append` and the local engine's first `system` message.
+ *     `systemPrompt.append` and the engine-slot's first `system` message.
  *     Per-engine capability deltas ("you have tools" / "you don't") stay in
- *     code next to each engine's wiring (see `agent.ts::buildClaudeCapabilityNote`
- *     and `local.ts::buildLocalCapabilityNote`) so SOUL.md stays portable.
+ *     code next to each engine's wiring (see `agent.ts::buildClaudeCapabilityNote`,
+ *     `local-driver.ts::buildLocalCapabilityNote`, and
+ *     `remote-driver.ts::buildRemoteCapabilityNote`) so SOUL.md stays portable.
  *
  *   - `SOLRAC.md` — operator overlay (operator name, channel posture, project
  *     hints). Re-read per turn via `readInstanceMd` so live edits take effect
@@ -36,7 +37,7 @@
  *   their voice edits.
  *
  * Position in the dependency graph:
- *   log → instance → consumed by main, agent, local
+ *   log → instance → consumed by main, agent, engine
  *
  * Exports:
  *   - `INSTANCE_FILE_NAMES` — `{ SOUL: "SOUL.md", SOLRAC: "SOLRAC.md" }`.
@@ -64,7 +65,7 @@
  *   - SOUL.md — canonical default voice (embedded into the binary)
  *   - SOLRAC.md — operator overlay template (embedded into the binary)
  *   - agent.ts::runAgent — Claude path consumer
- *   - local.ts::runLocalTurn — local path consumer
+ *   - engine.ts::runEngineTurn — engine-slot path consumer
  *   - main.ts — boot wires bootstrap + load
  *   - text-modules.d.ts — ambient string type for `*.md` text imports
  */

@@ -1,5 +1,113 @@
 # Changelog
 
+## Unreleased — OpenRouter as a remote backend for the engine slot
+
+Adds **OpenRouter** as a third option for the no-prefix engine slot, alongside on-host Ollama and LMStudio. New `REMOTE_ENABLED=true` flag — mutually exclusive with `LOCAL_ENABLED` at boot — points the engine slot at OpenRouter so hosts that can't run a local LLM still get a default-engine option. Per-token cost from OpenRouter's streaming `usage.cost` field is captured and written to `audit.cost_usd`, so the existing per-chat (`HOURLY_COST_CAP_USD`) and global (`GLOBAL_HOURLY_COST_CAP_USD`) hourly caps gate remote burn automatically — no new cost-cap knob needed. Claude tiers (`@`, `!`) and the `local` engine routing are unaffected.
+
+- **New env vars** (all `REMOTE_*` namespace, provider-neutral for future vLLM/Anyscale/Together/Groq additions):
+  - `REMOTE_ENABLED` — master switch. Mutually exclusive with `LOCAL_ENABLED` (boot rejects both true).
+  - `REMOTE_BACKEND` — `openrouter` (only value today; type stays open for future providers).
+  - `REMOTE_MODEL` — OpenRouter slug, e.g. `anthropic/claude-3.5-sonnet`, `openai/gpt-4o-mini`, `meta-llama/llama-3.3-70b-instruct`. Contains `/` — verified safe across the codebase (no parser splits on `/`).
+  - `REMOTE_API_KEY` — required when `REMOTE_ENABLED=true`. Scrubbed by `sanitizedSubprocessEnv()` (prefix-match `REMOTE_*`) so the Claude SDK subprocess never sees the OpenRouter credential.
+  - `REMOTE_BASE_URL` — defaults to `https://openrouter.ai/api/v1`; override for proxies/staging. URL validated at boot.
+  - `REMOTE_TIMEOUT_MS` (default 60s / 120s with tools), `REMOTE_HISTORY_LIMIT` (default 6), `REMOTE_MAX_TOOL_ITERATIONS` (default 8) — mirror the `LOCAL_*` knobs.
+  - `REMOTE_HTTP_REFERER` (default `https://github.com/cjus/solrac`) + `REMOTE_X_TITLE` (default `solrac`) — OpenRouter attribution headers.
+- **Engine slot reuse, not a new engine.** The internal `Engine = "primary" | "secondary" | "local"` union is unchanged; each `EngineDriver` factory sets a `mode: "local" | "remote"` field (`createOllamaDriver`/`createLmstudioDriver` → `"local"`; `createOpenrouterDriver` → `"remote"`). `runEngineTurn` reads `driver.mode` directly — no parallel `mode` field on the deps. Mode drives three behaviors: audit-tag prefix (`local:` vs `remote:`), capability-note framing ("cost the operator nothing" vs "cost the operator per-token via OpenRouter, so be concise"), and the `cost_usd` write decision. No new dispatch branch — the same routing, same queue, same mutex, same `/clear local` cutoff.
+- **Audit tag pattern: `remote:openrouter:<model>`.** Symmetric with `local:ollama:<model>` and `claude:primary:<model>`. The model slug's `/` flows through unmodified; no parser splits on `/` (audited via `grep -RnE "model\.(split|substring|substr|slice)" src/`).
+- **Cost capture from the streaming usage chunk.** OpenRouter's trailing usage chunk includes `cost` (USD) alongside `prompt_tokens` / `completion_tokens` — and as of 2026 it's automatic (the historical `usage: { include: true }` / `stream_options: { include_usage: true }` opt-ins are deprecated and have no effect per [OpenRouter docs](https://openrouter.ai/docs/guides/administration/usage-accounting)). `EngineChatEvent.done` carries `costUsd: number | null`; `engine.ts::resolveAuditCost` picks the write:
+  - `mode=local` → 0 (on-host backends are free; driver costUsd ignored).
+  - `mode=remote && costUsd != null` → write the real cost.
+  - `mode=remote && costUsd == null` → write `null` (NOT 0) + log `remote.cost_missing`. Writing 0 would silently bypass the cap query's `COALESCE(SUM(cost_usd), 0)`; null preserves the audit row but excludes it from the cap sum.
+- **Tool-loop sums cost across rounds.** `runToolLoop` accumulates per-round `costUsd` (each round is a separate API call on a remote backend with its own billed cost), then `engine.ts::resolveAuditCost` writes the sum to `audit.cost_usd`. The `costUsdSeen` flag distinguishes "every round skipped the field" (null) from "every round was a free local round" (0).
+- **Mutual exclusion at boot.** `LOCAL_ENABLED=true && REMOTE_ENABLED=true` throws with an actionable message. `SOLRAC_DEFAULT_ENGINE=local` now requires `LOCAL_ENABLED OR REMOTE_ENABLED`; the error message lists both paths.
+- **DB cutoff triple-pattern.** `db.hasLocalTurnsSince` and `db.outOfBandForEngine` LIKE clauses extend to `local:%` OR `ollama:%` (legacy) OR `remote:%`. So `/clear local` correctly wipes the engine-slot cutoff for an OpenRouter-only deploy, and Claude's cross-engine bridge honors the local cutoff for remote turns too (otherwise `/clear local` clears Ollama but Claude still recites freshly-cleared OpenRouter turns out of the bridge).
+- **Subprocess env scrub.** `sanitizedSubprocessEnv()` in `agent.ts` adds a `REMOTE_*` prefix exclusion alongside the existing `TELEGRAM_*`, `TG_*`, `LOCAL_*` scrubs. `REMOTE_API_KEY` in particular is a billed credential — exfiltration via `Bash(echo $REMOTE_API_KEY)` would let a compromised model burn operator balance.
+- **Web UI + `/help` mode awareness.** `defaultEngineLabel` renders `remote (openrouter)` when remote mode is active. `/help` engine section gets an `engineSlotMode` field that swaps the cost-framing line ("free" → "per-token via OpenRouter") for the no-prefix path.
+- **Boot probe.** The engine-slot health probe (`probeEngineHealth`) runs against whichever driver is wired, including the OpenRouter `GET /models` probe with bearer auth. 401 surfaces as `auth_failed` so a bad `REMOTE_API_KEY` is visible at startup, not first-turn.
+- **No new runtime deps.** OpenRouter is OpenAI-compatible — no SDK needed. The driver is built on raw `fetch` like the LMStudio driver. No anti-goals reversed.
+- **No SDK pin bump.** Claude Agent SDK pin stays at `0.2.119`.
+- **Tests.** 10 new driver tests cover OpenRouter probe (auth header, model-present, model-absent, 401, network error), streaming (cost captured from trailing usage, cost-missing falls through as null, slash-bearing slug round-trips, auth + attribution headers on every request, 401 surfaces with REMOTE_API_KEY hint, 404 → model_missing, inline error frame terminates, tool-call SSE deltas accumulate). 13 new config tests cover the REMOTE_* validations (required field set, mutex with LOCAL_ENABLED, default-engine=local needs one mode, base URL parse). 4 new runner tests cover the cost-write matrix (local 0, remote populated, remote-null defensive, mode default back-compat) and capability-note mode framing. 3 new DB tests cover the triple-pattern LIKE extension (remote:% matches hasLocalTurnsSince, remote:% hidden by outOfBandForEngine cutoff).
+- **Cleanup debt flagged.** The dual-pattern `local:% OR ollama:%` LIKE clauses (left over from v0.7.0's "removed in a follow-up release once the migration has propagated") become triple-pattern with `remote:%`. The legacy `ollama:%` clause is scheduled for removal in the next minor.
+
+### Refactor: split `engine.ts` / `local-driver.ts` / `remote-driver.ts`
+
+The OpenRouter work originally landed on the `local-*` files because the runner is mode-polymorphic — both modes legitimately share the same streaming + tool-loop + audit plumbing. Naming-wise that made the codebase lie ("local" hosting a remote service). This commit follows up with a structural-only refactor: clearer file names, no behavior change, no env-var change, no DB schema change.
+
+**Files renamed (git blame preserved via `git mv`):**
+
+| Was | Now |
+|---|---|
+| `src/local.ts` | `src/engine.ts` |
+| `src/local-tools.ts` | `src/engine-tools.ts` |
+| `src/local.test.ts` | `src/engine.test.ts` |
+| `src/local-tools.test.ts` | `src/engine-tools.test.ts` |
+
+**Files added:**
+
+- `src/engine-driver.ts` — shared abstraction owning `EngineBackend`, `EngineDriver`, `EngineChatEvent`, `EngineDriverError`, `DriverOpts`, plus the cross-driver helpers (`stableStringify`, `maybeLogEmptyStream`).
+- `src/remote-driver.ts` — OpenRouter driver moved out of `local-driver.ts`; sets `driver.mode = "remote"`. New `buildRemoteCapabilityNote` + `buildRemoteToolCapabilityNote` always frame cost as "per-token via OpenRouter".
+- `src/remote-driver.test.ts` — OpenRouter test block extracted (11 tests) from `local-driver.test.ts`.
+
+**Files updated in place:**
+
+- `src/local-driver.ts` — Ollama + LMStudio only, both with `driver.mode = "local"`. Capability builders `buildLocalCapabilityNote` / `buildLocalToolCapabilityNote` always frame cost as "free" (no mode parameter). OpenRouter shim removed.
+- `src/main.ts`, `src/commands.ts`, `src/skill-tools.ts`, `src/instance.ts`, `test/smokes/local.ts` — caller updates: imports from `./engine.ts` / `./engine-driver.ts` / `./engine-tools.ts`; `LocalSkillDeps` → `EngineSkillDeps`; `runLocalTurn` → `runEngineTurn`; `mcpToLocalTools` → `mcpToEngineTools`; `probeLocalHealth` → `probeEngineHealth`. Variable names that describe the engine *slot* (`localDeps`, `localDriver`, `localSkillDeps`) kept — the slot is still named `local` in routing.
+
+**Type renames:**
+
+| Was | Now |
+|---|---|
+| `LocalBackend` (wire-format union) | `EngineBackend` |
+| `LocalChatRole`, `LocalChatMessage`, `LocalToolCallRef`, `LocalToolDef`, `LocalChatEvent`, `LocalProbeResult`, `LocalStreamChatOpts` | `Engine*` equivalents |
+| `LocalDriver` | `EngineDriver` (adds `mode: "local" \| "remote"` field) |
+| `LocalDriverError` | `EngineDriverError` |
+| `LocalRunDeps`, `LocalRunInput` | `EngineRunDeps`, `EngineRunInput` |
+| `LocalEngineMode` (discriminator type) | **deleted** — `driver.mode` is now the single source of truth |
+| `LocalSkillDeps` | `EngineSkillDeps` |
+| `mcpToLocalTools` | `mcpToEngineTools` |
+| `LOCAL_DENY_TOOLS` | `ENGINE_DENY_TOOLS` |
+
+Operator-config-layer types (`config.ts::LocalBackend = "ollama" \| "lmstudio"`, `config.ts::RemoteBackend = "openrouter"`) kept — they describe operator-facing env-var values, distinct from the wire-format `EngineBackend` union.
+
+**Log event renames** (`local.*` → `engine.*` for runner events; per-backend prefixes for driver events):
+
+| Was | Now | Source |
+|---|---|---|
+| `local.ollama_bad_frame` | `ollama.bad_frame` | `local-driver.ts` |
+| `local.lmstudio_bad_frame` | `lmstudio.bad_frame` | `local-driver.ts` |
+| `local.lmstudio_empty_stream` | `lmstudio.empty_stream` | `local-driver.ts` |
+| `local.lmstudio_tool_call_deduped` | `lmstudio.tool_call_deduped` | `local-driver.ts` |
+| `local.openrouter_bad_frame` | `openrouter.bad_frame` | `remote-driver.ts` |
+| `local.openrouter_empty_stream` | `openrouter.empty_stream` | `remote-driver.ts` |
+| `local.openrouter_tool_call_deduped` | `openrouter.tool_call_deduped` | `remote-driver.ts` |
+| `local.stub_send_failed` | `engine.stub_send_failed` | `engine.ts` |
+| `local.unexpected_tool_call_single_shot` | `engine.unexpected_tool_call_single_shot` | `engine.ts` |
+| `local.driver_failed` | `engine.driver_failed` | `engine.ts` |
+| `local.unexpected_error` | `engine.unexpected_error` | `engine.ts` |
+| `local.edit_throttled` | `engine.edit_throttled` | `engine.ts` |
+| `local.edit_final_failed` | `engine.edit_final_failed` | `engine.ts` |
+| `local.final_send_failed` | `engine.final_send_failed` | `engine.ts` |
+| `local.done` | `engine.done` | `engine.ts` |
+| `local.boot` | `engine.boot` | `main.ts` |
+| `local.boot_health_ok` | `engine.boot_health_ok` | `main.ts` |
+| `local.boot_health_failed` | `engine.boot_health_failed` | `main.ts` |
+| `local.boot_health_model_missing` | `engine.boot_health_model_missing` | `main.ts` |
+| `local.disabled_ack_failed` | `engine.disabled_ack_failed` | `main.ts` |
+| `local.tools_enabled_but_zero_loaded` | `engine.tools_enabled_but_zero_loaded` | `main.ts` |
+| `local.tool_loop_start` / `local.tool_loop_done` / `local.tool_loop_failed` | `engine.tool_loop_*` | `engine-tools.ts` |
+| `local.tool_loop_detected` / `local.tool_iteration_cap` / `local.cap_finalize_failed` | `engine.tool_*` | `engine-tools.ts` |
+| `local.tool_unknown` / `local.tool_auto_allow` / `local.tool_denied_policy` / `local.tool_denied_hard` / `local.tool_hard_denied` / `local.tool_invalid_args` / `local.tool_handler_threw` / `local.tool_call_ok` | `engine.tool_*` | `engine-tools.ts` |
+| `local.tool_confirm_request` / `local.tool_confirm_resolved` / `local.tool_confirm_send_failed` / `local.tool_confirm_round_cap` / `local.tool_confirm_skipped_round_cap` | `engine.tool_confirm_*` | `engine-tools.ts` |
+| `local.progress_failed` | `engine.progress_failed` | `engine-tools.ts` |
+
+`remote.cost_missing` keeps its name — it's a remote-only signal, accurately scoped already.
+
+**Operator impact.** Any `journalctl ... | jq 'select(.event == "local.done")'` queries break against new boot logs. v0.8.0 audit rows already on disk keep the old event names — those don't change. Update grep patterns once.
+
+**Zero behavior change** — verified by typecheck + the full test suite passing (798 tests across 31 files). Zero env-var change. Zero DB schema change. The audit-tag DB column prefix (`local:` / `remote:`) is intentionally NOT renamed — that would require an SQL migration of `audit.model`; deferred.
+
+**Anti-goals.** No new runtime deps. No new HTTP framework. No SDK pin bump. No sub-agents enabled.
+
 ## v0.7.1 — weak-local-model hardening + docs
 
 Four post-v0.7.0 fixes that together make LMStudio + small open-weight models (gpt-oss-20b class) usable on long-running chats. No breaking changes, no new env vars, no SDK pin bump.

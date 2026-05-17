@@ -1,18 +1,19 @@
 /**
- * @fileoverview Local-engine tool-calling support — schema converter,
+ * @fileoverview Engine-slot tool-calling support — schema converter,
  *               per-call executor, and multi-round loop driver.
  * @purpose Bridge solrac integrations (`SdkMcpToolDefinition`, designed for
  *          the Anthropic-hosted Claude Agent SDK) into the OpenAI-compatible
- *          tool format both local backends (Ollama, LMStudio) accept, and
- *          run a single tool call through the same safety layers (loop
- *          detector, classifier, broker) the SDK path uses on Claude tiers.
- *          One source of truth for the tool surface — the same operator-
- *          authored integrations reach Claude tiers AND every local backend.
+ *          tool format every non-Anthropic backend accepts — local (Ollama,
+ *          LMStudio) and remote (OpenRouter) alike — and run a single tool
+ *          call through the same safety layers (loop detector, classifier,
+ *          broker) the SDK path uses on Claude tiers. One source of truth
+ *          for the tool surface — the same operator-authored integrations
+ *          reach Claude tiers AND every engine-slot backend.
  *
  * Why a converter at all:
  *   `SdkMcpToolDefinition.inputSchema` is a raw `ZodRawShape` (object of zod
  *   field defs), NOT a wrapped `z.object(...)`. The SDK applies the wrap
- *   internally; for the local path we wrap before producing JSON Schema.
+ *   internally; for the engine-slot path we wrap before producing JSON Schema.
  *
  * Why `z.toJSONSchema` and not a hand-rolled walker:
  *   Verified empirically that zod 4.4.3's output is already OpenAI-compatible
@@ -21,10 +22,10 @@
  *   the top-level `$schema` JSON-Schema-version marker (some strict models
  *   reject unrecognized fields). Pin or vendor zod if churn becomes an issue.
  *
- * Why a separate executor for the local path (vs reusing the SDK's path):
+ * Why a separate executor for the engine-slot path (vs reusing the SDK's path):
  *   The Anthropic SDK drives the tool-call loop internally — every classified
  *   `mcp__solrac__*` call lands at the integration's handler without solrac
- *   needing to invoke it. The local backends return one assistant message;
+ *   needing to invoke it. Engine-slot backends return one assistant message;
  *   if it contains `tool_calls`, WE execute them and feed results back. So
  *   we re-implement the per-call gate path (loop → classify → broker → invoke)
  *   that `agent.ts` gets for free from the SDK. The same `policy.ts` building
@@ -40,28 +41,29 @@
  *   6. handler invoke — the integration's own code.
  *
  * Cost cap is intentionally NOT checked here. Anthropic per-chat + global
- * caps gate Anthropic burn only. Local is $0; the loop detector and the
- * iteration cap are the runaway-loop defenses.
+ * caps gate Anthropic burn only. The loop detector and the iteration cap
+ * are the runaway-loop defenses.
  *
  * Position in the dependency graph:
- *   integrations + policy + telegram + log + zod + local-driver → local-tools → local
+ *   integrations + policy + telegram + log + zod + engine-driver
+ *     → engine-tools → engine
  *
  * Cross-references:
  *   - src/integrations.ts — the producer side
  *   - src/policy.ts — `classifyToolWithIntegrations`, `LoopDetector`,
  *     `ConfirmationBroker` (all reused as-is)
- *   - src/local-driver.ts — backend abstraction this loop consumes
+ *   - src/engine-driver.ts — shared backend abstraction this loop consumes
  */
 
 import { z } from "zod";
 import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import {
-  type LocalChatMessage,
-  type LocalDriver,
-  LocalDriverError,
-  type LocalToolCallRef,
-  type LocalToolDef,
-} from "./local-driver.ts";
+  type EngineChatMessage,
+  type EngineDriver,
+  EngineDriverError,
+  type EngineToolCallRef,
+  type EngineToolDef,
+} from "./engine-driver.ts";
 import {
   classifyToolWithIntegrations,
   type ConfirmationBroker,
@@ -72,26 +74,27 @@ import type { IntegrationTier } from "./integrations.ts";
 import { log } from "./log.ts";
 
 /**
- * Re-export the wire-shape tool def under the local-tools-flavored name so
+ * Re-export the wire-shape tool def under the engine-tools-flavored name so
  * downstream callers can import everything tool-related from one module.
  */
-export type { LocalToolDef } from "./local-driver.ts";
+export type { EngineToolDef } from "./engine-driver.ts";
 
 /**
- * Convert solrac integration tools to the wire-shape both local backends use.
+ * Convert solrac integration tools to the wire-shape every engine-slot
+ * backend uses.
  *
  * Names pass through unchanged — integrations register short names like
  * `time_now`; the `mcp__solrac__` prefix is added at the SDK boundary in
- * `agent.ts` and is NOT used over the local wire (both backends use flat
- * tool registries).
+ * `agent.ts` and is NOT used over the engine-slot wire (every backend uses
+ * a flat tool registry).
  *
  * The `<any>` schema generic mirrors the SDK's own `tools?: Array<…<any>>`
  * field (`sdk.d.ts:426`) — heterogeneous tool arrays can't share a single
  * concrete schema type.
  */
-export function mcpToLocalTools(
+export function mcpToEngineTools(
   tools: ReadonlyArray<SdkMcpToolDefinition<any>>,
-): LocalToolDef[] {
+): EngineToolDef[] {
   return tools.map((t) => {
     const objectSchema = z.object(t.inputSchema as z.ZodRawShape);
     const parameters = z.toJSONSchema(objectSchema) as Record<string, unknown>;
@@ -164,7 +167,7 @@ export interface ExecuteToolCallDeps {
   readonly broker: Pick<ConfirmationBroker, "request">;
   readonly loopDetector: LoopDetector;
   /**
-   * `LOCAL_DENY_TOOLS` belt-and-suspenders set. Names in this set bypass the
+   * `ENGINE_DENY_TOOLS` belt-and-suspenders set. Names in this set bypass the
    * classifier and broker; any call whose name appears here is denied
    * immediately with `denied_policy`. Mirrors `disallowedTools: ["Agent","Task"]`
    * for the SDK path.
@@ -202,7 +205,7 @@ export async function executeToolCall(
 
   if (deps.loopDetector.check(fullName, args) === "loop") {
     const reason = `loop_detected: ${shortName} called ${deps.loopDetector.threshold}× with same input`;
-    log.warn("local.tool_loop_detected", {
+    log.warn("engine.tool_loop_detected", {
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
@@ -214,7 +217,7 @@ export async function executeToolCall(
   const tool = deps.tools.get(shortName);
   if (!tool) {
     const reason = `unknown tool: ${shortName}`;
-    log.warn("local.tool_unknown", {
+    log.warn("engine.tool_unknown", {
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
@@ -227,8 +230,8 @@ export async function executeToolCall(
   }
 
   if (deps.deniedTools?.has(shortName)) {
-    const reason = `tool ${shortName} is in LOCAL_DENY_TOOLS`;
-    log.warn("local.tool_denied_hard", {
+    const reason = `tool ${shortName} is in ENGINE_DENY_TOOLS`;
+    log.warn("engine.tool_denied_hard", {
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
@@ -238,7 +241,7 @@ export async function executeToolCall(
 
   const decision = classifyToolWithIntegrations(fullName, args, deps.toolTiers);
   if (decision.kind === "deny") {
-    log.warn("local.tool_denied_policy", {
+    log.warn("engine.tool_denied_policy", {
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
@@ -252,7 +255,7 @@ export async function executeToolCall(
   }
 
   if (decision.kind === "confirm" && deps.autoAllow) {
-    log.info("local.tool_auto_allow", {
+    log.info("engine.tool_auto_allow", {
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
@@ -260,7 +263,7 @@ export async function executeToolCall(
   } else if (decision.kind === "confirm") {
     if (deps.roundState && deps.roundState.confirmsRemaining <= 0) {
       const reason = "only one confirmable tool per round; retry one at a time";
-      log.warn("local.tool_confirm_round_cap", {
+      log.warn("engine.tool_confirm_round_cap", {
         auditId: deps.auditId,
         chatId: deps.chatId,
         tool: shortName,
@@ -268,7 +271,7 @@ export async function executeToolCall(
       return { content: `denied: ${reason}`, disposition: "denied_policy", reason };
     }
     if (deps.roundState) deps.roundState.confirmsRemaining -= 1;
-    log.info("local.tool_confirm_request", {
+    log.info("engine.tool_confirm_request", {
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
@@ -282,7 +285,7 @@ export async function executeToolCall(
       });
     } catch (err) {
       const msg = (err as Error).message;
-      log.warn("local.tool_confirm_send_failed", {
+      log.warn("engine.tool_confirm_send_failed", {
         auditId: deps.auditId,
         chatId: deps.chatId,
         tool: shortName,
@@ -294,7 +297,7 @@ export async function executeToolCall(
         reason: msg,
       };
     }
-    log.info("local.tool_confirm_resolved", {
+    log.info("engine.tool_confirm_resolved", {
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
@@ -322,7 +325,7 @@ export async function executeToolCall(
     const issues = parsed.error.issues
       .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
       .join("; ");
-    log.warn("local.tool_invalid_args", {
+    log.warn("engine.tool_invalid_args", {
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
@@ -341,7 +344,7 @@ export async function executeToolCall(
     result = await tool.handler(parsed.data, {});
   } catch (err) {
     const msg = (err as Error).message;
-    log.warn("local.tool_handler_threw", {
+    log.warn("engine.tool_handler_threw", {
       auditId: deps.auditId,
       chatId: deps.chatId,
       tool: shortName,
@@ -356,7 +359,7 @@ export async function executeToolCall(
   }
 
   const { content, truncated } = coalesceResultContent(result);
-  log.debug("local.tool_call_ok", {
+  log.debug("engine.tool_call_ok", {
     auditId: deps.auditId,
     chatId: deps.chatId,
     tool: shortName,
@@ -507,7 +510,7 @@ const EDIT_THROTTLE_MS = 1500;
  * `disallowedTools: ["Agent","Task"]`. Any tool name in this set is rejected
  * before the executor is called.
  */
-export const LOCAL_DENY_TOOLS: ReadonlySet<string> = Object.freeze(new Set<string>());
+export const ENGINE_DENY_TOOLS: ReadonlySet<string> = Object.freeze(new Set<string>());
 
 export interface ToolLoopResult {
   readonly assistantText: string;
@@ -516,6 +519,14 @@ export interface ToolLoopResult {
   readonly inputTokens: number | null;
   /** Sum of `outputTokens` across all rounds (true total generated). */
   readonly outputTokens: number | null;
+  /**
+   * Sum of `costUsd` across every round (including cap-finalize). `null` only
+   * if NO round reported a cost — for local backends this is always null;
+   * for the openrouter backend a null here is the `remote.cost_missing` signal.
+   * Per-round sums (vs round-0-only) match how the tool-loop actually bills
+   * on a remote backend: each round is a separate API call with its own cost.
+   */
+  readonly costUsd: number | null;
   readonly rounds: number;
   readonly toolsFired: number;
   readonly iterationCapHit: boolean;
@@ -539,7 +550,7 @@ export interface RunToolLoopRenderer {
 }
 
 export interface RunToolLoopDeps {
-  readonly driver: LocalDriver;
+  readonly driver: EngineDriver;
   readonly model: string;
   /**
    * Single shared `AbortSignal` for every fetch this turn — model rounds AND
@@ -549,7 +560,7 @@ export interface RunToolLoopDeps {
   readonly signal: AbortSignal;
   readonly tools: ReadonlyMap<string, SdkMcpToolDefinition<any>>;
   readonly toolTiers: ReadonlyMap<string, IntegrationTier>;
-  readonly toolDefs: ReadonlyArray<LocalToolDef>;
+  readonly toolDefs: ReadonlyArray<EngineToolDef>;
   readonly broker: Pick<ConfirmationBroker, "request">;
   readonly loopDetector: LoopDetector;
   readonly maxIterations: number;
@@ -561,7 +572,7 @@ export interface RunToolLoopDeps {
 }
 
 export interface RunToolLoopInput {
-  readonly initialMessages: ReadonlyArray<LocalChatMessage>;
+  readonly initialMessages: ReadonlyArray<EngineChatMessage>;
 }
 
 /**
@@ -587,12 +598,20 @@ export async function runToolLoop(
   deps: RunToolLoopDeps,
   input: RunToolLoopInput,
 ): Promise<ToolLoopResult> {
-  const denyTools = deps.denyTools ?? LOCAL_DENY_TOOLS;
-  const messages: LocalChatMessage[] = input.initialMessages.map((m) => ({ ...m }));
+  const denyTools = deps.denyTools ?? ENGINE_DENY_TOOLS;
+  const messages: EngineChatMessage[] = input.initialMessages.map((m) => ({ ...m }));
 
   let inputTokens: number | null = null;
   let outputTokens = 0;
   let outputTokensSeen = false;
+  // Remote-backend cost accumulator. Each round writes its own usage chunk
+  // with its own per-round cost; the tool-loop is a series of independent API
+  // calls so the summed cost is the real billed total. `costUsdSeen` tracks
+  // whether ANY round reported a cost — a tool-loop where every round skips
+  // the field must return `costUsd: null` (not 0) so `resolveAuditCost` in
+  // `engine.ts` writes null + emits `remote.cost_missing`.
+  let costUsd = 0;
+  let costUsdSeen = false;
   const toolCallSummaries: Array<{ name: string; input: unknown }> = [];
   let assistantText = "";
   let errorMessage: string | null = null;
@@ -602,7 +621,7 @@ export async function runToolLoop(
   let lastEditedKey = "";
   let round = 0;
 
-  log.info("local.tool_loop_start", {
+  log.info("engine.tool_loop_start", {
     auditId: deps.auditId,
     chatId: deps.chatId,
     backend: deps.driver.backend,
@@ -621,6 +640,7 @@ export async function runToolLoop(
     toolCalls: LocalToolCall[];
     inputTokens: number | null;
     outputTokens: number | null;
+    costUsd: number | null;
     error: string | null;
   }> {
     const result = {
@@ -628,6 +648,7 @@ export async function runToolLoop(
       toolCalls: [] as LocalToolCall[],
       inputTokens: null as number | null,
       outputTokens: null as number | null,
+      costUsd: null as number | null,
       error: null as string | null,
     };
 
@@ -652,7 +673,7 @@ export async function runToolLoop(
                 try {
                   await deps.renderer.onProgress(result.text, toolNames);
                 } catch (renderErr) {
-                  log.debug("local.progress_failed", {
+                  log.debug("engine.progress_failed", {
                     auditId: deps.auditId,
                     error: (renderErr as Error).message,
                   });
@@ -669,13 +690,14 @@ export async function runToolLoop(
         } else if (evt.kind === "done") {
           result.inputTokens = evt.inputTokens;
           result.outputTokens = evt.outputTokens;
+          result.costUsd = evt.costUsd;
         } else if (evt.kind === "error") {
           result.error = `local error: ${evt.message}`;
           break;
         }
       }
     } catch (err) {
-      if (err instanceof LocalDriverError) {
+      if (err instanceof EngineDriverError) {
         result.error = formatDriverErrorForLoop(err);
       } else {
         const e = err as Error;
@@ -698,6 +720,10 @@ export async function runToolLoop(
       if (r.outputTokens !== null) {
         outputTokens += r.outputTokens;
         outputTokensSeen = true;
+      }
+      if (r.costUsd !== null) {
+        costUsd += r.costUsd;
+        costUsdSeen = true;
       }
       assistantText = r.text;
 
@@ -730,7 +756,7 @@ export async function runToolLoop(
 
         if (denyTools.has(call.name)) {
           const denyMsg = `denied: ${call.name} is hard-disabled in this build`;
-          log.warn("local.tool_hard_denied", {
+          log.warn("engine.tool_hard_denied", {
             auditId: deps.auditId,
             chatId: deps.chatId,
             tool: call.name,
@@ -751,7 +777,7 @@ export async function runToolLoop(
         const wouldConfirm = tier !== "auto" && !deps.autoAllow;
         if (wouldConfirm && confirmsUsedThisRound > 0) {
           const msg = "denied: only one confirmable tool per round; retry separately";
-          log.info("local.tool_confirm_skipped_round_cap", {
+          log.info("engine.tool_confirm_skipped_round_cap", {
             auditId: deps.auditId,
             chatId: deps.chatId,
             tool: call.name,
@@ -803,7 +829,7 @@ export async function runToolLoop(
     // tool stream as the final UX state.
     if (round >= deps.maxIterations && errorMessage === null && !isAborted()) {
       iterationCapHit = true;
-      log.warn("local.tool_iteration_cap", {
+      log.warn("engine.tool_iteration_cap", {
         auditId: deps.auditId,
         chatId: deps.chatId,
         cap: deps.maxIterations,
@@ -830,6 +856,10 @@ export async function runToolLoop(
         outputTokens += finalRound.outputTokens;
         outputTokensSeen = true;
       }
+      if (finalRound.costUsd !== null) {
+        costUsd += finalRound.costUsd;
+        costUsdSeen = true;
+      }
     }
   } catch (err) {
     const e = err as Error;
@@ -837,7 +867,7 @@ export async function runToolLoop(
       // Caller aborted (timeout / shutdown). Distinct from a fetch failure.
     } else {
       errorMessage = `local unexpected error: ${e.message}`;
-      log.error("local.tool_loop_failed", {
+      log.error("engine.tool_loop_failed", {
         auditId: deps.auditId,
         backend: deps.driver.backend,
         error: e.message,
@@ -852,6 +882,7 @@ export async function runToolLoop(
     toolCallSummaries,
     inputTokens,
     outputTokens: outputTokensSeen ? outputTokens : null,
+    costUsd: costUsdSeen ? costUsd : null,
     rounds: round + (iterationCapHit ? 1 : 0),
     toolsFired,
     iterationCapHit,
@@ -861,7 +892,7 @@ export async function runToolLoop(
     aborted,
   };
 
-  log.info("local.tool_loop_done", {
+  log.info("engine.tool_loop_done", {
     auditId: deps.auditId,
     chatId: deps.chatId,
     backend: deps.driver.backend,
@@ -869,6 +900,7 @@ export async function runToolLoop(
     rounds: result.rounds,
     inputTokens: result.inputTokens,
     outputTokens: result.outputTokens,
+    costUsd: result.costUsd,
     toolsFired,
     iterationCapHit,
     aborted,
@@ -879,8 +911,8 @@ export async function runToolLoop(
 }
 
 // Format a driver error into a loop-level message. Mirrors the formatting in
-// local.ts but kept local so the loop driver doesn't depend back on the runner.
-function formatDriverErrorForLoop(err: LocalDriverError): string {
+// engine.ts but kept local so the loop driver doesn't depend back on the runner.
+function formatDriverErrorForLoop(err: EngineDriverError): string {
   if (err.code === "model_missing") return err.message;
   return `local ${err.backend} ${err.code}: ${err.message}`;
 }
@@ -889,13 +921,14 @@ function formatDriverErrorForLoop(err: LocalDriverError): string {
 // Used by the cap-finalize path where we want a closing message but no tools
 // surface and no UI throttling.
 async function collectFinalText(opts: {
-  driver: LocalDriver;
+  driver: EngineDriver;
   model: string;
-  messages: ReadonlyArray<LocalChatMessage>;
+  messages: ReadonlyArray<EngineChatMessage>;
   signal: AbortSignal;
-}): Promise<{ text: string; outputTokens: number | null }> {
+}): Promise<{ text: string; outputTokens: number | null; costUsd: number | null }> {
   let text = "";
   let outputTokens: number | null = null;
+  let costUsd: number | null = null;
   try {
     for await (const evt of opts.driver.streamChat({
       model: opts.model,
@@ -903,18 +936,20 @@ async function collectFinalText(opts: {
       signal: opts.signal,
     })) {
       if (evt.kind === "text") text += evt.delta;
-      else if (evt.kind === "done") outputTokens = evt.outputTokens;
-      else if (evt.kind === "error") break;
+      else if (evt.kind === "done") {
+        outputTokens = evt.outputTokens;
+        costUsd = evt.costUsd;
+      } else if (evt.kind === "error") break;
     }
   } catch (err) {
-    log.warn("local.cap_finalize_failed", {
+    log.warn("engine.cap_finalize_failed", {
       error: (err as Error).message,
     });
   }
-  return { text, outputTokens };
+  return { text, outputTokens, costUsd };
 }
 
 /**
- * Re-export `LocalToolCallRef` so consumers don't need a second import.
+ * Re-export `EngineToolCallRef` so consumers don't need a second import.
  */
-export type { LocalToolCallRef };
+export type { EngineToolCallRef };

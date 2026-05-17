@@ -360,16 +360,40 @@ Canonical event names:
 - `agent.oob_local_injected` — cross-engine bridge injected N local-engine turns into the user prompt (only fires when there are out-of-band local exchanges since the last successful Claude turn)
 - `agent.done` — per-turn summary (cost, turns, isError)
 
-### Local engine (default engine path)
-- `local.stub_send_failed` — couldn't send the 💻 stub
-- `local.bad_frame` — wire-format parse failure on a stream chunk (NDJSON for Ollama, SSE for LMStudio; logged, line skipped, stream continues)
-- `local.fetch_failed` — fetch to `LOCAL_URL` threw (unreachable, abort/timeout, etc.)
-- `local.edit_throttled` / `local.edit_final_failed` — Telegram edit failures
-- `local.final_send_failed` — final fallback send (when the stub creation itself failed earlier)
-- `local.disabled_ack_failed` / `local.usage_ack_failed` — couldn't reply with the disabled / usage hint
-- `local.boot_health_failed` — backend health probe failed at boot (`/api/tags` for Ollama, `/v1/models` for LMStudio); non-fatal warn — daemon may come up after Solrac under systemd
-- `local.lmstudio_empty_stream` — LMStudio closed the SSE stream with zero text + zero tool-call events. Carries up to 30 raw `data:` payloads (truncated to 400 chars each) for diagnosis. Fires only when no events were yielded; happy path is silent. See [ARCHITECTURE.md tricky seam §10](./ARCHITECTURE.md#10-lmstudio-inline-error-sse-frames-http-200) and [RUNBOOK.md](./RUNBOOK.md#diagnosis) for triage steps.
-- `local.done` — per-turn summary (backend, model, elapsedSec, inputTokens, outputTokens, isError)
+### Engine slot (default engine path)
+
+**Runner events** (`engine.ts` / `engine-tools.ts` — fire regardless of backend):
+
+- `engine.stub_send_failed` — couldn't send the 💻 stub
+- `engine.driver_failed` — driver threw `EngineDriverError` (unreachable, timeout, `model_missing`, `http_error`)
+- `engine.unexpected_error` — driver threw something other than `EngineDriverError`
+- `engine.edit_throttled` / `engine.edit_final_failed` — Telegram edit failures
+- `engine.final_send_failed` — final fallback send (when the stub creation itself failed earlier)
+- `engine.disabled_ack_failed` — couldn't reply with the disabled hint
+- `engine.boot_health_ok` / `engine.boot_health_failed` / `engine.boot_health_model_missing` — health probe results (`/api/tags` for Ollama, `/v1/models` for LMStudio, `/v1/models` with bearer for OpenRouter); non-fatal warn — daemon may come up after Solrac under systemd
+- `engine.boot` — engine-slot boot summary (backend, mode, url, model, isDefaultEngine, toolsEnabled)
+- `engine.tools_enabled_but_zero_loaded` — `LOCAL_TOOLS_ENABLED=true` but no integration tools loaded
+- `engine.unexpected_tool_call_single_shot` — single-shot path saw a `tool_call` event (model called a tool we didn't offer); logged, ignored
+- `engine.tool_loop_start` / `engine.tool_loop_done` / `engine.tool_loop_failed` — tool-loop bookends
+- `engine.tool_loop_detected` / `engine.tool_iteration_cap` / `engine.cap_finalize_failed` — loop-defense events
+- `engine.tool_unknown` / `engine.tool_auto_allow` / `engine.tool_denied_policy` / `engine.tool_denied_hard` / `engine.tool_hard_denied` / `engine.tool_invalid_args` / `engine.tool_handler_threw` / `engine.tool_call_ok` — per-tool dispositions
+- `engine.tool_confirm_request` / `engine.tool_confirm_resolved` / `engine.tool_confirm_send_failed` / `engine.tool_confirm_round_cap` / `engine.tool_confirm_skipped_round_cap` — confirm-tier broker events
+- `engine.progress_failed` — throttled stream-render hook threw
+- `engine.done` — per-turn summary (backend, mode, model, elapsedSec, inputTokens, outputTokens, costUsd, isError)
+
+**Backend-specific driver events** (per-prefix so operators can grep one wire-format):
+
+- `ollama.bad_frame` — NDJSON parse failure (`local-driver.ts`; line skipped, stream continues)
+- `lmstudio.bad_frame` — SSE frame parse failure (`local-driver.ts`)
+- `lmstudio.tool_call_deduped` — Gemma-4 emitted the same `(name, args)` tool call twice; silently deduped
+- `lmstudio.empty_stream` — LMStudio closed the SSE stream with zero text + zero tool-call events. Carries up to 30 raw `data:` payloads (truncated to 400 chars each) for diagnosis. Fires only when no events were yielded; happy path is silent. See [ARCHITECTURE.md tricky seam §10](./ARCHITECTURE.md#10-lmstudio-inline-error-sse-frames-http-200) and [RUNBOOK.md](./RUNBOOK.md#diagnosis) for triage steps.
+- `openrouter.bad_frame` — SSE frame parse failure (`remote-driver.ts`)
+- `openrouter.tool_call_deduped` — identical-`(name, args)` dedup, mirrors LMStudio
+- `openrouter.empty_stream` — same shape as `lmstudio.empty_stream` but for OpenRouter
+
+**Remote-mode signals** (fire from `engine.ts` when `driver.mode === "remote"`):
+
+- `remote.cost_missing` — driver returned `null` for `costUsd` in the usage chunk; runner wrote `null` to `audit.cost_usd` (NOT 0) so the cap query doesn't silently treat it as free. Verify the backend still emits `usage.cost`.
 
 ### Policy
 - `policy.auto_allow` — classifier returned allow

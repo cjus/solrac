@@ -29,6 +29,16 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `LOCAL_HISTORY_LIMIT` | no | `6` | positive int | Last N successful turns reconstructed as conversation context per chat (cross-engine: includes Claude turns). At 256-char prompts × 6 turns ≈ ~3k tokens worst case. If you flip `LOCAL_TOOLS_ENABLED` off→on on an existing chat, prior "I do not have tools" turns get replayed and the model learns to refuse — use `/clear local` to wipe the chat's local history. |
 | `LOCAL_TOOLS_ENABLED` | no | `false` | boolean | Local model can call the same `mcp__solrac__*` integration tools the Claude tiers see. Requires `SOLRAC_INTEGRATIONS_ENABLED=true` AND `SOLRAC_DEFAULT_ENGINE=local` (boot rejects the unreachable `default!=local && tools=on` combo). Recommended `true` for local-default deploys. |
 | `LOCAL_MAX_TOOL_ITERATIONS` | no | `8` | positive int | Hard ceiling on tool-loop rounds per turn. Loop detector fires earlier on duplicate calls; this is the runaway-loop backstop. Iteration cap surfaces as `⚠️ stopped after N tool iterations`. |
+| `REMOTE_ENABLED` | no | `false` | boolean | Master switch for the remote-backend path (OpenRouter). **Mutually exclusive with `LOCAL_ENABLED`** — boot rejects both true. When `true`, the engine slot (`SOLRAC_DEFAULT_ENGINE=local` routing) dispatches to OpenRouter instead of an on-host LLM. Audit tag becomes `remote:<backend>:<model>` so cross-engine queries pattern-match correctly. `REMOTE_BACKEND`, `REMOTE_MODEL`, `REMOTE_API_KEY` MUST be set. |
+| `REMOTE_BACKEND` | when `REMOTE_ENABLED=true` | — | `openrouter` | Remote provider. Today only OpenRouter is supported; the type is provider-neutral for future vLLM/Anyscale/Together/Groq additions. |
+| `REMOTE_MODEL` | when `REMOTE_ENABLED=true` | — | string | OpenRouter slug (`<provider>/<model>`). Examples: `anthropic/claude-3.5-sonnet`, `openai/gpt-4o-mini`, `meta-llama/llama-3.3-70b-instruct`. Browse the full list at `https://openrouter.ai/models`. The `/` separator is preserved across the audit log; nothing parses `model` by splitting on `/`. |
+| `REMOTE_API_KEY` | when `REMOTE_ENABLED=true` | — | string | OpenRouter API key (typically prefixed `sk-or-`). Get one at `https://openrouter.ai/keys`. **Scrubbed** from the SDK-spawned `claude` subprocess env (`agent.ts::sanitizedSubprocessEnv` strips the entire `REMOTE_*` prefix) so a compromised model can't exfiltrate the billed credential via an auto-allowed `Bash(echo $REMOTE_API_KEY)`. |
+| `REMOTE_BASE_URL` | no | `https://openrouter.ai/api/v1` | url | Override for proxies or staging. Trailing slash stripped at boot; URL validated (http/https scheme required). |
+| `REMOTE_TIMEOUT_MS` | no | `60000` (or `120000` when `LOCAL_TOOLS_ENABLED=true`) | positive int | Mirrors `LOCAL_TIMEOUT_MS` semantics. |
+| `REMOTE_HISTORY_LIMIT` | no | `6` | positive int | Mirrors `LOCAL_HISTORY_LIMIT` — last N successful turns reconstructed as conversation context per chat (cross-engine). `/clear local` wipes the slot for remote turns too via the triple-pattern LIKE clause in `db.hasLocalTurnsSince` / `db.outOfBandForEngine`. |
+| `REMOTE_MAX_TOOL_ITERATIONS` | no | `8` | positive int | Mirrors `LOCAL_MAX_TOOL_ITERATIONS`. Per-round cost from each iteration is summed into `audit.cost_usd` so the hourly cap gates the full tool-loop burn. |
+| `REMOTE_HTTP_REFERER` | no | `https://github.com/cjus/solrac` | string | OpenRouter recommends attribution headers so usage shows correctly on the per-model leaderboard. Override for branded forks. |
+| `REMOTE_X_TITLE` | no | `solrac` | string | Counterpart to `REMOTE_HTTP_REFERER`. |
 | `SOLRAC_SKILLS_ENABLED` | no | `false` | boolean | Master switch for operator-defined skills. When `true`, Solrac discovers `SKILL.md` files under `SOLRAC_SKILLS_DIR` at boot and exposes each as a `/<name>` slash command. |
 | `SOLRAC_SKILLS_DIR` | no | `./skills` | path | Directory scanned for `<name>/SKILL.md` files. Resolved relative to `SOLRAC_HOME`. Loaded ONCE at boot — edit files and restart. See [USAGE.md#skills-operator-defined-commands](./USAGE.md#skills-operator-defined-commands). |
 | `SOLRAC_TASKS_ENABLED` | no | `false` | boolean | Master switch for scheduled tasks. When `true`, Solrac discovers `TASK.md` files under `SOLRAC_TASKS_DIR` at boot and fires each on its configured schedule (5-field unix `cron:` or absolute `at:`). Fires synthesize updates through the existing turn queue, so cost caps + allowlist gate + policy hooks all apply automatically. |
@@ -55,10 +65,12 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 - **Webhook constraint:** when `SOLRAC_TRANSPORT=webhook`, `TG_WEBHOOK_SECRET` must be set and ≥32 characters.
 - **Legacy `OLLAMA_*` env var rejection:** any `OLLAMA_*` env var still set at boot causes Solrac to fail loud with the full list and a rename mapping (`OLLAMA_ENABLED` → `LOCAL_ENABLED`, etc., plus `add LOCAL_BACKEND=ollama`). Same for `SOLRAC_DEFAULT_ENGINE=ollama`. See [RUNBOOK.md#breaking-local-engine](./RUNBOOK.md#breaking-local-engine).
 - **Default-engine constraints:**
-  - `SOLRAC_DEFAULT_ENGINE=local` requires `LOCAL_ENABLED=true`. Boot throws with the actionable hint to either enable the local engine or pick a different default.
-  - `SOLRAC_DEFAULT_ENGINE=primary|secondary` with `LOCAL_TOOLS_ENABLED=true` is **unreachable** — the local engine only runs as the default engine, so this combination would load tools no engine can call. Boot throws.
+  - `SOLRAC_DEFAULT_ENGINE=local` requires `LOCAL_ENABLED=true` OR `REMOTE_ENABLED=true`. The "local" engine slot is mode-agnostic — on-host or OpenRouter both satisfy it. Boot throws with the actionable hint listing both paths.
+  - `SOLRAC_DEFAULT_ENGINE=primary|secondary` with `LOCAL_TOOLS_ENABLED=true` is **unreachable** — the engine slot only runs as the default engine, so this combination would load tools no engine can call. Boot throws.
   - When `SOLRAC_DEFAULT_ENGINE` is unset, a `solrac.default_engine_implicit` warn fires at boot so deployments never run on an implicit default. Set the variable explicitly (even to `local`) to silence the warning.
 - **Local-engine constraint:** when `LOCAL_ENABLED=true`, both `LOCAL_BACKEND` (∈ `ollama`/`lmstudio`) and `LOCAL_MODEL` must be set and non-blank. `LOCAL_TIMEOUT_MS`, `LOCAL_HISTORY_LIMIT`, and `LOCAL_MAX_TOOL_ITERATIONS` must parse as positive integers if provided. `LOCAL_URL` has its trailing slash stripped at boot.
+- **Remote-engine constraint:** when `REMOTE_ENABLED=true`, all of `REMOTE_BACKEND`, `REMOTE_MODEL`, `REMOTE_API_KEY` must be set and non-blank. `REMOTE_BASE_URL` (default `https://openrouter.ai/api/v1`) has its trailing slash stripped and scheme validated. `REMOTE_TIMEOUT_MS`, `REMOTE_HISTORY_LIMIT`, `REMOTE_MAX_TOOL_ITERATIONS` parse as positive integers.
+- **Local/remote mutex:** `LOCAL_ENABLED=true && REMOTE_ENABLED=true` is rejected at boot. The engine slot has a single driver per boot — picking between modes is structural, not per-message. Operators wanting both should pin `SOLRAC_DEFAULT_ENGINE=primary` and use Claude for the no-prefix path.
 - **Local-tools constraint:** `LOCAL_TOOLS_ENABLED=true` requires `SOLRAC_INTEGRATIONS_ENABLED=true` (else there are no tools to expose; boot throws).
 - **Web UI constraint:** when `SOLRAC_WEB_ENABLED=true`, `SOLRAC_WEB_TOKEN` must be set (any value; ≥32 chars recommended). `SOLRAC_WEB_PORT` must differ from `PORT`. `SOLRAC_WEB_CHAT_ID` must be a negative integer.
 
@@ -108,7 +120,7 @@ LMStudio operators must size the **model's loaded context window** to fit Solrac
 
 **Effective vs nominal context.** Most models that advertise 128K+ degrade noticeably past their training distribution (the RULER and "lost in the middle" benchmarks). Loading a 26B Gemma-derived model at its nominal 256K rarely buys real-world quality past 32-64K — wasted RAM either way.
 
-**Model selection gotcha.** Some MLX repacks (notably community Gemma variants like `gemma-4-26b-a4b-it-mlx`) silently dropped the tool-call branch from their chat template. When `tools` is in the request body the model emits zero output. Solrac's diagnostic catches this as `local.lmstudio_empty_stream` — see [RUNBOOK.md](./RUNBOOK.md#diagnosis). First-class OpenAI tool-calling models (Qwen 2.5 instruct, Llama 3.1 instruct) avoid this entirely.
+**Model selection gotcha.** Some MLX repacks (notably community Gemma variants like `gemma-4-26b-a4b-it-mlx`) silently dropped the tool-call branch from their chat template. When `tools` is in the request body the model emits zero output. Solrac's diagnostic catches this as `lmstudio.empty_stream` — see [RUNBOOK.md](./RUNBOOK.md#diagnosis). First-class OpenAI tool-calling models (Qwen 2.5 instruct, Llama 3.1 instruct) avoid this entirely.
 
 ## Example `.env`
 
@@ -167,13 +179,36 @@ SOLRAC_WEB_TOKEN=                 # required when enabled; generate: openssl ran
 
 ### Claude-only deploy
 
-For hosts that can't run a local model:
+For hosts that can't run a local model and don't want OpenRouter:
 
 ```sh
 SOLRAC_DEFAULT_ENGINE=primary     # no-prefix → Anthropic Sonnet
 LOCAL_ENABLED=false
+REMOTE_ENABLED=false
 LOCAL_TOOLS_ENABLED=false
 SOLRAC_INTEGRATIONS_ENABLED=true  # still useful for Claude tiers
+```
+
+### Remote deploy via OpenRouter
+
+For hosts that can't run a local model but want a non-Claude default engine (e.g. `gpt-4o-mini` for cheap chat, with `@` / `!` escalation to Claude tiers for heavier reasoning):
+
+```sh
+SOLRAC_DEFAULT_ENGINE=local       # the engine slot, served by OpenRouter
+LOCAL_ENABLED=false               # mutually exclusive with REMOTE_ENABLED
+REMOTE_ENABLED=true
+REMOTE_BACKEND=openrouter
+REMOTE_MODEL=openai/gpt-4o-mini   # browse https://openrouter.ai/models
+REMOTE_API_KEY=sk-or-…            # get at https://openrouter.ai/keys
+# REMOTE_BASE_URL=https://openrouter.ai/api/v1  # default
+# REMOTE_HTTP_REFERER=https://github.com/cjus/solrac
+# REMOTE_X_TITLE=solrac
+
+# Per-token cost is captured from OpenRouter's streaming usage chunk into
+# audit.cost_usd, so the existing per-chat + global hourly caps gate burn
+# automatically — no separate REMOTE_HOURLY_COST_CAP_USD needed.
+HOURLY_COST_CAP_USD=1.00
+GLOBAL_HOURLY_COST_CAP_USD=4.00
 ```
 
 ## Sensitive-secret handling
@@ -182,8 +217,11 @@ The SDK spawns a `claude` subprocess that **inherits parent env**. Solrac scrubs
 
 - `TELEGRAM_*` (any prefix)
 - `TG_*` (any prefix)
+- `LOCAL_*` (any prefix — backend URL/model)
+- `REMOTE_*` (any prefix — OpenRouter API key + base URL)
 - `STATS_BEARER_TOKEN`
 - `ALLOWLIST_BOOTSTRAP`
+- `NOTION_API_KEY`
 
 `ANTHROPIC_API_KEY`, `SOLRAC_PRIMARY_MODEL`, and `SOLRAC_SECONDARY_MODEL` are passed through (the agent needs them).
 

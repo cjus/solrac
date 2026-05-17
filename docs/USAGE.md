@@ -54,7 +54,7 @@ The bot responds by editing a single thinking-stub message. The stub emoji tells
 |--------|------|
 | Primary Claude (Sonnet) | `🙂 thinking…` |
 | Secondary Claude (Opus) | `🤔 thinking…` |
-| Local (`ollama` / `lmstudio`) | `💻 thinking…` |
+| Engine slot (Ollama / LMStudio / OpenRouter) | `💻 thinking…` |
 
 You'll see it transition through:
 
@@ -69,12 +69,15 @@ The footer reports turn count and cost in USD.
 ## Engine routing (prefix table)
 
 The first non-whitespace character of your message picks the engine. The
-default routes to the local engine, so Anthropic burn happens only on a
-deliberate `@` or `!`; everything else stays local and free.
+default routes to the **engine slot** — on-host (Ollama / LMStudio) when
+`LOCAL_ENABLED=true`, or hosted (OpenRouter) when `REMOTE_ENABLED=true`.
+Anthropic burn happens only on a deliberate `@` or `!`; everything else
+stays on the engine slot.
 
 | Prefix | Engine | Default model | Use when |
 |--------|--------|---------------|----------|
-| (none) | **Default** (per `SOLRAC_DEFAULT_ENGINE`, ships as `local`) | `LOCAL_MODEL` (recommended `gemma4:e4b`); backend picked by `LOCAL_BACKEND` (`ollama` / `lmstudio`) | The free default. Local model handles casual chat + tool-driven work via integrations. |
+| (none), local mode | **Engine slot — local** (Ollama / LMStudio) | `LOCAL_MODEL` (recommended `gemma4:e4b`); backend picked by `LOCAL_BACKEND` | The free default. Local model handles casual chat + tool-driven work via integrations. |
+| (none), remote mode | **Engine slot — remote** (OpenRouter) | `REMOTE_MODEL` slug (e.g. `openai/gpt-4o-mini`, `anthropic/claude-3.5-sonnet`) | When the host can't run a local LLM. Per-token cost is captured into `audit.cost_usd` so the hourly cap gates burn. |
 | `@` | Primary Claude — escalate | `SOLRAC_PRIMARY_MODEL` (default `claude-sonnet-4-6`) | When the task needs Sonnet-level reasoning, file ops, or the SDK's preset tools. Costs $$$. |
 | `!` | Secondary Claude — heaviest | `SOLRAC_SECONDARY_MODEL` (default `claude-opus-4-7`) | When Sonnet isn't enough. Costs $$$$. Mnemonic: `!` = "important / hardest". |
 
@@ -103,17 +106,17 @@ double it (`!!literal` produces `!literal`).
 
 Reach for `@` (Sonnet) when:
 - The task needs structured tool use beyond the operator's integrations (file edits, web fetches, complex shell).
-- You want strong code reasoning or multi-step planning the local model can't sustain.
-- The conversation needs a long context window the local model truncates.
+- You want strong code reasoning or multi-step planning the engine-slot model can't sustain.
+- The conversation needs a long context window the engine-slot model truncates.
 
 Reach for `!` (Opus) when:
 - `@` already responded but missed the nuance.
 - You're doing architecture review, hard math, or anything where extra cost is justified by extra correctness.
 
-Stay on the default (local engine) when:
+Stay on the default (engine slot) when:
 - The question is casual / one-shot / self-contained.
-- The operator has integrations the local model can call (`LOCAL_TOOLS_ENABLED=true`).
-- You want zero Anthropic burn.
+- The operator has integrations the engine-slot model can call (`LOCAL_TOOLS_ENABLED=true`).
+- You want zero Anthropic burn (local mode is free; remote mode is per-token via OpenRouter — still typically cheaper than Claude for casual chat).
 
 Both Claude tiers run through the same SDK preset (`claude_code`), the same
 tools, the same `canUseTool` policy, and the same `<untrusted-content>`
@@ -122,29 +125,39 @@ prompt caching survives across same-tier turns.
 
 ### Default engine details
 
-The default-engine identity is server-resolved from `SOLRAC_DEFAULT_ENGINE`:
+The default-engine identity is server-resolved from `SOLRAC_DEFAULT_ENGINE`. When `SOLRAC_DEFAULT_ENGINE=local`, the engine slot is wired by exactly one of `LOCAL_ENABLED=true` (Ollama/LMStudio) or `REMOTE_ENABLED=true` (OpenRouter) — mutually exclusive at boot.
 
 | `SOLRAC_DEFAULT_ENGINE` | What no-prefix routes to | Capability note tone |
 |---|---|---|
-| `local` (default) | Local engine (`LOCAL_MODEL` on `LOCAL_BACKEND`) | "you are the default chat engine; tools when `LOCAL_TOOLS_ENABLED=true`; escalate via `@` / `!`" |
+| `local` + `LOCAL_ENABLED=true` | Engine slot → on-host (`LOCAL_MODEL` on `LOCAL_BACKEND`) | "you are the default chat engine; cost the operator nothing; tools when `LOCAL_TOOLS_ENABLED=true`; escalate via `@` / `!`" |
+| `local` + `REMOTE_ENABLED=true` | Engine slot → OpenRouter (`REMOTE_MODEL`) | "you are the default chat engine; cost the operator per-token via OpenRouter, so be concise; tools when `LOCAL_TOOLS_ENABLED=true`; escalate via `@` / `!`" |
 | `primary` | Anthropic Sonnet | Same as `@` Sonnet (Claude-only deploys) |
 | `secondary` | Anthropic Opus | Same as `!` Opus (Claude-only deploys) |
 
-**Default-local details:**
+**Engine-slot details (local mode):**
 - **Free** — `cost_usd = 0`; the per-chat and global cost caps don't apply.
 - **Footer** — `<i>✅ local:ollama:gemma4:e4b · 1.2s</i>` (or `· N tools · 1.2s` when tools fired). On LMStudio: `local:lmstudio:<model>`.
 - **Tools** — when `LOCAL_TOOLS_ENABLED=true` and integrations are loaded, the local model can call `mcp__solrac__*` tools the same way Claude does.
 - **Cross-engine context** — sees prior Claude turns (both tiers).
 
-**Default-local failure modes:**
+**Engine-slot details (remote mode):**
+- **Per-token billed** — `cost_usd` is captured from OpenRouter's streaming `usage.cost` chunk into the audit row. The existing `HOURLY_COST_CAP_USD` + `GLOBAL_HOURLY_COST_CAP_USD` ceilings gate this burn alongside any Claude tier spend.
+- **Footer** — `<i>✅ remote:openrouter:openai/gpt-4o-mini · 1.2s</i>`. The mode prefix (`remote:`) matches the audit-row tag so log-grepping and chat-footer comparison are symmetric.
+- **Tools** — `LOCAL_TOOLS_ENABLED=true` works the same way (the runner is mode-agnostic; tool-loop summation correctly accumulates per-round cost from OpenRouter).
+- **Cross-engine context** — sees prior Claude turns AND prior local turns (same audit-table query path).
+
+**Engine-slot failure modes:**
 
 | Condition | What you see |
 |-----------|--------------|
 | `@` / `!` alone with no payload | `usage: @<prompt> — sends to primary Claude (model: <model>)` |
-| Backend not running | `❌ local unreachable: <LOCAL_URL>` (boot also logs `local.boot_health_failed`) |
-| Model not pulled / loaded on the host | `❌ local model not found: <model> — pull with 'ollama pull <model>' (Ollama) or load via the LMStudio UI / 'lms load <model>'` |
+| **Local mode:** backend not running | `❌ local unreachable: <LOCAL_URL>` (boot also logs `engine.boot_health_failed`) |
+| **Local mode:** model not pulled / loaded on the host | `❌ local model not found: <model> — pull with 'ollama pull <model>' (Ollama) or load via the LMStudio UI / 'lms load <model>'` |
+| **Remote mode:** bad API key | `❌ auth failed (HTTP 401) — check REMOTE_API_KEY` (boot also logs `engine.boot_health_failed` with `auth_failed`) |
+| **Remote mode:** model slug unknown / unavailable | `❌ model not available on OpenRouter: <slug> — <provider message>` |
+| **Remote mode:** OpenRouter didn't return a cost (defensive) | turn renders normally; `audit.cost_usd` is `NULL` (not 0); `remote.cost_missing` warn fires in logs |
 | Tool loop didn't converge | `⚠️ stopped after N tool iterations` |
-| Inference exceeds `LOCAL_TIMEOUT_MS` | `❌ local timed out after 60s` |
+| Inference exceeds `LOCAL_TIMEOUT_MS` / `REMOTE_TIMEOUT_MS` | `❌ local timed out after 60s` |
 
 See [CONFIG.md](./CONFIG.md) for the full env list.
 
@@ -186,7 +199,7 @@ Examples:
 :context            → same as /context (alternate prefix)
 ```
 
-`/clear local` semantics differ from the Claude tiers because the local engine is stateless — there's no SDK session id to drop. Instead, the dispatcher writes `Date.now()` to `sessions.local_cutoff_ms` for this chat. Subsequent `recentChatTurns` lookups (the local engine's history reconstruction) and `outOfBandForEngine` lookups (Claude's cross-engine bridge) filter out local-engine rows with `started_at <= cutoff`. The audit log itself is untouched — operator queries against `audit` still show every turn. The cutoff is per-chat and survives restarts. A back-to-back `/clear local` with no intervening turn reports "Already clean" (the cutoff is already past every existing row).
+`/clear local` semantics differ from the Claude tiers because the engine slot (Ollama / LMStudio / OpenRouter) is stateless from the SDK's perspective — there's no session id to drop. Instead, the dispatcher writes `Date.now()` to `sessions.local_cutoff_ms` for this chat. Subsequent `recentChatTurns` lookups (the engine slot's history reconstruction) and `outOfBandForEngine` lookups (Claude's cross-engine bridge) filter out engine-slot rows with `started_at <= cutoff`. The triple-pattern LIKE clause matches `local:%` (Ollama, LMStudio), `ollama:%` (legacy, pre-v0.7.0), and `remote:%` (OpenRouter) — so `/clear local` is correct for any engine-slot mode. The audit log itself is untouched — operator queries against `audit` still show every turn. The cutoff is per-chat and survives restarts. A back-to-back `/clear local` with no intervening turn reports "Already clean" (the cutoff is already past every existing row).
 
 ### `/compact` semantics
 
@@ -263,7 +276,7 @@ HTML comments inside `SOLRAC.md` (`<!-- ... -->`) are stripped before the file s
 
 ### Tier independence
 
-Both files apply to **all** engines: the default (local unless overridden), primary Claude (`@`, Sonnet), and secondary Claude (`!`, Opus). The only engine-specific text is a single capability sentence Solrac appends in code (the §3c matrix in `agent.ts::buildClaudeCapabilityNote` and `local.ts::buildLocalCapabilityNote`), so your `SOUL.md` doesn't need conditional sections.
+Both files apply to **all** engines: the default (engine slot unless overridden), primary Claude (`@`, Sonnet), and secondary Claude (`!`, Opus). The only engine-specific text is a single capability sentence Solrac appends in code (the §3c matrix in `agent.ts::buildClaudeCapabilityNote`, `local-driver.ts::buildLocalCapabilityNote`, and `remote-driver.ts::buildRemoteCapabilityNote`), so your `SOUL.md` doesn't need conditional sections.
 
 ### Re-read cadence (`SOLRAC.md`)
 
@@ -583,7 +596,7 @@ See `examples/tasks/` for two ready-to-edit samples.
 
 An **integration** is a TypeScript module under `$SOLRAC_INTEGRATIONS_DIR/<name>/index.ts` (or, for shipped reference integrations, `src/integrations-builtin/<name>/index.ts`) that adds new tools to the agent without touching solrac's source. Each module default-exports `setup(ctx)` and returns `{ apiVersion, tools, meta }`. Tools surface to the model as `mcp__solrac__<name>`.
 
-> **Engine reach.** Integrations are reachable from both Claude tiers (`@`, `!`) and the local-engine default — the latter when `LOCAL_TOOLS_ENABLED=true` (precondition: `SOLRAC_INTEGRATIONS_ENABLED=true`). With local-engine tools-on, the local model gets the same `mcp__solrac__*` tool surface; `local.ts::buildLocalCapabilityNote` advertises the loaded tool names so the model knows what it can call. With `LOCAL_TOOLS_ENABLED=false`, the local engine falls back to single-shot inference and the capability note tells it to redirect tool-shaped requests to `@`/`!`. Reliability still varies by local model — `gemma4:e4b` (on Ollama) is the recommended baseline.
+> **Engine reach.** Integrations are reachable from both Claude tiers (`@`, `!`) and the engine-slot default — the latter when `LOCAL_TOOLS_ENABLED=true` (precondition: `SOLRAC_INTEGRATIONS_ENABLED=true`). With engine-slot tools-on, the slot's model gets the same `mcp__solrac__*` tool surface; the capability note (`local-driver.ts::buildLocalCapabilityNote` or `remote-driver.ts::buildRemoteCapabilityNote`, selected by `driver.mode`) advertises the loaded tool names so the model knows what it can call. With `LOCAL_TOOLS_ENABLED=false`, the engine slot falls back to single-shot inference and the capability note tells it to redirect tool-shaped requests to `@`/`!`. Reliability still varies by local model — `gemma4:e4b` (on Ollama) is the recommended baseline; OpenRouter-hosted frontier models handle tools cleanly.
 
 ### Shipping model
 

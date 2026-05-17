@@ -43,7 +43,7 @@
  *
  * Cross-references:
  *   - src/commands.ts::runSkillBare — pure execution helper, recursion-safe
- *   - src/local.ts::runLocalTurnWithTools — wraps loop in skillToolCtx.run
+ *   - src/engine.ts::runEngineTurnWithTools — wraps loop in skillToolCtx.run
  *   - docs/USAGE.md#skills-as-tools — operator-facing docs
  */
 
@@ -53,7 +53,7 @@ import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import {
   runSkillBare,
-  type LocalSkillDeps,
+  type EngineSkillDeps,
 } from "./commands.ts";
 import type { SolracDb } from "./db.ts";
 import { log } from "./log.ts";
@@ -84,7 +84,7 @@ export const skillToolCtx = new AsyncLocalStorage<SkillToolContext>();
 // The leading `skills` segment is the synthetic-integration namespace; the
 // trailing `<name>` matches the operator's `name:` frontmatter. The
 // `mcp__solrac__` prefix the policy layer expects is added by
-// `local-tools.ts::executeToolCall` when reconstructing the full name.
+// `engine-tools.ts::executeToolCall` when reconstructing the full name.
 export const SKILL_TOOL_PREFIX = "skills__";
 
 export function skillToolName(skillName: string): string {
@@ -139,7 +139,7 @@ export interface BuildSkillToolsDeps {
   // skills (the tool-eligible filter below catches the contradiction). When
   // null and the registry contains tool-eligible skills, we log + return
   // empty rather than crash.
-  readonly localSkillDeps: LocalSkillDeps | null;
+  readonly localSkillDeps: EngineSkillDeps | null;
 }
 
 /**
@@ -179,7 +179,7 @@ export function buildSkillTools(
 function buildOneSkillTool(
   skill: Skill,
   db: SolracDb,
-  local: LocalSkillDeps,
+  local: EngineSkillDeps,
 ): SdkMcpToolDefinition<any> {
   // The `args` schema mirrors the only template variable supported by skill
   // bodies (`{{args}}`). We expose it as a single string parameter rather
