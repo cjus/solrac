@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — OpenRouter as a remote backend for the engine slot
+## v0.9.0 — OpenRouter as a remote backend for the engine slot
 
 Adds **OpenRouter** as a third option for the no-prefix engine slot, alongside on-host Ollama and LMStudio. New `REMOTE_ENABLED=true` flag — mutually exclusive with `LOCAL_ENABLED` at boot — points the engine slot at OpenRouter so hosts that can't run a local LLM still get a default-engine option. Per-token cost from OpenRouter's streaming `usage.cost` field is captured and written to `audit.cost_usd`, so the existing per-chat (`HOURLY_COST_CAP_USD`) and global (`GLOBAL_HOURLY_COST_CAP_USD`) hourly caps gate remote burn automatically — no new cost-cap knob needed. Claude tiers (`@`, `!`) and the `local` engine routing are unaffected.
 
