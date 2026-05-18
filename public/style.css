@@ -349,14 +349,20 @@ body {
 }
 
 .voice-badge {
-  display: inline-block;
-  margin: 4px 16px 8px 16px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--code-bg);
-  color: var(--muted);
   font-size: 12px;
-  align-self: flex-start;
+  color: var(--muted);
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1.4;
+}
+
+.voice-badge:hover {
+  border-color: var(--error);
+  color: var(--error);
 }
 
 /* Per-message speak button, bottom-right of the bubble. */

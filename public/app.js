@@ -98,6 +98,7 @@ function bindUi() {
   }
   setEngine("");
   els.micBtn?.addEventListener("click", onMicClick);
+  els.voiceBadge?.addEventListener("click", () => sendUser("/voice off"));
 }
 
 // ── Auth ───────────────────────────────────────────────
