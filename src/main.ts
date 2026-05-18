@@ -118,7 +118,7 @@ import {
   type DenialThrottle,
   type GlobalCostCapGuard,
 } from "./policy.ts";
-import { createTurnQueue } from "./queue.ts";
+import { createTurnQueue, type EnqueueResult } from "./queue.ts";
 import {
   EMPTY_TASK_REGISTRY,
   getScheduledContext,
@@ -151,6 +151,12 @@ import { createTelegramClient, type TelegramClient } from "./telegram.ts";
 import { TurnTracker } from "./turn-tracker.ts";
 import { createWebClient, type WebClient } from "./web-client.ts";
 import { startWebServer } from "./web.ts";
+import {
+  handleTelegramVoiceStt,
+  maybeReplyWithVoice,
+  type VoiceDeps,
+  type VoiceTelegramSender,
+} from "./voice.ts";
 
 interface RunTurnDeps {
   tg: TelegramClient;
@@ -195,13 +201,102 @@ interface RunTurnDeps {
   // value created by `createSdkMcpServer` and threaded into `runAgent`'s
   // `options.mcpServers`. Claude tiers only — local path ignores this.
   mcpServer: McpSdkServerConfigWithInstance | null;
+  // Voice (ElevenLabs). `null` when VOICE_ENABLED=false. When non-null, the
+  // dispatcher routes `msg.voice` through `handleTelegramVoiceStt` to
+  // transcribe → enqueue the synthesized text Update. Wired only on the
+  // Telegram transport (web has its own /api/stt route).
+  voiceDeps: VoiceDeps | null;
+  // Forward reference to `queue.enqueue` so the voice dispatcher can
+  // re-enqueue a synthesized text Update once STT lands. Mutable closure
+  // bound at boot (queue is built after makeRunTurn — same pattern as
+  // `getQueueSnapshot` and `triggerScheduledTask`).
+  enqueue: (update: Update) => EnqueueResult;
+  // Phase 5 — post-turn TTS attach. Threaded into AgentRunDeps and the
+  // localDeps EngineRunDeps so Claude tiers + local + remote all attach a
+  // voice note when `voice_replies=1`. `undefined` on the web RunTurnDeps
+  // (web has its own per-message speak button).
+  attachVoiceReply?: AttachVoiceReply;
+  // Word target for the voice-mode prompt nudge (Phase 1). Threaded to
+  // both runners. `undefined` when VOICE_ENABLED=false; identical for
+  // Telegram + web (both transports inject the nudge when /voice on).
+  voiceReplyWords?: number;
 }
+
+type AttachVoiceReply = (opts: {
+  chatId: number;
+  messageId: number | null;
+  auditId: number;
+  finalText: string;
+}) => Promise<void>;
 
 function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
   return async (update) => {
     const msg = update.message;
-    if (!msg || !msg.text || !msg.from) {
-      log.debug("turn.ignored", { update_id: update.update_id, kind: "non-text-or-no-from" });
+    if (!msg || !msg.from) {
+      log.debug("turn.ignored", { update_id: update.update_id, kind: "no-msg-or-no-from" });
+      return;
+    }
+    // Voice note → STT → re-enqueue as synthesized text. Gated on
+    // `voiceDeps` (null when VOICE_ENABLED=false). The synthesized Update
+    // carries the same update_id/from/chat but `text=transcript` and NO
+    // `voice` field, so this branch can't loop. Cap-check, gate, and
+    // voice_events row all happen inside `handleTelegramVoiceStt`.
+    if (!msg.text && msg.voice && deps.voiceDeps) {
+      const chatId = msg.chat.id;
+      log.info("turn.voice_received", {
+        update_id: update.update_id,
+        chat_id: chatId,
+        from_id: msg.from.id,
+        duration: msg.voice.duration,
+      });
+      await deps.tg
+        .sendChatAction(chatId, "record_voice")
+        .catch((err) =>
+          log.debug("voice.chat_action_failed", { error: (err as Error).message }),
+        );
+      const result = await handleTelegramVoiceStt(deps.voiceDeps, {
+        update,
+        voiceFileId: msg.voice.file_id,
+      });
+      if (result.kind === "synthesized") {
+        log.info("voice.stt_ok", {
+          update_id: update.update_id,
+          chat_id: chatId,
+          text_preview: result.update.message?.text?.slice(0, 80) ?? "",
+        });
+        const enq = deps.enqueue(result.update);
+        if (enq.kind === "dropped_queue_full") {
+          await deps.tg
+            .sendMessage(chatId, `queue full (${enq.depth} waiting) — try again in a moment`)
+            .catch((err) =>
+              log.warn("voice.queue_full_notice_failed", { error: (err as Error).message }),
+            );
+        }
+        return;
+      }
+      if (result.kind === "denied_cap") {
+        await deps.tg
+          .sendMessage(chatId, "voice cap reached, try again in a minute")
+          .catch((err) =>
+            log.warn("voice.cap_notice_failed", { error: (err as Error).message }),
+          );
+      } else if (result.kind === "error") {
+        log.warn("voice.stt_failed", {
+          update_id: update.update_id,
+          chat_id: chatId,
+          message: result.message,
+        });
+        await deps.tg
+          .sendMessage(chatId, "voice transcription failed — try sending as text")
+          .catch((err) =>
+            log.warn("voice.error_notice_failed", { error: (err as Error).message }),
+          );
+      }
+      // denied_gate is silent (parity with the text-gate path).
+      return;
+    }
+    if (!msg.text) {
+      log.debug("turn.ignored", { update_id: update.update_id, kind: "non-text-or-voice" });
       return;
     }
     // Scheduler — when this update was synthesized by the tick driver, the
@@ -337,6 +432,8 @@ function makeRunTurn(deps: RunTurnDeps): (update: Update) => Promise<void> {
         globalCostGuard: deps.globalCostGuard,
         createCanUseTool: deps.createCanUseTool,
         mcpServer: deps.mcpServer,
+        voiceReplyWords: deps.voiceReplyWords,
+        attachVoiceReply: deps.attachVoiceReply,
       },
       {
         chatId: msg.chat.id,
@@ -823,6 +920,8 @@ async function main(): Promise<void> {
             toolTiers: localToolsActive ? integrationToolTiers : undefined,
             broker: localToolsActive ? broker : undefined,
             maxToolIterations: localSlotMaxToolIterations,
+            voiceReplyWords: config.voiceEnabled ? config.voiceReplyWordsHint : undefined,
+            attachVoiceReply: undefined,
           }
         : null;
     if (localDeps && localDriver) {
@@ -974,6 +1073,67 @@ async function main(): Promise<void> {
         : null;
     }
 
+    // Voice (Phase 4 STT + Phase 5 TTS attach). Built once at boot when
+    // VOICE_ENABLED=true; null otherwise. Telegram dispatcher gets the
+    // populated value; web transport passes `null` because it has its own
+    // /api/stt and /api/tts routes (Phase 2).
+    //
+    // The `telegramSender` lets the post-turn hook attach a voice note to
+    // assistant replies on the Telegram transport. Phase 5's
+    // `maybeReplyWithVoice` no-ops when this is missing.
+    const telegramSender: VoiceTelegramSender | null = config.voiceEnabled
+      ? {
+          sendVoice: async (chatId, audio, opts) => {
+            await tg.sendVoice(chatId, audio, {
+              reply_to_message_id: opts?.replyToMessageId,
+              mime_type: opts?.mimeType,
+            });
+          },
+          sendAudio: async (chatId, audio, opts) => {
+            await tg.sendAudio(chatId, audio, {
+              reply_to_message_id: opts?.replyToMessageId,
+              mime_type: opts?.mimeType,
+            });
+          },
+        }
+      : null;
+    const voiceDeps: VoiceDeps | null = config.voiceEnabled
+      ? {
+          db,
+          tg,
+          config,
+          isAllowed: allowlist.isAllowed,
+          telegramSender: telegramSender ?? undefined,
+        }
+      : null;
+    // Bound once so AgentRunDeps + EngineRunDeps share the same callback
+    // (and the same VoiceDeps, including cost-cap state).
+    const attachVoiceReply: AttachVoiceReply | undefined = voiceDeps
+      ? (opts) => maybeReplyWithVoice(voiceDeps, opts)
+      : undefined;
+    // Splice the post-turn hook onto the Telegram-bound `localDeps` so the
+    // engine runner sees it when the operator types into a Telegram chat.
+    // `webLocalDeps` (built above as a spread of `localDeps`) is overridden
+    // explicitly below — web has its own per-message speak button.
+    if (localDeps) {
+      localDeps.attachVoiceReply = attachVoiceReply;
+    }
+    if (webLocalDeps) {
+      webLocalDeps.attachVoiceReply = undefined;
+    }
+    // Forward reference for the voice dispatcher's re-enqueue. Mirrors the
+    // `queueRef` pattern — queue is built after makeRunTurn, but the closure
+    // resolves the latest reference at call time.
+    const voiceEnqueue = (update: Update): EnqueueResult => {
+      if (!queueRef) {
+        // Defensive: voice dispatch fires inside a queue worker, so queue
+        // must exist. If it doesn't, drop loud rather than NPE.
+        log.warn("voice.enqueue_pre_queue", { update_id: update.update_id });
+        return { kind: "dropped_queue_full", depth: 0, key: 0 };
+      }
+      return queueRef.enqueue(update);
+    };
+
     const tgRunTurn = makeRunTurn({
       tg,
       db,
@@ -991,6 +1151,10 @@ async function main(): Promise<void> {
       botUsername,
       skillRegistry,
       mcpServer: integrationsMcpServer,
+      voiceDeps,
+      enqueue: voiceEnqueue,
+      voiceReplyWords: config.voiceEnabled ? config.voiceReplyWordsHint : undefined,
+      attachVoiceReply,
     });
     const webRunTurn = webClient
       ? makeRunTurn({
@@ -1008,6 +1172,10 @@ async function main(): Promise<void> {
           localDeps: webLocalDeps,
           commandDeps: webCommandDeps!,
           botUsername: null,
+          voiceDeps: null,
+          enqueue: voiceEnqueue,
+          voiceReplyWords: config.voiceEnabled ? config.voiceReplyWordsHint : undefined,
+          attachVoiceReply: undefined,
           skillRegistry,
           mcpServer: integrationsMcpServer,
         })
