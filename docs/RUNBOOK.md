@@ -12,6 +12,8 @@ For day-to-day operations, see [OPERATIONS.md](./OPERATIONS.md).
 - [Bot silent, no error in logs](#bot-silent-no-error)
 - [Drain timeout on shutdown](#drain-timeout)
 - [Runaway cost (cap not firing)](#runaway-cost)
+- [Voice cost runaway (ElevenLabs)](#voice-cost-runaway)
+- [Voice silent / ElevenLabs errors](#voice-errors)
 - [DB corruption / lock errors](#db-corruption)
 - [OOM kill / runaway memory](#oom)
 - [Zombie poller / stale PID](#zombie-poller)
@@ -322,6 +324,152 @@ sudo systemctl start solrac.service
 - The PreToolUse hook fires for every tool, including SDK-auto-approved ones. As long as the hook is configured (set in `agent.ts`), every tool call consults the cap before running.
 - Daily report DM is your post-hoc alarm. Don't ignore it.
 - See [OQ#5](./ROADMAP.md#oq5-cost-surprises-beyond-anthropic) for "cost surprises beyond Anthropic" — paid third-party CLIs are auto-denied at the bash layer (`claude`/`openai`/`replicate`/`anthropic`) but anything else is on you.
+
+---
+
+<a id="voice-cost-runaway"></a>
+
+## Voice cost runaway (ElevenLabs)
+
+### Symptoms
+
+- Daily report DM shows voice spend above the configured cap.
+- Users report `/voice on` replies stopped arriving with no error in chat.
+- `voice_events` shows a spike in `cost_usd_estimate` or a wave of `denied_cap` rows.
+
+Note: the voice cost axis is **independent** from the Anthropic axis. A voice runaway does not show up in `audit.cost_usd` or the `/stats` `spend24hUsd` number — check `voice_events` separately.
+
+### Diagnosis
+
+The voice cost cap fires *before* the ElevenLabs call, writing a `denied_cap` row. Find the recent caps:
+
+```sh
+sqlite3 data/solrac.sqlite \
+  "SELECT id, chat_id, kind, source, error_message,
+          datetime(ts_ms/1000,'unixepoch') AS at
+   FROM voice_events
+   WHERE status = 'denied_cap'
+   ORDER BY ts_ms DESC LIMIT 20"
+```
+
+`error_message='global_voice_cap'` → host-wide ceiling fired (every chat muted).
+`error_message='chat_voice_cap'` → only the named chat is muted; others still speak.
+
+Top spenders in the last hour:
+
+```sh
+sqlite3 data/solrac.sqlite \
+  "SELECT chat_id, kind,
+          ROUND(SUM(cost_usd_estimate), 4) AS spent,
+          COUNT(*) AS attempts
+   FROM voice_events
+   WHERE ts_ms >= (strftime('%s','now') - 3600) * 1000
+     AND status = 'ok'
+   GROUP BY chat_id, kind
+   ORDER BY spent DESC"
+```
+
+Likely causes:
+
+1. **Verbose TTS replies.** Long markdown answers get spoken in full; `VOICE_TTS_MAX_CHARS` (default 1500) is a hard wall but doesn't compress shorter replies. `VOICE_REPLY_WORDS_HINT` is a model hint, not enforced.
+2. **TTS price drift.** `ELEVENLABS_TTS_PRICE_USD_PER_1K_CHARS` is operator-set. If your plan changed, the local estimate diverges from reality — but the cap still fires at the operator-set rate. The cap is a behavior gate, not a billing reconciliation.
+3. **Replay button refetching.** Browser cache miss on the web 🔊 button forces a re-synthesis. Each click should hit a cached blob; if not, a UI regression — look for `voice.tts_called` log events repeating against the same `audit_id`.
+
+### Recovery
+
+Immediate stop for one chat — turn voice mode off:
+
+```sh
+sqlite3 data/solrac.sqlite \
+  "UPDATE sessions SET voice_replies = 0 WHERE chat_id = <chatId>"
+```
+
+(Or have the operator type `/voice off` in that chat.)
+
+Global stop — set `VOICE_ENABLED=false` in `.env` and restart. ElevenLabs calls return early at the boot gate; existing audio messages in chat history are untouched.
+
+Tighten the cap:
+
+```ini
+# .env
+VOICE_HOURLY_COST_CAP_USD=0.10
+VOICE_GLOBAL_HOURLY_COST_CAP_USD=0.50
+```
+
+Restart. Next turns will hit the lower ceiling sooner.
+
+### Prevention
+
+- Turning `/voice on` for a chat doesn't double the model spend — TTS speaks the text the model already produced. The voice axis is purely ElevenLabs.
+- Enable for one chat first, watch `voice_events` for a day, then decide the global ceiling.
+- Pin `ELEVENLABS_TTS_PRICE_USD_PER_1K_CHARS` and `ELEVENLABS_STT_PRICE_USD_PER_HOUR` to your actual plan rate so the local estimate matches your invoice.
+
+---
+
+<a id="voice-errors"></a>
+
+## Voice silent / ElevenLabs errors
+
+### Symptoms
+
+- `/voice on` confirmed, but Telegram replies arrive without an audio attachment.
+- Web mic button records and uploads, but the composer doesn't pre-fill with a transcript.
+- `voice_events` has rows with `status='error'`.
+- Boot exits with `ELEVENLABS_API_KEY is required when VOICE_ENABLED=true` (or the same for `ELEVENLABS_VOICE_ID`).
+
+### Diagnosis
+
+Read the most recent failures:
+
+```sh
+sqlite3 data/solrac.sqlite \
+  "SELECT id, chat_id, kind, source, status, error_message,
+          datetime(ts_ms/1000,'unixepoch') AS at
+   FROM voice_events
+   WHERE status IN ('error','denied_gate')
+   ORDER BY ts_ms DESC LIMIT 10"
+```
+
+| `status` / `error_message` | Cause | Fix |
+|---|---|---|
+| `error` / verbatim 401 message | API key invalid or missing required permission | Verify in the ElevenLabs dashboard that the key has *both* Speech to Text and Text to Speech permissions. A TTS-only key works for `/voice on` but mic button uploads fail. Log line: `voice.auth_failed`. |
+| `error` / verbatim 429 message | ElevenLabs throttled your account | Back off; lower TTS use; upgrade the plan. No Solrac-side retry (the cap already bounds spend). Log line: `voice.rate_limited`. |
+| `error` / verbatim 4xx message | Wrong voice id, malformed multipart, unsupported model | Confirm `ELEVENLABS_VOICE_ID` against the dashboard. For STT, Telegram voice notes are OGG/Opus (supported by Scribe). Log line: `voice.upstream_error` with the upstream status. |
+| `denied_gate` / `denied` | `from.id` not in the allowlist (for voice-note STT) | Add to `ALLOWLIST_BOOTSTRAP`, restart. Allowlist gates apply uniformly to voice and text. |
+| `denied_gate` / `no_from` | Update has no `from.id` (channel post, service message) | Not actionable — these are filtered by design. |
+| `denied_cap` / `chat_voice_cap` or `global_voice_cap` | Voice cost cap fired | See [Voice cost runaway](#voice-cost-runaway). |
+| `error` / `too_long` (rare, never reaches ElevenLabs) | Input exceeded `VOICE_STT_MAX_BYTES` / `VOICE_STT_MAX_SECONDS` or `VOICE_TTS_MAX_CHARS` | Adjust the limit, or trim the input. |
+| (boot rejection) | `VOICE_ENABLED=true` without `ELEVENLABS_API_KEY` or `ELEVENLABS_VOICE_ID` | Set both, restart. Both are required when voice is enabled. |
+
+### Recovery
+
+**Common gotcha: shell-exported `ELEVENLABS_API_KEY` overriding `.env`.** Bun reads `process.env` first; an exported value beats the file. Check:
+
+```sh
+echo "${ELEVENLABS_API_KEY:0:12}"          # what the shell sees
+grep ELEVENLABS_API_KEY .env | cut -c1-30  # what the file holds
+```
+
+If they don't match, unset the shell var and restart:
+
+```sh
+unset ELEVENLABS_API_KEY
+sudo systemctl restart solrac.service
+```
+
+For 401 / 403 specifically: rotate the key. Generate a new key in the ElevenLabs dashboard with both required permissions, paste into `.env`, restart. Verify with a direct curl before debugging Solrac further:
+
+```sh
+curl -sS -H "xi-api-key: $ELEVENLABS_API_KEY" https://api.elevenlabs.io/v1/user | jq
+```
+
+For 429: there's no retry layer in `elevenlabs.ts` — that's intentional. Wait it out; the cap already bounds in-Solrac spend.
+
+### Prevention
+
+- One unrestricted dev key + a restricted prod key with only Text to Speech + Speech to Text permissions. ElevenLabs billing is independent of Anthropic, so rotating either key is contained.
+- Never paste the key into chat or commit it. The CLAUDE.md secret-handling rules apply to ElevenLabs keys too.
+- `ELEVENLABS_*` and `VOICE_*` env vars are scrubbed from the Claude SDK subprocess (`agent.ts::sanitizedSubprocessEnv`); a compromised model can't exfiltrate them. If you add a new ElevenLabs-related env, add it to the scrub list in the same PR.
 
 ---
 

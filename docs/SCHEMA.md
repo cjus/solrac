@@ -32,6 +32,7 @@ Pragmas Solrac sets at boot:
 | `sessions` | one row per chat | per-tier SDK session ids + pending `/compact` summaries |
 | `audit` | one row per attempted turn (allowed, denied, queue-full, tool-call sub-row) | append-mostly; the source of truth |
 | `scheduled_tasks` | one row per loaded `TASK.md` | upserted at boot; `last_run_at` / `one_off_consumed` updated by the tick loop |
+| `voice_events` | one row per ElevenLabs attempt (STT or TTS; ok, capped, gated, errored) | append-only; independent axis from `audit` (own sliding 60-min cost cap) |
 
 Authoritative source for shapes + migrations: `src/db.ts` (look at the `SCHEMA` constant and the post-`SCHEMA` `ALTER TABLE` block).
 
@@ -209,6 +210,48 @@ scheduled_tasks(
 
 One row per task loaded at boot. The loader upserts `source_path / source_hash / updated_at`; the tick loop updates `last_*` on each fire (and flips `one_off_consumed = 1` for `at <ISO>` tasks). When a `TASK.md` is removed from disk, the row stays — operators query `scheduled_tasks LEFT JOIN` the registry at runtime. `/tasks` slash command joins this table with the in-memory registry to render last/next fire info.
 
+### `voice_events`
+
+```sql
+voice_events(
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id            INTEGER NOT NULL,
+  ts_ms              INTEGER NOT NULL,
+  kind               TEXT NOT NULL CHECK (kind IN ('stt','tts')),
+  source             TEXT NOT NULL CHECK (source IN ('web','telegram')),
+  model              TEXT NOT NULL,                       -- e.g. 'scribe_v1', 'eleven_flash_v2_5'
+  voice_id           TEXT,                                -- null for STT
+  audit_id           INTEGER,                             -- informational; NO FK (denied_gate has no audit row)
+  duration_ms        INTEGER,                             -- STT input duration
+  chars              INTEGER,                             -- TTS char count
+  cost_usd_estimate  REAL NOT NULL DEFAULT 0,             -- local estimate from env-set prices
+  status             TEXT NOT NULL CHECK (status IN ('ok','denied_cap','denied_gate','error')),
+  error_message      TEXT
+)
+```
+
+Parallel to `audit`, not nested inside it. One turn can emit multiple voice events (a Telegram voice note triggers an STT row, a `/voice on` reply triggers a TTS row — two separate rows). Every gate path writes a row before the ElevenLabs request fires, so denials show up here even when ElevenLabs never saw the call.
+
+#### `status` values
+
+| Value | Meaning | `cost_usd_estimate` |
+|---|---|---|
+| `ok` | ElevenLabs returned 2xx; `duration_ms` (STT) or `chars` (TTS) populated. | computed from env-set price |
+| `denied_cap` | Voice cost cap fired pre-flight. `error_message` ∈ `chat_voice_cap`, `global_voice_cap`. ElevenLabs never called. | 0 |
+| `denied_gate` | Allowlist / voice-disabled rejection. `error_message` ∈ `denied`, `no_from`. ElevenLabs never called. | 0 |
+| `error` | ElevenLabs returned non-2xx or the request threw. `error_message` carries the upstream message verbatim. | 0 |
+
+Special `error_message` value: `too_long` — input exceeded `VOICE_STT_MAX_BYTES` / `VOICE_STT_MAX_SECONDS` (STT) or `VOICE_TTS_MAX_CHARS` (TTS) before any request fired.
+
+#### Cost estimate
+
+`cost_usd_estimate` is computed locally — ElevenLabs doesn't return cost on the response. Two operator-set price knobs feed the math:
+
+- STT: `(duration_ms / 1000 / 3600) * ELEVENLABS_STT_PRICE_USD_PER_HOUR`
+- TTS: `(chars / 1000) * ELEVENLABS_TTS_PRICE_USD_PER_1K_CHARS`
+
+The cap is enforced against these local estimates, not against ElevenLabs' billing API. If the published prices change, update the env — the table values aren't backfilled.
+
 ## Indexes
 
 | Index | Columns | Used by |
@@ -217,6 +260,8 @@ One row per task loaded at boot. The loader upserts `source_path / source_hash /
 | `idx_audit_chat_started` | `(chat_id, started_at)` | the cost-cap query path (`db.sumChatCostSince`) — fires before every Claude tool call |
 | `idx_audit_chat_model_started` | `(chat_id, model, started_at)` | engine-scoped queries: `outOfBandForEngine`, `recentChatTurnsForEngine`, `lastSuccessfulTurnAt`, `countChatTurnsForEngine`, etc. |
 | `idx_audit_task_started` | `(task_name, started_at)` | scheduler queries: per-task cost windows (`max_cost_usd` pre-flight) and operator audit dumps |
+| `idx_voice_events_chat_ts` | `(chat_id, ts_ms)` | per-chat voice cost-cap window (`db.voiceCostUsedLast60min`) |
+| `idx_voice_events_ts` | `(ts_ms)` | global voice cost-cap window (`db.voiceCostUsedGlobalLast60min`) |
 
 The first two are declared in the `SCHEMA` constant; the others are created after the migration block so they can reference columns added incrementally on existing databases.
 
@@ -528,6 +573,91 @@ WHERE (model LIKE 'local:%' OR model LIKE 'ollama:%')          -- dual-pattern: 
   AND started_at >= (strftime('%s','now') - 7*86400) * 1000;
 ```
 
+### Voice events
+
+For spend-focused voice queries (cost by chat/kind, daily totals, cap-hit rates) see [OPERATIONS.md#voice-events](./OPERATIONS.md#voice-events). The queries below are debugging-oriented and non-overlapping.
+
+**Trace one voice attempt end-to-end** (link from an `audit.id` to the voice event it produced):
+
+```sql
+SELECT id, chat_id, kind, source, status, error_message,
+       duration_ms, chars, ROUND(cost_usd_estimate, 4) AS cost,
+       datetime(ts_ms/1000,'unixepoch') AS at
+FROM voice_events
+WHERE audit_id = <audit_id>
+ORDER BY ts_ms;
+```
+
+**Recent voice errors with verbatim ElevenLabs messages.** Only `status='error'` rows carry upstream message strings; gate/cap denials carry their own short codes.
+
+```sql
+SELECT id, chat_id, kind, source, error_message,
+       datetime(ts_ms/1000,'unixepoch') AS at
+FROM voice_events
+WHERE status = 'error'
+ORDER BY ts_ms DESC LIMIT 20;
+```
+
+**Cap-hit breakdown (chat vs global).** `error_message` distinguishes which ceiling fired.
+
+```sql
+SELECT error_message,
+       COUNT(*) AS hits,
+       COUNT(DISTINCT chat_id) AS chats_affected
+FROM voice_events
+WHERE status = 'denied_cap'
+  AND ts_ms >= (strftime('%s','now') - 86400) * 1000
+GROUP BY error_message;
+```
+
+**Gate denials by reason** (`denied` = allowlist; `no_from` = malformed update).
+
+```sql
+SELECT error_message, source, COUNT(*) AS denials
+FROM voice_events
+WHERE status = 'denied_gate'
+GROUP BY error_message, source
+ORDER BY denials DESC;
+```
+
+**Longest STT inputs.** Useful for spotting users uploading long voice notes that risk the size wall.
+
+```sql
+SELECT id, chat_id, source,
+       ROUND(duration_ms / 1000.0, 1) AS seconds,
+       ROUND(cost_usd_estimate, 4) AS cost,
+       datetime(ts_ms/1000,'unixepoch') AS at
+FROM voice_events
+WHERE kind = 'stt' AND status = 'ok'
+ORDER BY duration_ms DESC LIMIT 20;
+```
+
+**TTS char distribution** — where are long replies coming from?
+
+```sql
+SELECT chat_id,
+       COUNT(*) AS tts_calls,
+       MIN(chars) AS min_chars,
+       ROUND(AVG(chars), 0) AS avg_chars,
+       MAX(chars) AS max_chars,
+       ROUND(SUM(cost_usd_estimate), 4) AS total_cost
+FROM voice_events
+WHERE kind = 'tts' AND status = 'ok'
+  AND ts_ms >= (strftime('%s','now') - 7*86400) * 1000
+GROUP BY chat_id
+ORDER BY total_cost DESC;
+```
+
+**`/voice on` state per chat** (lives in `sessions`, not `voice_events`).
+
+```sql
+SELECT chat_id, voice_replies,
+       datetime(updated_at/1000,'unixepoch') AS last_updated
+FROM sessions
+WHERE voice_replies = 1
+ORDER BY updated_at DESC;
+```
+
 ### Tool inspection
 
 **Tool-call distribution per Claude tier (last 7 days).**
@@ -682,6 +812,8 @@ The `audit` log is the source of truth for "what did the bot do?" but it's not a
 
 - [ARCHITECTURE.md#sqlite-schema](./ARCHITECTURE.md#sqlite-schema) — schema rationale and design decisions
 - [OPERATIONS.md#audit-queries](./OPERATIONS.md#audit-queries) — cost-focused operator queries
+- [OPERATIONS.md#voice-events](./OPERATIONS.md#voice-events) — voice spend and cap-hit queries
 - [OPERATIONS.md#backup-and-restore](./OPERATIONS.md#backup-and-restore) — backup procedure
 - [RUNBOOK.md#db-corruption](./RUNBOOK.md#db-corruption) — recovery from `database disk image is malformed`
+- [RUNBOOK.md#voice-cost-runaway](./RUNBOOK.md#voice-cost-runaway) — voice cost runaway recovery
 - `src/db.ts` — schema source of truth, prepared statements, migrations
