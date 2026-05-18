@@ -1254,6 +1254,11 @@ async function main(): Promise<void> {
           db
             .recentChatTurns(config.webChatId, 50)
             .filter((r) => !r.model.startsWith("system")),
+        // Voice (Phase 2). Same VoiceDeps as the Telegram path so the
+        // sliding 60-min cap is shared across transports — operator can't
+        // double up by talking on web + Telegram simultaneously.
+        voiceDeps,
+        voiceRepliesEnabled: () => db.getVoiceRepliesFlag(config.webChatId),
       });
     }
     // Scheduler tick loop — started AFTER queue construction (it depends on
