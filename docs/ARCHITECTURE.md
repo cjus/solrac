@@ -1216,6 +1216,151 @@ The existing `policy.ts::createConfirmationBroker` is transport-agnostic — `re
 
 The transport adds `web.ts`, `web-client.ts`, `web-sanitize.ts`, and `markdown.ts`. No HTTP framework, no WebSocket framework, no extra runtime dependencies beyond `marked` (used on both transports). The "no HTTP framework" anti-goal is honored — `Bun.serve` `routes` and `fetch` only, same shape as `server.ts`.
 
+## Voice transport (optional)
+
+Off by default. Enabled via `VOICE_ENABLED=true` + ElevenLabs credentials. Adds two flows — **speech-in** (operator → text prompt) and **speech-out** (assistant reply → audio) — to both Telegram and the web UI. Implementation lives in two modules:
+
+| Module | Role |
+|---|---|
+| `src/elevenlabs.ts` | Typed `fetch` wrapper for ElevenLabs HTTP. STT (`POST /v1/speech-to-text`, multipart) and TTS-stream (`POST /v1/text-to-speech/{voice_id}/stream`, chunked body). ~165 lines, no SDK. |
+| `src/voice.ts` | Orchestration — gate, cost-cap, audit-write, transport delivery. Exports `handleWebStt`, `handleWebTts`, `handleTelegramVoiceStt`, `maybeReplyWithVoice`, `stripMarkdownForSpeech`, `buildVoiceModePrompt`. |
+
+### The two flows
+
+```
+SPEECH-IN (STT)
+   Telegram voice note               Web mic button
+   ───────────────────                ────────────────
+   poll loop → msg.voice              MediaRecorder → /api/stt (multipart)
+       │                                  │
+       │ gateUpdate (allowlist)            │ session-cookie auth
+       │ voice cost cap check              │ voice cost cap check
+       ▼                                  ▼
+   getFile + download bytes           parse multipart, validate size
+       │                                  │
+       └──────► voice.handleXxxStt ◄──────┘
+                    │
+                    ▼
+            ElevenLabs Scribe
+                    │
+                    ▼
+           voice_events row written
+                    │
+       Telegram: synthesize text Update    Web: return { ok, text } →
+       → queue.enqueue (normal turn)       browser pre-fills composer
+
+SPEECH-OUT (TTS)
+   Telegram: post-turn hook           Web: speak button on assistant msg
+   ──────────────────────              ──────────────────────────────────
+   agent/engine done + audit closed   user click → POST /api/tts
+       │                                  │ session-cookie auth
+       │ /voice on? (sessions table)       │ voice cost cap check
+       │ voice cost cap check              │ length wall
+       ▼                                  ▼
+   stripMarkdownForSpeech(final)      stripMarkdownForSpeech(markdown)
+       │                                  │
+       └──────► ElevenLabs TTS-stream ◄────┘
+                    │
+                    ▼
+           voice_events row written
+                    │
+       Telegram: buffer → sendVoice       Web: proxy-stream → <audio>
+       (Ogg/Opus) or sendAudio (MP3)      blob URL → autoplay
+```
+
+### `voice_events` table — separate from `audit`
+
+One turn can produce **multiple** voice events (one STT input + one TTS output, sometimes). The `audit` table's two-writes-per-turn shape doesn't fit, so voice gets its own append-only log:
+
+```sql
+CREATE TABLE voice_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  ts_ms INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('stt','tts')),
+  source TEXT NOT NULL CHECK (source IN ('web','telegram')),
+  model TEXT NOT NULL,
+  voice_id TEXT,
+  audit_id INTEGER,            -- informational link to audit.id (not FK)
+  duration_ms INTEGER,         -- STT only
+  chars INTEGER,               -- TTS only
+  cost_usd_estimate REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('ok','denied_cap','denied_gate','error')),
+  error_message TEXT
+);
+CREATE INDEX idx_voice_events_chat_ts ON voice_events (chat_id, ts_ms);
+CREATE INDEX idx_voice_events_ts ON voice_events (ts_ms);
+```
+
+`audit_id` is informational only (no FK) so a `denied_gate` STT — which never reaches `audit` because no allowlisted sender existed — still gets a row. Cost-cap queries sum `cost_usd_estimate` over a sliding 60-min window, filtered to `status='ok'` so denials don't double-count.
+
+### Independent voice cost cap
+
+Anthropic burn (`audit.cost_usd`) and ElevenLabs burn (`voice_events.cost_usd_estimate`) are **separate axes**. Each has its own per-chat + global sliding-60-min ceiling:
+
+| Axis | Per-chat env var | Global env var | Default |
+|---|---|---|---|
+| Anthropic | `HOURLY_COST_CAP_USD` | `GLOBAL_HOURLY_COST_CAP_USD` | $1.00 / $4.00 (4×) |
+| Voice | `VOICE_HOURLY_COST_CAP_USD` | `VOICE_GLOBAL_HOURLY_COST_CAP_USD` | $0.25 / $1.00 |
+
+Order of checks inside `voice.ts` mirrors the Anthropic cap shape: **global first, then per-chat** (a host-wide hit shouldn't be masked by a per-chat pass). For STT the gate fires before either cap; for TTS the length wall fires after both caps. Cost is **estimated** at write time (ElevenLabs doesn't return per-call billing on the wire) using the configured price constants:
+
+- **STT:** `audio_duration_secs / 3600 × ELEVENLABS_STT_PRICE_USD_PER_HOUR`
+- **TTS:** `chars / 1000 × ELEVENLABS_TTS_PRICE_USD_PER_1K_CHARS`
+
+Pin the prices to your ElevenLabs plan if the published defaults don't match.
+
+### Voice mode (`sessions.voice_replies` + `/voice on|off`)
+
+Per-chat sticky toggle backing both Telegram TTS attach AND the word-limit prompt nudge. Added to `sessions` as a `0/1` column (idempotent ALTER). The `/voice` command's parser accepts `on`, `off`, `1`, `0`, `true`, `false`, or no-arg (renders current state).
+
+When `voice_replies=1` for a chat, two things happen on every turn:
+
+1. **`voice.ts::buildVoiceModePrompt`** is called by both SOLRAC.md injection sites and a `<voice-mode>` block is prepended that tells the model to keep the reply under `VOICE_REPLY_WORDS_HINT` words (default 60). The block sits **after** SOLRAC.md and **before** the cross-engine OOB block, so operator overlays can override the word limit if needed. The model may use up to 3× the limit when the user explicitly asks for more.
+2. **`maybeReplyWithVoice`** runs as the post-turn hook (after the audit row closes, only on `!isError`). It strips the markdown, checks the cost cap + length wall, calls ElevenLabs TTS, buffers the audio, and sends via `sendVoice` (Ogg/Opus) or `sendAudio` (MP3 fallback). Web turns don't invoke this — the per-message speak button does it on user demand instead.
+
+The post-turn hook is wired as an optional `attachVoiceReply` callback on `AgentRunDeps` and `EngineRunDeps`. Telegram-bound deps carry the callback; web-bound deps don't. Same VoiceDeps instance backs both Telegram STT/TTS and web STT/TTS — the sliding 60-min cap is shared across transports, so an operator can't double up by talking on web + Telegram simultaneously.
+
+### Footer strip
+
+The `*✅ ...*` line agent/engine append to every successful reply (turn count, cost, model) is UI chrome, not content. `voice.ts::stripMarkdownForSpeech` regex-strips that pattern before tokenizing, so TTS never reads "✅ remote:openrouter:z-ai/glm-5.1 · 1 tools · 6.6s · $0.0048" aloud.
+
+The strip also handles standard markdown → speech transforms via `marked.lexer`:
+- Code fences → `[code block omitted]`
+- Tables → `[table omitted]`
+- Lists → comma-joined items
+- Links → text (URL dropped)
+- Headers / bold / italic → unwrap, keep text
+
+### Env scrub additions
+
+`ELEVENLABS_*` and `VOICE_*` are added to `agent.ts::sanitizedSubprocessEnv`'s scrub list. `ELEVENLABS_API_KEY` is a billed credential that the spawned `claude` SDK subprocess has no business reading; `VOICE_*` (cost caps, model ids) shouldn't leak via an auto-allowed `Bash(echo $VOICE_...)`.
+
+### What about the web sanitizer?
+
+`web-sanitize.ts` deliberately excludes `<audio>` from its allowlist. We do NOT widen it. The `<audio>` element on the web UI is injected via `document.createElement` by `app.js`, AFTER sanitization runs on the reply body — the trust boundary doesn't move. The sanitizer is for marked-rendered LLM content; audio playback is UI chrome.
+
+### Dependency direction
+
+```
+elevenlabs.ts  →  log + config
+voice.ts       →  elevenlabs + db + log + config + policy + telegram + marked
+agent.ts       →  + voice (post-turn hook + buildVoiceModePrompt)
+engine.ts      →  + voice (post-turn hook + buildVoiceModePrompt)
+web.ts         →  + voice (handleWebStt, handleWebTts)
+main.ts        →  + voice (handleTelegramVoiceStt dispatcher, maybeReplyWithVoice)
+commands.ts    →  unchanged structurally — /voice command dispatches via db.setVoiceRepliesFlag
+```
+
+No new runtime dependency outside `marked` (already shipped). `fetch` and `FormData` are global in Bun.
+
+### Anti-goal preservation
+
+- `marked` is still the only non-SDK runtime dep — ElevenLabs is raw `fetch`, no SDK.
+- No HTTP framework added (the two new routes ride the existing `Bun.serve` instance).
+- No Telegram framework runtime added (`sendVoice`/`sendAudio` use multipart `fetch`).
+- One-PR-per-feature was reversed deliberately for the voice change (phases 1–5 landed together) — per PLAN.md §16, called out as an explicit re-evaluation.
+
 ## Anti-goals
 
 Decisions deliberately not made. Don't relitigate without strong justification.

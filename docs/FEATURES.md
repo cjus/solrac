@@ -19,6 +19,7 @@ The complete feature list, grouped by theme. See [../README.md](../README.md) fo
 ## Transport
 
 - **Optional browser web UI** — a second `Bun.serve` instance on a configurable port serves a minimal vanilla-JS chat interface with the same agent loop, slash commands, engine routing, and tool-confirm UX as Telegram. Full markdown rendering (headers, lists, tables, fenced code) on both transports — Claude and local responses get a server-side markdown→HTML pass for Telegram and the raw markdown to the browser. Off by default; enable with `SOLRAC_WEB_ENABLED=true` plus a token. See [USAGE.md#web-ui-browser-interface](./USAGE.md#web-ui-browser-interface).
+- **Optional voice (ElevenLabs STT + TTS)** — Telegram voice notes get transcribed via ElevenLabs Scribe into the normal text path; the web UI gets a mic button that pre-fills the composer. With `/voice on` (per-chat sticky toggle), Telegram replies attach an audio voice note and a `<voice-mode>` system block tells the model to respond in under N words. Web UI gets a per-message 🔊 speak button for on-demand playback (with blob caching — replay doesn't re-bill). Independent cost cap separate from the Anthropic cap. Off by default; enable with `VOICE_ENABLED=true` plus an ElevenLabs key/voice id. See [USAGE.md#voice-elevenlabs-stt--tts](./USAGE.md#voice-elevenlabs-stt--tts).
 - **Multi-user, multi-chat** — gated by per-`from.id` allowlist.
 
 ## Safety & audit
@@ -26,7 +27,8 @@ The complete feature list, grouped by theme. See [../README.md](../README.md) fo
 - **Three-tier permission policy** — auto-allow / auto-deny / Telegram-inline-keyboard-confirm. Configurable rule tables.
 - **Per-chat hourly cost cap** — sliding 60-minute window over the audit log. Default $1.00/chat/hour.
 - **Loop detector** — denies the third call to the same `(toolName, input)` within a turn. Order-insensitive over JSON keys.
-- **Persistent audit trail** — every turn (allowed, denied, queue-full) writes a SQLite row with prompt, response, tool calls, cost, tokens, session id, status, **and engine** (`claude:primary:<modelId>` / `claude:secondary:<modelId>` / `local:<backend>:<modelId>` / `remote:openrouter:<modelId>`).
+- **Persistent audit trail** — every turn (allowed, denied, queue-full) writes a SQLite row with prompt, response, tool calls, cost, tokens, session id, status, **and engine** (`claude:primary:<modelId>` / `claude:secondary:<modelId>` / `local:<backend>:<modelId>` / `remote:openrouter:<modelId>`). When voice is enabled, every STT/TTS attempt — allowed, capped, denied at the gate, errored — writes a row to the separate `voice_events` table with kind/source/cost-estimate/status.
+- **Independent voice cost cap** — per-chat and global sliding 60-min ceilings on ElevenLabs spend (`voice_events.cost_usd_estimate`), separate from the Anthropic burn cap. ElevenLabs API key + voice-mode env vars (`ELEVENLABS_*`, `VOICE_*`) are scrubbed from the Claude SDK subprocess env so a compromised model can't exfiltrate the billed credential.
 - **Session resume across restarts** — SDK session ids persisted per chat **and per tier**; conversations survive process death.
 - **Inline-keyboard confirm UX** — 60-second timeout, fail-closed on send failure, verdict stamped into chat history after tap.
 - **Sub-agent default-deny** — `Agent`/`Task` tools disabled at SDK + policy layers.
