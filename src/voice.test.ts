@@ -111,6 +111,41 @@ describe("stripMarkdownForSpeech", () => {
   test("empty input returns empty string", () => {
     expect(stripMarkdownForSpeech("")).toBe("");
   });
+
+  test("strips Claude tier agent footer", () => {
+    const md = "Here's the answer.\n\n*✅ 2 turns · $0.0123*";
+    const out = stripMarkdownForSpeech(md);
+    expect(out).toBe("Here's the answer.");
+    expect(out).not.toContain("✅");
+    expect(out).not.toContain("turns");
+    expect(out).not.toContain("$");
+  });
+
+  test("strips engine-slot footer with model and tools", () => {
+    const md =
+      "London is in BST right now, 19:42.\n\n" +
+      "*✅ remote:openrouter:z-ai/glm-5.1 · 1 tools · 6.6s · $0.0048*";
+    const out = stripMarkdownForSpeech(md);
+    expect(out).toContain("London");
+    expect(out).not.toContain("openrouter");
+    expect(out).not.toContain("$");
+    expect(out).not.toContain("tools");
+  });
+
+  test("strips footer even with surrounding whitespace", () => {
+    const md = "Answer.\n\n  *  ✅ 1 turn · $0.0001  *  \n\n";
+    const out = stripMarkdownForSpeech(md);
+    expect(out).toBe("Answer.");
+  });
+
+  test("plain ✅ in content is preserved (no italic markers)", () => {
+    // The footer specifically uses italic markers (*...*). A bare ✅
+    // inside content shouldn't be stripped.
+    const md = "Test passed ✅ — moving on.";
+    const out = stripMarkdownForSpeech(md);
+    expect(out).toContain("Test passed");
+    expect(out).toContain("moving on");
+  });
 });
 
 describe("estimateSttCostUsd", () => {

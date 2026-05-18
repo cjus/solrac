@@ -116,16 +116,29 @@ export function buildVoiceModePrompt(opts: { words: number }): string {
  * Returns trimmed, single-spaced text.
  */
 export function stripMarkdownForSpeech(markdown: string): string {
+  const trimmed = stripAgentFooter(markdown);
   let tokens: Token[];
   try {
-    tokens = speechMarked.lexer(markdown);
+    tokens = speechMarked.lexer(trimmed);
   } catch {
     // Parser glitch — fall back to the raw text so we never refuse to
     // speak. The downstream length wall still gates absurdly long inputs.
-    return collapseWhitespace(markdown);
+    return collapseWhitespace(trimmed);
   }
   const out = walkTokens(tokens);
   return collapseWhitespace(out);
+}
+
+// Footer pattern from agent.ts::buildFooter / engine.ts::renderFinal:
+//   *✅ <metadata>*   — italicized line with the ✅ prefix carrying turn
+//                       count / cost / engine info. Pure UI chrome that
+//                       should never be spoken aloud. The ✅ (U+2705) is
+//                       distinctive enough that any occurrence is the
+//                       footer; strip from ✅ to the closing `*` on the
+//                       same line.
+const FOOTER_RE = /\*\s*✅[^*\n]*\*/g;
+function stripAgentFooter(markdown: string): string {
+  return markdown.replace(FOOTER_RE, "");
 }
 
 function walkTokens(tokens: Token[]): string {
