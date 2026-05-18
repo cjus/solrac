@@ -26,7 +26,7 @@
  *   - `createTelegramClient(token)` — factory returning a `TelegramClient`.
  *   - `TelegramClient` — interface with generic `call`, plus typed helpers:
  *     `getUpdates`, `sendMessage`, `editMessageText`, `setMessageReaction`,
- *     `sendChatAction`.
+ *     `sendChatAction`, `sendVoice`, `sendAudio`.
  *   - `TelegramConflictError` — 409 variant; signals "exit 1, don't retry."
  *   - `TelegramApiError` — generic non-409, non-429 API failure.
  *   - `htmlEscapeText(s)` — escape `&`, `<`, `>` for HTML text-context interpolation.
@@ -134,6 +134,14 @@ export interface BotCommand {
   description: string;
 }
 
+export interface SendVoiceOpts {
+  reply_to_message_id?: number;
+  // Telegram infers the MIME from the multipart filename if absent; explicit
+  // override here is for callers (like voice.ts) that already know the
+  // upstream content-type. Both sendVoice and sendAudio accept this.
+  mime_type?: string;
+}
+
 export interface TelegramClient {
   call: <T>(
     method: string,
@@ -156,6 +164,27 @@ export interface TelegramClient {
   // Both are non-fatal at boot — wrapped in `.catch` at the call site.
   getMe: () => Promise<BotIdentity>;
   setMyCommands: (commands: ReadonlyArray<BotCommand>) => Promise<true>;
+  // Voice (Phase 5). Multipart POST to /sendVoice or /sendAudio.
+  //   sendVoice expects Ogg/Opus — renders as a chat voice pill with a
+  //     waveform preview. Per Telegram's docs the file must be encoded with
+  //     OPUS (other formats yield a generic "audio file" rendering).
+  //   sendAudio expects an MP3 (or other media-codec audio); renders as a
+  //     file attachment with play controls. Used as the fallback path when
+  //     ElevenLabs returns raw Opus (no OggS container).
+  // The `audio` field accepts an ArrayBuffer — the caller already aggregated
+  // the upstream stream. We wrap as a Blob with `mime_type` (default
+  // audio/ogg for voice, audio/mpeg for audio) so Telegram's content-type
+  // sniff matches.
+  sendVoice: (
+    chatId: number,
+    audio: ArrayBuffer,
+    opts?: SendVoiceOpts,
+  ) => Promise<Message>;
+  sendAudio: (
+    chatId: number,
+    audio: ArrayBuffer,
+    opts?: SendVoiceOpts,
+  ) => Promise<Message>;
 }
 
 export function htmlEscapeText(s: string): string {
@@ -203,6 +232,52 @@ export function createTelegramClient(token: string): TelegramClient {
     }
   }
 
+  async function callMultipart<T>(method: string, form: FormData): Promise<T> {
+    // Telegram's multipart endpoints share the same 409/429 semantics as the
+    // JSON ones, so the retry shape mirrors `call()`. We rebuild FormData
+    // on retry only if needed — currently the body is the same on each
+    // attempt (no per-call hash/signature).
+    let attempt = 0;
+    while (true) {
+      attempt++;
+      const res = await fetch(`${base}/${method}`, {
+        method: "POST",
+        body: form,
+      });
+      const json = (await res.json()) as TelegramResponse<T>;
+      if (json.ok) return json.result as T;
+      const code = json.error_code ?? res.status;
+      const description = json.description ?? "unknown";
+      if (code === 409) throw new TelegramConflictError(description);
+      if (code === 429) {
+        const retryAfter = Number(json.parameters?.retry_after ?? 1);
+        log.warn("telegram.rate_limited", { method, retryAfter, attempt });
+        await Bun.sleep(Math.max(retryAfter * 1000, 100));
+        continue;
+      }
+      throw new TelegramApiError(code, description);
+    }
+  }
+
+  function buildAudioForm(
+    chatId: number,
+    audio: ArrayBuffer,
+    field: "voice" | "audio",
+    filename: string,
+    defaultMime: string,
+    opts: SendVoiceOpts | undefined,
+  ): FormData {
+    const mime = opts?.mime_type ?? defaultMime;
+    const blob = new Blob([audio], { type: mime });
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    form.append(field, blob, filename);
+    if (opts?.reply_to_message_id !== undefined) {
+      form.append("reply_to_message_id", String(opts.reply_to_message_id));
+    }
+    return form;
+  }
+
   return {
     call,
     getUpdates(params, signal) {
@@ -238,6 +313,14 @@ export function createTelegramClient(token: string): TelegramClient {
     },
     setMyCommands(commands) {
       return call<true>("setMyCommands", { commands });
+    },
+    sendVoice(chatId, audio, opts) {
+      const form = buildAudioForm(chatId, audio, "voice", "voice.ogg", "audio/ogg", opts);
+      return callMultipart<Message>("sendVoice", form);
+    },
+    sendAudio(chatId, audio, opts) {
+      const form = buildAudioForm(chatId, audio, "audio", "audio.mp3", "audio/mpeg", opts);
+      return callMultipart<Message>("sendAudio", form);
     },
   };
 }

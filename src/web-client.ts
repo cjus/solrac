@@ -181,5 +181,16 @@ export function createWebClient(opts: WebClientOpts = {}): WebClient {
     async setMyCommands() {
       return true as const;
     },
+    async sendVoice() {
+      // The web transport has its own per-message speak button (handled
+      // by the browser); the post-turn TTS attach (`voice.maybeReplyWithVoice`)
+      // is gated on the presence of a `telegramSender` dep, which the web
+      // path never wires. So sendVoice/sendAudio should never be called on
+      // a WebClient — if they are, throw loudly rather than silently drop.
+      throw new Error("WebClient.sendVoice is not implemented — web uses per-message speak button");
+    },
+    async sendAudio() {
+      throw new Error("WebClient.sendAudio is not implemented — web uses per-message speak button");
+    },
   };
 }
