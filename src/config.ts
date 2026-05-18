@@ -48,6 +48,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
+import { log } from "./log.ts";
 
 type Transport = "poll" | "webhook";
 
@@ -201,6 +202,41 @@ export interface Config {
   readonly webPort: number;
   readonly webToken: string | null;
   readonly webChatId: number;
+  // Voice (ElevenLabs STT + TTS). Master switch is `voiceEnabled` — every
+  // call site short-circuits when false, so unset ELEVENLABS_* keys are
+  // tolerated. When true, `elevenlabsApiKey` and `elevenlabsVoiceId` MUST
+  // be set (boot validation enforces). Independent cost cap (per-chat +
+  // global, sliding 60-min) over `voice_events.cost_usd_estimate` is
+  // separate from the Anthropic `audit.cost_usd` cap.
+  readonly voiceEnabled: boolean;
+  readonly elevenlabsApiKey: string | null;
+  readonly elevenlabsVoiceId: string | null;
+  readonly elevenlabsTtsModel: string;
+  readonly elevenlabsSttModel: string;
+  // Hard wall — TTS requests over this length are refused with HTTP 413 +
+  // chat hint. The word-limit prompt nudge defends against this; the wall
+  // is the last line of defense.
+  readonly voiceTtsMaxChars: number;
+  // Soft target — injected into the LLM prompt when sessions.voice_replies
+  // = 1. Clamped to [30, 200] at boot; out-of-range values warn and clamp.
+  readonly voiceReplyWordsHint: number;
+  readonly voiceSttMaxBytes: number;
+  readonly voiceSttMaxSeconds: number;
+  readonly voiceHourlyCostCapUsd: number;
+  readonly voiceGlobalHourlyCostCapUsd: number;
+  // Output format used by the web `<audio>` element. MP3 plays everywhere
+  // (Chromium, Firefox, Safari, mobile).
+  readonly elevenlabsTtsFormatWeb: string;
+  // Output format used for Telegram `sendVoice`. Default opus_48000_64 —
+  // §17 probe (May 2026) confirmed ElevenLabs returns Ogg-containerized
+  // Opus (`OggS` magic, `content-type: audio/opus`) which sendVoice accepts.
+  // Fallback to mp3_44100_64 + sendAudio if a future ElevenLabs change
+  // flips to raw Opus; voice.ts branches on the env var.
+  readonly elevenlabsTtsFormatTg: string;
+  // Per-1k-char TTS price + per-hour STT price. Constants so pricing drift
+  // can be pinned to the operator's plan without code changes.
+  readonly elevenlabsTtsPriceUsdPer1k: number;
+  readonly elevenlabsSttPriceUsdPerHour: number;
 }
 
 function parseAllowlist(raw: string): number[] {
@@ -596,6 +632,95 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       ? env.SOLRAC_INTEGRATIONS_DIR.trim()
       : "./integrations";
 
+  // Voice (ElevenLabs STT + TTS). Master switch off by default — unset
+  // ELEVENLABS_* keys are tolerated when voiceEnabled=false. When true, the
+  // key + voice id are mandatory (mirrors REMOTE_ENABLED requiring API key).
+  const voiceEnabled = parseBoolean("VOICE_ENABLED", env.VOICE_ENABLED, false);
+  const elevenlabsApiKey =
+    env.ELEVENLABS_API_KEY && env.ELEVENLABS_API_KEY.trim() !== ""
+      ? env.ELEVENLABS_API_KEY.trim()
+      : null;
+  const elevenlabsVoiceId =
+    env.ELEVENLABS_VOICE_ID && env.ELEVENLABS_VOICE_ID.trim() !== ""
+      ? env.ELEVENLABS_VOICE_ID.trim()
+      : null;
+  if (voiceEnabled) {
+    if (!elevenlabsApiKey) {
+      throw new Error(
+        "ELEVENLABS_API_KEY is required when VOICE_ENABLED=true (get one from your ElevenLabs Profile + API Keys page)",
+      );
+    }
+    if (!elevenlabsVoiceId) {
+      throw new Error(
+        "ELEVENLABS_VOICE_ID is required when VOICE_ENABLED=true (find it on the voice's detail page in ElevenLabs VoiceLab)",
+      );
+    }
+  }
+  const elevenlabsTtsModel =
+    env.ELEVENLABS_TTS_MODEL && env.ELEVENLABS_TTS_MODEL.trim() !== ""
+      ? env.ELEVENLABS_TTS_MODEL.trim()
+      : "eleven_flash_v2_5";
+  const elevenlabsSttModel =
+    env.ELEVENLABS_STT_MODEL && env.ELEVENLABS_STT_MODEL.trim() !== ""
+      ? env.ELEVENLABS_STT_MODEL.trim()
+      : "scribe_v2";
+  const voiceTtsMaxChars = parsePositiveInt("VOICE_TTS_MAX_CHARS", env.VOICE_TTS_MAX_CHARS, 3000);
+  // Words hint clamps to [30, 200]. Below 30 the model can't say anything
+  // useful; above 200 defeats the "user is listening, be brief" purpose.
+  // Out-of-range = warn + clamp (operator's env honored as closely as
+  // possible) rather than throw, because voice mode is non-critical.
+  const voiceReplyWordsHintRaw = parsePositiveInt(
+    "VOICE_REPLY_WORDS_HINT",
+    env.VOICE_REPLY_WORDS_HINT,
+    60,
+  );
+  let voiceReplyWordsHint = voiceReplyWordsHintRaw;
+  if (voiceReplyWordsHintRaw < 30) {
+    voiceReplyWordsHint = 30;
+    log.warn("config.voice_reply_words_clamped", { from: voiceReplyWordsHintRaw, to: 30 });
+  } else if (voiceReplyWordsHintRaw > 200) {
+    voiceReplyWordsHint = 200;
+    log.warn("config.voice_reply_words_clamped", { from: voiceReplyWordsHintRaw, to: 200 });
+  }
+  const voiceSttMaxBytes = parsePositiveInt(
+    "VOICE_STT_MAX_BYTES",
+    env.VOICE_STT_MAX_BYTES,
+    2_097_152,
+  );
+  const voiceSttMaxSeconds = parsePositiveInt(
+    "VOICE_STT_MAX_SECONDS",
+    env.VOICE_STT_MAX_SECONDS,
+    60,
+  );
+  const voiceHourlyCostCapUsd = parsePositiveNumber(
+    "VOICE_HOURLY_COST_CAP_USD",
+    env.VOICE_HOURLY_COST_CAP_USD,
+    0.25,
+  );
+  const voiceGlobalHourlyCostCapUsd = parsePositiveNumber(
+    "VOICE_GLOBAL_HOURLY_COST_CAP_USD",
+    env.VOICE_GLOBAL_HOURLY_COST_CAP_USD,
+    1.0,
+  );
+  const elevenlabsTtsFormatWeb =
+    env.ELEVENLABS_TTS_OUTPUT_FORMAT_WEB && env.ELEVENLABS_TTS_OUTPUT_FORMAT_WEB.trim() !== ""
+      ? env.ELEVENLABS_TTS_OUTPUT_FORMAT_WEB.trim()
+      : "mp3_44100_64";
+  const elevenlabsTtsFormatTg =
+    env.ELEVENLABS_TTS_OUTPUT_FORMAT_TG && env.ELEVENLABS_TTS_OUTPUT_FORMAT_TG.trim() !== ""
+      ? env.ELEVENLABS_TTS_OUTPUT_FORMAT_TG.trim()
+      : "opus_48000_64";
+  const elevenlabsTtsPriceUsdPer1k = parsePositiveNumber(
+    "ELEVENLABS_TTS_PRICE_USD_PER_1K_CHARS",
+    env.ELEVENLABS_TTS_PRICE_USD_PER_1K_CHARS,
+    0.05,
+  );
+  const elevenlabsSttPriceUsdPerHour = parsePositiveNumber(
+    "ELEVENLABS_STT_PRICE_USD_PER_HOUR",
+    env.ELEVENLABS_STT_PRICE_USD_PER_HOUR,
+    0.22,
+  );
+
   return Object.freeze({
     anthropicApiKey: env.ANTHROPIC_API_KEY!,
     telegramBotToken: env.TELEGRAM_BOT_TOKEN!,
@@ -648,5 +773,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     webPort,
     webToken,
     webChatId,
+    voiceEnabled,
+    elevenlabsApiKey,
+    elevenlabsVoiceId,
+    elevenlabsTtsModel,
+    elevenlabsSttModel,
+    voiceTtsMaxChars,
+    voiceReplyWordsHint,
+    voiceSttMaxBytes,
+    voiceSttMaxSeconds,
+    voiceHourlyCostCapUsd,
+    voiceGlobalHourlyCostCapUsd,
+    elevenlabsTtsFormatWeb,
+    elevenlabsTtsFormatTg,
+    elevenlabsTtsPriceUsdPer1k,
+    elevenlabsSttPriceUsdPerHour,
   });
 }

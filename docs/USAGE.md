@@ -172,6 +172,7 @@ Slash commands give you control over conversation context and visibility into sp
 | `/context @\|!` | **none** — tier required | Show audit-table footprint (bytes), turn count, last turn's token breakdown (fresh / cache read / cache create / output), and estimated next-turn replay size. **Bare `/context` rejects** for the same reason as `/compact`. | Free |
 | `/help` | — | Engine prefix table + command reference. Engine section is dynamic (renders the deploy's actual default). | Free |
 | `/status` | — | Per-chat session/spend snapshot + global rollup + queue depth + uptime. Claude session lines render only when a session exists; a `local turns (24h): N` bullet is added when applicable. | Free |
+| `/voice [on\|off]` | shows state | Toggle per-chat voice replies. With voice mode on, Telegram replies attach an audio voice note AND a `<voice-mode>` system block tells the model to respond in under N words. Works in both Telegram and the web UI (web operators get the word-limit nudge; per-message speak button replaces the auto-attach). Requires `VOICE_ENABLED=true` at deploy. See [Voice (ElevenLabs STT + TTS)](#voice-elevenlabs-stt--tts). | Free (the flag write; TTS spend is independent) |
 
 ### Tier args
 
@@ -1113,6 +1114,97 @@ Claude and the local engine both emit markdown. Solrac now converts markdown to 
 - File uploads are not supported (Telegram's photo flow is). Out of scope for v1.
 - Sessions are stored in process memory; restarting Solrac signs out all browsers (operator must log in again). The conversation history is hydrated from the audit log on next page load.
 - Confirmation prompts that arrive before the operator opens the UI are silently dropped on broker timeout (60 s). Same failure mode as Telegram when the operator's phone is off.
+
+## Voice (ElevenLabs STT + TTS)
+
+Off by default. Enabled via `VOICE_ENABLED=true` + an ElevenLabs key/voice id. Adds two affordances on both transports:
+
+- **Speech-in (STT):** Telegram voice notes get transcribed via ElevenLabs Scribe into the normal text path. The web UI gets a mic button that records via `MediaRecorder` and pre-fills the composer with the transcript.
+- **Speech-out (TTS):** with `/voice on` set for a chat, Telegram replies attach an audio voice note. On the web UI, each assistant reply gets a 🔊 button for on-demand playback.
+
+> ⚠️ **Privacy.** Audio (your spoken words) AND the assistant's reply text are sent to ElevenLabs SaaS for transcription and synthesis. `SOUL.md` and `SOLRAC.md` never leave the host, but the conversation content does. Don't enable voice on chats covering material you wouldn't paste into a third-party transcription tool.
+
+### Setup
+
+1. **ElevenLabs account.** Sign up at [elevenlabs.io](https://elevenlabs.io). Pick a paid plan if you want production usage limits — the free tier is fine for testing.
+2. **API key.** Profile + API Keys → Create API Key. Recommended: name it `solrac`, turn **Restrict Key** on, set **Text to Speech → Access** and **Speech to Text → Access**, leave everything else as `No Access`. ElevenLabs reveals the `sk_…` value **once at creation** — copy it immediately.
+3. **Voice id.** Sidebar → Voices (or VoiceLab) → pick a voice → copy the 20-char id from the voice's detail page. One voice per deploy in v1.
+4. **`.env` values:**
+   ```sh
+   VOICE_ENABLED=true
+   ELEVENLABS_API_KEY=sk_…           # the value from step 2
+   ELEVENLABS_VOICE_ID=…             # the id from step 3
+   ```
+   Restart Solrac. Boot fails loud if either of the two required vars is missing.
+
+Full env reference: [CONFIG.md#variables](./CONFIG.md#variables) (search for `VOICE_` and `ELEVENLABS_`).
+
+### Telegram voice notes
+
+**Sending audio in.** Hold the 🎙️ mic icon in Telegram's input bar (or click it on desktop), record, release to send. Solrac downloads the audio, hits Scribe, synthesizes a text Update, and feeds it back into the queue. Your prefix conventions still apply — if you say "at Sonnet what's the time" out loud, the transcript probably won't start with `@`, so the engine slot answers. To force a tier, type the prefix instead.
+
+The audio file size cap is `VOICE_STT_MAX_BYTES` (default 2 MiB). Telegram caps voice notes at ~1 minute / ~1 MB anyway, so the limit rarely fires.
+
+Solrac handles `msg.voice` only — files attached via "Send a File" (which arrive as `msg.audio`) are out of scope for v1.
+
+**Getting audio out.** Type `/voice on` once per chat — that flips a sticky per-chat flag (`sessions.voice_replies`) so every successful reply from that chat gets an audio note attached. `/voice off` turns it back off; `/voice` with no arg shows the current state. The flag survives restarts.
+
+When voice mode is on:
+- Each turn also injects a `<voice-mode>` system block telling the model to respond in under `VOICE_REPLY_WORDS_HINT` words (default 60) — the soft target keeps replies short enough to listen to.
+- After the text reply lands, Solrac strips the markdown, calls ElevenLabs TTS, and sends the audio via Telegram's `sendVoice` (Ogg/Opus voice note pill) or `sendAudio` (MP3 file) depending on the configured output format.
+- Replies longer than `VOICE_TTS_MAX_CHARS` (default 3000) are refused with a chat message — the prompt nudge usually keeps things short enough, but the wall is the last line of defense.
+
+### Web UI voice surface
+
+When `VOICE_ENABLED=true` AND you're logged in to the web UI:
+
+- **🎙️ mic button** in the composer (next to send). Click → grant mic permission → speak → click again to stop (or auto-stop at `VOICE_STT_MAX_SECONDS`, default 60). The transcript pre-fills the composer; review and send.
+- **🔊 speak button** on each assistant reply, bottom-right of the bubble. Only appears once the reply hits its final state (the `✅` footer sentinel). Click → audio plays, button switches to ⏹ (click to stop). Re-click 🔊 to replay from cache (no extra ElevenLabs spend).
+- **Voice mode badge** in the header (top right). Shows `🔊 voice mode on` when `/voice on` is active for the web chat id. Click to disable (sends `/voice off`).
+
+The web speak button is **on-demand**, not automatic — you control when you pay for synthesis. Different shape from Telegram, where voice-mode-on auto-attaches every reply.
+
+### Voice mode and engine compliance
+
+The `<voice-mode>` system block is a soft target, not a hard rule:
+
+| Engine | Compliance |
+|---|---|
+| Claude tiers (`@` / `!`) | Strong; ±20-30% drift typical. |
+| Local (Ollama / LMStudio) | Variable. Instruction-tuned models obey; tiny (1-3B param) models may drift wildly. |
+| Remote (OpenRouter) | Depends on the routed model; most modern instruction-tuned models comply. |
+
+If the model ignores the limit AND the reply exceeds `VOICE_TTS_MAX_CHARS`, the hard wall fires and you get the refusal text instead of audio. Two ways to work around:
+1. Ask for a shorter response in the next prompt ("be brief").
+2. Raise `VOICE_TTS_MAX_CHARS` in `.env`.
+
+The "expand 3×" carve-out in the prompt block gives the model room to elaborate when you explicitly ask ("explain in detail") — it'll know it has up to `60 × 3 = 180` words of headroom.
+
+### Voice cost cap
+
+Independent from the Anthropic cap. Two sliding 60-min windows:
+
+| Cap | Env var | Default |
+|---|---|---|
+| Per-chat voice | `VOICE_HOURLY_COST_CAP_USD` | $0.25/hr |
+| Global voice | `VOICE_GLOBAL_HOURLY_COST_CAP_USD` | $1.00/hr |
+
+When a cap fires:
+- Telegram STT: reply text `voice cap reached, try again in a minute`.
+- Telegram TTS: silent (text reply already shipped; we just skip the audio attach).
+- Web STT: HTTP 429, browser toast `voice cap reached`.
+- Web TTS: HTTP 429, browser toast `voice cap reached`.
+
+Cost is **estimated** from duration (STT) or character count (TTS) using the configured price constants. ElevenLabs doesn't return per-call billing on the wire, so estimates may drift from your statement — pin `ELEVENLABS_TTS_PRICE_USD_PER_1K_CHARS` and `ELEVENLABS_STT_PRICE_USD_PER_HOUR` to your plan if you want closer alignment.
+
+Audit queries: [OPERATIONS.md](./OPERATIONS.md) — every voice event (allowed, capped, denied, errored) writes a row to the `voice_events` table.
+
+### Notes & limits (v1)
+
+- Single deploy-wide voice. No per-chat override yet — change `ELEVENLABS_VOICE_ID` to switch voices for everyone.
+- Page reload drops cached audio blobs. Re-clicking 🔊 after a reload re-pays for TTS. Disk cache is a future enhancement.
+- No real-time WebSocket STT. File-based round-trip is enough at conversational latency.
+- Telegram voice mode attaches one audio note per turn; long multi-paragraph replies still respect the 3000-char wall.
 
 ## Related docs
 

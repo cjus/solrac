@@ -105,6 +105,7 @@ import {
 import type { SessionStore, SessionTier } from "./session.ts";
 import { mdToTelegramHtml } from "./markdown.ts";
 import { htmlEscapeText, type TelegramClient } from "./telegram.ts";
+import { buildVoiceModePrompt } from "./voice.ts";
 
 // Exported so the skill runner in commands.ts uses the same threshold as
 // runAgent — diverging values would make loop-detection behavior depend on
@@ -218,6 +219,21 @@ export interface AgentRunDeps {
   // that case we omit `mcpServers` entirely rather than registering an empty
   // server.
   mcpServer?: McpSdkServerConfigWithInstance | null;
+  // Voice — word target for the voice-mode prompt nudge. When set AND
+  // `sessions.voice_replies=1` for the chat, the augmented prompt carries
+  // a `<voice-mode>` block telling the model to keep the reply under this
+  // many words. Optional — omitted when `VOICE_ENABLED=false`.
+  voiceReplyWords?: number;
+  // Post-turn TTS attach. Called once per successful turn AFTER the audit
+  // row is finalized. Wired only on the Telegram transport when VOICE_ENABLED
+  // — web has its own per-message speak button. Best-effort: failures inside
+  // the callback log + return; they do NOT propagate.
+  attachVoiceReply?: (opts: {
+    chatId: number;
+    messageId: number | null;
+    auditId: number;
+    finalText: string;
+  }) => Promise<void>;
 }
 
 export interface AgentRunInput {
@@ -397,9 +413,23 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
   // Returns null if the file is missing OR carries the unedited-template
   // marker; either way we skip the wrapper block.
   const instanceMd = readInstanceMd(deps.instanceMdPath);
+  // Voice-mode block when the chat has `/voice on` AND the deploy has
+  // configured a word target. SOLRAC.md loads BEFORE this block so an
+  // operator overlay can override (e.g. "ignore voice-mode word limits on
+  // this project") — see plan §14.
+  const voiceModeBlock =
+    deps.voiceReplyWords !== undefined && deps.db.getVoiceRepliesFlag(input.chatId)
+      ? buildVoiceModePrompt({ words: deps.voiceReplyWords })
+      : null;
   const promptToSend =
-    summary !== null || oobTurns.length > 0 || instanceMd !== null
-      ? buildAugmentedPrompt({ instanceMd, summary, oobTurns, currentPrompt: input.prompt })
+    summary !== null || oobTurns.length > 0 || instanceMd !== null || voiceModeBlock !== null
+      ? buildAugmentedPrompt({
+          instanceMd,
+          summary,
+          oobTurns,
+          currentPrompt: input.prompt,
+          voiceModeBlock,
+        })
       : input.prompt;
   if (summary !== null) {
     log.info("agent.summary_injected", {
@@ -568,6 +598,18 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
     numTurns,
     isError,
   });
+
+  // Voice (TTS attach). Fire-and-forget — the text reply is already
+  // committed; a TTS failure must not propagate. The callback itself
+  // gates on `sessions.voice_replies` and cost caps.
+  if (deps.attachVoiceReply && !isError && finalText.trim()) {
+    await deps.attachVoiceReply({
+      chatId: input.chatId,
+      messageId: stubId,
+      auditId,
+      finalText,
+    });
+  }
 }
 
 const defaultAllowAll: CanUseTool = async (toolName) => {
@@ -608,6 +650,15 @@ export function sanitizedSubprocessEnv(): Record<string, string | undefined> {
     // future REMOTE_* secret (additional providers, BYO keys, etc.) is
     // covered without needing to revisit this list.
     if (key.startsWith("REMOTE_")) continue;
+    // ELEVENLABS_* — billed credential (`xi-api-key`) + voice id. The
+    // spawned `claude` subprocess never calls ElevenLabs; `Bash(echo
+    // $ELEVENLABS_API_KEY)` is auto-allowed under BASH_SAFE_PREFIXES and
+    // would exfiltrate the key. Same rationale as REMOTE_API_KEY.
+    if (key.startsWith("ELEVENLABS_")) continue;
+    // VOICE_* — cost-cap thresholds, models, output formats. Not a secret
+    // per se, but the SDK subprocess has no business reading them; clean
+    // env reduces accidental coupling.
+    if (key.startsWith("VOICE_")) continue;
     if (key === "STATS_BEARER_TOKEN") continue;
     if (key === "ALLOWLIST_BOOTSTRAP") continue;
     if (key === "NOTION_API_KEY") continue;
@@ -723,10 +774,18 @@ export function buildAugmentedPrompt(args: {
   summary: { text: string; at: number } | null;
   oobTurns: ReadonlyArray<{ prompt: string; response: string; model: string }>;
   currentPrompt: string;
+  // Voice mode — `<voice-mode>` system block injected when `/voice on` for
+  // the chat AND the deploy has a word target configured. Sits AFTER
+  // SOLRAC.md and BEFORE summary/OOB so operator overlays can override
+  // (plan §14). `null` = voice mode off.
+  voiceModeBlock?: string | null;
 }): string {
   const lines: string[] = [];
   if (args.instanceMd !== null) {
     lines.push(wrapInstanceMd(args.instanceMd), "");
+  }
+  if (args.voiceModeBlock) {
+    lines.push(args.voiceModeBlock, "");
   }
   if (args.summary !== null) {
     const ts = new Date(args.summary.at).toISOString();

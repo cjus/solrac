@@ -144,6 +144,31 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
   source_hash TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- Voice (ElevenLabs STT + TTS) per-event audit log. Separate from the
+-- audit table because one turn can produce multiple voice events (one STT
+-- input + one TTS output) and the two-writes-per-turn shape doesn't fit.
+-- audit_id is informational only -- no FK so a denied-gate STT (which
+-- never reaches the audit table) still has a row here. Cost-cap queries
+-- sum cost_usd_estimate over the sliding 60-min window per chat and
+-- globally, independent of the Anthropic audit.cost_usd cap.
+CREATE TABLE IF NOT EXISTS voice_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  ts_ms INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('stt','tts')),
+  source TEXT NOT NULL CHECK (source IN ('web','telegram')),
+  model TEXT NOT NULL,
+  voice_id TEXT,
+  audit_id INTEGER,
+  duration_ms INTEGER,
+  chars INTEGER,
+  cost_usd_estimate REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('ok','denied_cap','denied_gate','error')),
+  error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_voice_events_chat_ts ON voice_events (chat_id, ts_ms);
+CREATE INDEX IF NOT EXISTS idx_voice_events_ts ON voice_events (ts_ms);
 `;
 
 export interface AuditInsert {
@@ -335,6 +360,19 @@ export interface SolracDb {
   }) => void;
   setTaskLastRunOnly: (name: string, lastRunAt: number) => void;
   sumTaskCostSince: (taskName: string, sinceMs: number) => number;
+  // Voice (ElevenLabs) — see `voice_events` table comment.
+  recordVoiceEvent: (row: VoiceEventInsert) => number;
+  // Per-chat sliding 60-min window over voice_events.cost_usd_estimate for
+  // the voice-axis cost cap. Independent of `audit.cost_usd` (Anthropic
+  // burn); voice spend and Claude spend cap separately.
+  voiceCostUsedLast60min: (chatId: number, sinceMs: number) => number;
+  voiceCostUsedGlobalLast60min: (sinceMs: number) => number;
+  // Per-chat sticky toggle backing `/voice on|off`. Returns false for unknown
+  // chats (no row yet — same as `voice_replies=0`).
+  getVoiceRepliesFlag: (chatId: number) => boolean;
+  // Upserts the sessions row; touches `updated_at` so a fresh chat that
+  // toggles voice before its first turn still has a created/updated stamp.
+  setVoiceRepliesFlag: (chatId: number, enabled: boolean) => void;
   close: () => void;
 }
 
@@ -347,6 +385,32 @@ export interface ScheduledTaskRow {
   sourcePath: string;
   sourceHash: string;
   updatedAt: number;
+}
+
+// Outcome of a voice event. `denied_cap`/`denied_gate` rows still persist so
+// the operator can see "we spent N tries denied at the gate" — audit-before-
+// acting parity with the main `audit` table.
+export type VoiceEventStatus = "ok" | "denied_cap" | "denied_gate" | "error";
+
+export interface VoiceEventInsert {
+  chatId: number;
+  tsMs: number;
+  kind: "stt" | "tts";
+  source: "web" | "telegram";
+  model: string;
+  voiceId: string | null;
+  // Informational link to `audit.id` when this voice event corresponds to a
+  // turn that touched the audit table. Null for STT events that happen
+  // before the turn is created and for denied-gate STT (no turn ever runs).
+  auditId: number | null;
+  // STT: audio duration in ms; TTS: null. Cost math uses `audio_duration_secs`
+  // from the upstream response, persisted here as ms for a single time unit.
+  durationMs: number | null;
+  // TTS: input character count fed to ElevenLabs; STT: null.
+  chars: number | null;
+  costUsdEstimate: number;
+  status: VoiceEventStatus;
+  errorMessage: string | null;
 }
 
 export async function openDb(dataDir: string): Promise<SolracDb> {
@@ -467,6 +531,14 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   } else if (!hasLegacyCutoff && !hasLocalCutoff) {
     db.run("ALTER TABLE sessions ADD COLUMN local_cutoff_ms INTEGER");
     log.info("db.migrated", { migration: "sessions.local_cutoff_ms_added" });
+  }
+  // Voice — per-chat sticky toggle for the post-turn TTS attach + the
+  // voice-mode word-limit prompt. 0 = off (default), 1 = on. Read by both
+  // SOLRAC.md injection sites every turn so toggling takes effect on the
+  // next message without a restart.
+  if (!sessionCols.some((c) => c.name === "voice_replies")) {
+    db.run("ALTER TABLE sessions ADD COLUMN voice_replies INTEGER NOT NULL DEFAULT 0");
+    log.info("db.migrated", { migration: "sessions.voice_replies_added" });
   }
   // PLAN Step 12 — retag legacy `audit.model='claude'` rows. They ran on the
   // then-default SOLRAC_MODEL=claude-opus-4-7, which is now the secondary
@@ -662,6 +734,36 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
   const stSumTaskCostSince = db.prepare(
     "SELECT COALESCE(SUM(cost_usd), 0) AS spent FROM audit " +
       "WHERE task_name = ? AND started_at >= ?",
+  );
+  const stInsertVoiceEvent = db.prepare(
+    "INSERT INTO voice_events " +
+      "(chat_id, ts_ms, kind, source, model, voice_id, audit_id, duration_ms, chars, " +
+      "cost_usd_estimate, status, error_message) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  // Cap windows match the Anthropic per-chat / global cap shape: the caller
+  // passes `Date.now() - 3600_000`; we sum `cost_usd_estimate` since then.
+  // Only `status='ok'` rows count — denied events don't bill, so denying
+  // them shouldn't deny again on the next call.
+  const stSumVoiceCostChat = db.prepare(
+    "SELECT COALESCE(SUM(cost_usd_estimate), 0) AS spent FROM voice_events " +
+      "WHERE chat_id = ? AND ts_ms >= ? AND status = 'ok'",
+  );
+  const stSumVoiceCostGlobal = db.prepare(
+    "SELECT COALESCE(SUM(cost_usd_estimate), 0) AS spent FROM voice_events " +
+      "WHERE ts_ms >= ? AND status = 'ok'",
+  );
+  const stGetVoiceReplies = db.prepare(
+    "SELECT voice_replies FROM sessions WHERE chat_id = ?",
+  );
+  // INSERT OR IGNORE creates a baseline row if absent (default created_at +
+  // updated_at = now), then the UPDATE flips the flag. Two statements stay
+  // simpler than the equivalent UPSERT for a column not on the PK.
+  const stEnsureSession = db.prepare(
+    "INSERT OR IGNORE INTO sessions (chat_id, created_at, updated_at) VALUES (?, ?, ?)",
+  );
+  const stSetVoiceReplies = db.prepare(
+    "UPDATE sessions SET voice_replies = ?, updated_at = ? WHERE chat_id = ?",
   );
 
   return {
@@ -878,6 +980,40 @@ export async function openDb(dataDir: string): Promise<SolracDb> {
     sumTaskCostSince(taskName, sinceMs) {
       const row = stSumTaskCostSince.get(taskName, sinceMs) as { spent: number | null } | null;
       return row?.spent ?? 0;
+    },
+    recordVoiceEvent(row) {
+      const r = stInsertVoiceEvent.run(
+        row.chatId,
+        row.tsMs,
+        row.kind,
+        row.source,
+        row.model,
+        row.voiceId,
+        row.auditId,
+        row.durationMs,
+        row.chars,
+        row.costUsdEstimate,
+        row.status,
+        row.errorMessage,
+      );
+      return Number(r.lastInsertRowid);
+    },
+    voiceCostUsedLast60min(chatId, sinceMs) {
+      const row = stSumVoiceCostChat.get(chatId, sinceMs) as { spent: number | null } | null;
+      return row?.spent ?? 0;
+    },
+    voiceCostUsedGlobalLast60min(sinceMs) {
+      const row = stSumVoiceCostGlobal.get(sinceMs) as { spent: number | null } | null;
+      return row?.spent ?? 0;
+    },
+    getVoiceRepliesFlag(chatId) {
+      const row = stGetVoiceReplies.get(chatId) as { voice_replies: number } | null;
+      return row?.voice_replies === 1;
+    },
+    setVoiceRepliesFlag(chatId, enabled) {
+      const now = Date.now();
+      stEnsureSession.run(chatId, now, now);
+      stSetVoiceReplies.run(enabled ? 1 : 0, now, chatId);
     },
     close() {
       db.close();

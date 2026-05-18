@@ -34,6 +34,8 @@ Terms that recur across Solrac's codebase and docs. Alphabetical.
 
 **edit (Telegram)** — `editMessageText` API call. Solrac edits its 🤔 stub message rather than sending many small ones. Throttled to 1.5s between edits (`agent.ts:19`).
 
+**ElevenLabs** — Hosted speech provider used by Solrac's optional voice path. STT via Scribe (`/v1/speech-to-text`); TTS via voice models (`/v1/text-to-speech/{voice_id}/stream`). Two HTTP calls, no SDK. `ELEVENLABS_*` and `VOICE_*` env vars are scrubbed from the Claude SDK subprocess (`agent.ts::sanitizedSubprocessEnv`) so a compromised model can't exfiltrate the billed credential. See `src/elevenlabs.ts`.
+
 **from.id** — Telegram user identifier. The user who actually sent a message. Differs from `chat.id` in groups and forwarded messages.
 
 **handled_updates** — SQLite table holding all claimed `update_id`s. Idempotency surface for the poll loop; pruned by a future janitor (deferred to a follow-up).
@@ -90,6 +92,8 @@ Terms that recur across Solrac's codebase and docs. Alphabetical.
 
 **stub** — The `🤔 thinking…` placeholder message Solrac sends at turn start, then edits with progress. Final state is the same message edited to the answer + footer (`<i>✅ N turns · $X.XXXX</i>`). No separate "final" message — that's intentional (see ARCHITECTURE.md "No-op-edit guard").
 
+**STT** — Speech-to-text. ElevenLabs Scribe in Solrac. Telegram voice notes get transcribed inline (`handleTelegramVoiceStt` synthesizes a text Update for the existing dispatcher); the web UI's mic button pre-fills the composer with the transcript. Off by default; gated by `VOICE_ENABLED=true`.
+
 **SOUL.md** — Operator-editable persona file at the launch cwd's root. Contains voice, stance, and the `<untrusted-content>` safety clause. Read once at boot via `instance.ts::loadSoul`; joined with an engine-specific capability note and shipped as `systemPrompt.append` (Claude path) or as the first `system` message (local path). Hard-fails at boot if missing or empty. Mirrors OpenClaw's SOUL concept (voice, not operating rules).
 
 **SOLRAC.md** — Operator-editable instance overlay at the launch cwd's root. Contains operator-specific operating rules (operator name, channel posture, project hints). Re-read per turn so live edits take effect immediately. Wrapped in `<solrac-md>...</solrac-md>` and injected at the top of the user-message envelope (Claude path) or as a second `system` message (local path). Soft-warn if missing — Solrac runs vanilla without it. Carries a `solrac-md:unedited` sentinel marker on first install so a fresh template injects nothing until the operator activates the overlay. Analogous to a per-project CLAUDE.md.
@@ -104,6 +108,8 @@ Terms that recur across Solrac's codebase and docs. Alphabetical.
 
 **TurnTracker** — `turn-tracker.ts`. Symbol-keyed `Set<symbol>` tracking active turns. `count` for `/stats`; `drain()` for shutdown.
 
+**TTS** — Text-to-speech. ElevenLabs voice models. Web UI gets a per-message 🔊 button with a cached blob — replay doesn't re-bill. Telegram gets a voice-note attachment when `/voice on` (`sessions.voice_replies = 1`). `VOICE_TTS_MAX_CHARS` (default 1500) is a length wall before the call fires. Off by default; gated by `VOICE_ENABLED=true`.
+
 **`tree_id`** — see above.
 
 **untrusted-content wrapper** — `policy.ts::wrapUntrustedContent(text, source)` returns `<untrusted-content source="…">text</untrusted-content>`. Paired with a system-prompt clause that tells the agent to treat such blocks as data, never instructions. v1 has no inbound-attachment intake yet, so the wrapper is wired but unused.
@@ -111,6 +117,12 @@ Terms that recur across Solrac's codebase and docs. Alphabetical.
 **`update_id`** — Monotonically increasing Telegram update identifier. Solrac uses it as the primary key of `handled_updates` for idempotency.
 
 **verdict** — The user's tap on a confirm prompt: `"allow" | "deny" | "timeout"`. Surfaced from the broker as a `ConfirmDecision`.
+
+**voice cost cap** — Independent of the Anthropic burn cap. Per-chat `VOICE_HOURLY_COST_CAP_USD` and global `VOICE_GLOBAL_HOURLY_COST_CAP_USD`, both sliding 60-min windows over `voice_events.cost_usd_estimate`. Enforced pre-flight on every STT/TTS attempt. Cap-hit writes a `denied_cap` row with `error_message ∈ {chat_voice_cap, global_voice_cap}` and refuses the call.
+
+**voice mode** — Per-chat sticky toggle: `/voice on` / `/voice off`. Persisted as `sessions.voice_replies` (0 or 1). When on, Telegram replies attach a TTS voice note and a `<voice-mode>` system block tells the model to keep replies under N words (`VOICE_REPLY_WORDS_HINT`, clamped to [30,200]). Web UI ignores the flag — its per-message 🔊 button is on-demand. See `commands.ts::runVoiceSet`.
+
+**voice_events** — Append-only SQLite table parallel to `audit`. One row per ElevenLabs attempt with `kind` (`stt`|`tts`), `source` (`web`|`telegram`), `status` (`ok`|`denied_cap`|`denied_gate`|`error`), `cost_usd_estimate`, `duration_ms` (STT) or `chars` (TTS). Source of truth for the voice cost cap. `audit_id` is informational (no FK) so denied-gate STTs — which never reach `audit` — still get a row. See [SCHEMA.md#voice_events](./SCHEMA.md#voice_events).
 
 **WAL** — SQLite Write-Ahead Log mode (`PRAGMA journal_mode = WAL`). Concurrent readers + a single writer; checkpointed to truncate on graceful shutdown (`PRAGMA wal_checkpoint(TRUNCATE)` in `lifecycle.ts`).
 

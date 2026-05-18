@@ -314,3 +314,123 @@ body {
 }
 
 #send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Voice (mic + speak + badge + toast) ──────────────── */
+
+.mic-btn {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.mic-btn:hover { border-color: var(--accent); }
+.mic-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.mic-btn.recording {
+  border-color: var(--error);
+  color: var(--error);
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+
+.mic-btn.uploading {
+  border-color: var(--accent);
+  color: var(--accent);
+  opacity: 0.7;
+}
+
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(185, 28, 28, 0.4); }
+  50%      { box-shadow: 0 0 0 6px rgba(185, 28, 28, 0); }
+}
+
+.voice-badge {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1.4;
+}
+
+.voice-badge:hover {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+/* Per-message speak button, bottom-right of the bubble. */
+.msg.assistant {
+  position: relative;
+}
+
+.speak-btn {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.6;
+}
+
+.speak-btn:hover { opacity: 1; border-color: var(--accent); color: var(--accent); }
+.speak-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.speak-btn.loading { animation: mic-pulse 1.2s ease-in-out infinite; }
+
+/* Audio element is invisible — the 🔊 / ⏹ button is the only UI for
+ * playback. display:none does NOT prevent the element from playing. */
+.speak-audio { display: none; }
+
+.speak-btn.playing { opacity: 1; color: var(--accent); border-color: var(--accent); }
+
+/* Toast — bottom-right transient messages. */
+
+.toast-host {
+  position: fixed;
+  right: 16px;
+  bottom: 80px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.toast {
+  pointer-events: auto;
+  max-width: 320px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-size: 13px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  animation: toast-in 200ms ease-out;
+}
+
+.toast.fading {
+  animation: toast-out 500ms ease-in forwards;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes toast-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}

@@ -35,6 +35,7 @@ import { randomUUID } from "node:crypto";
 import { log } from "./log.ts";
 import { sanitizeHtml } from "./web-sanitize.ts";
 import type { WebClient, WebBusEvent } from "./web-client.ts";
+import { handleWebStt, handleWebTts, type VoiceDeps } from "./voice.ts";
 
 // PNX-168 — text imports of UI assets so the compiled binary serves the web
 // UI without runtime fs reads of the source tree. In dev these resolve to the
@@ -96,6 +97,19 @@ export interface WebServerDeps {
    * runs `marked` + sanitizer.
    */
   loadHistory: () => Array<{ prompt: string; response: string; model: string }>;
+  /**
+   * Voice (Phase 2). When set, the server exposes /api/stt + /api/tts
+   * routes backed by ElevenLabs. `null` when VOICE_ENABLED=false — the
+   * routes still respond with HTTP 503 so the browser can render a clean
+   * "voice disabled" toast rather than a 404 mystery.
+   */
+  voiceDeps: VoiceDeps | null;
+  /**
+   * Voice-replies current state for this chat (the web one shares a single
+   * synthetic chat id). The browser badges the composer with "voice mode
+   * on" when true. main.ts wires this to `db.getVoiceRepliesFlag(webChatId)`.
+   */
+  voiceRepliesEnabled: () => boolean;
 }
 
 export interface WebServerHandle {
@@ -178,6 +192,97 @@ export function startWebServer(deps: WebServerDeps): WebServerHandle {
   function historyHandler(req: Request): Response {
     if (!authorize(req)) return Response.json({ ok: false }, { status: 401 });
     return Response.json({ ok: true, turns: deps.loadHistory() });
+  }
+
+  function voiceStateHandler(req: Request): Response {
+    if (!authorize(req)) return Response.json({ ok: false }, { status: 401 });
+    return Response.json({ ok: true, enabled: deps.voiceRepliesEnabled() });
+  }
+
+  async function sttHandler(req: Request): Promise<Response> {
+    if (!authorize(req)) return Response.json({ ok: false }, { status: 401 });
+    if (!deps.voiceDeps) {
+      return Response.json({ ok: false, message: "voice disabled" }, { status: 503 });
+    }
+    const cap = deps.voiceDeps.config.voiceSttMaxBytes;
+    // `req.formData()` buffers the entire body. The Content-Length check
+    // is a fast-path reject for oversized uploads before we pay the buffer.
+    const lenHeader = req.headers.get("content-length");
+    const len = lenHeader ? Number(lenHeader) : NaN;
+    if (Number.isFinite(len) && len > cap) {
+      return Response.json(
+        { ok: false, message: `audio exceeds ${cap} bytes` },
+        { status: 413 },
+      );
+    }
+    let form;
+    try {
+      form = await req.formData();
+    } catch (err) {
+      log.warn("web.stt_form_parse_failed", { error: (err as Error).message });
+      return Response.json({ ok: false, message: "invalid multipart" }, { status: 400 });
+    }
+    const audio = form.get("audio");
+    if (!(audio instanceof Blob)) {
+      return Response.json({ ok: false, message: "missing audio" }, { status: 400 });
+    }
+    if (audio.size > cap) {
+      return Response.json(
+        { ok: false, message: `audio exceeds ${cap} bytes` },
+        { status: 413 },
+      );
+    }
+    const result = await handleWebStt(deps.voiceDeps, {
+      chatId: deps.webChatId,
+      audio,
+    });
+    if (result.kind === "ok") return Response.json({ ok: true, text: result.text });
+    if (result.kind === "denied_cap") {
+      return Response.json({ ok: false, message: "voice cap reached" }, { status: 429 });
+    }
+    return Response.json({ ok: false, message: result.message }, { status: 502 });
+  }
+
+  async function ttsHandler(req: Request): Promise<Response> {
+    if (!authorize(req)) return Response.json({ ok: false }, { status: 401 });
+    if (!deps.voiceDeps) {
+      return Response.json({ ok: false, message: "voice disabled" }, { status: 503 });
+    }
+    const body = (await req.json().catch(() => null)) as
+      | { message_id?: unknown; markdown?: unknown }
+      | null;
+    const markdown = body && typeof body.markdown === "string" ? body.markdown : "";
+    const auditId =
+      body && typeof body.message_id === "number" ? body.message_id : null;
+    if (!markdown.trim()) {
+      return Response.json({ ok: false, message: "empty markdown" }, { status: 400 });
+    }
+    const result = await handleWebTts(deps.voiceDeps, {
+      chatId: deps.webChatId,
+      markdown,
+      auditId,
+    });
+    if (result.kind === "stream") {
+      return new Response(result.body, {
+        headers: {
+          "content-type": result.contentType,
+          "cache-control": "no-cache, no-transform",
+        },
+      });
+    }
+    if (result.kind === "too_long") {
+      return Response.json(
+        {
+          ok: false,
+          message: `reply too long to speak (max ${result.maxChars} chars)`,
+        },
+        { status: 413 },
+      );
+    }
+    if (result.kind === "denied_cap") {
+      return Response.json({ ok: false, message: "voice cap reached" }, { status: 429 });
+    }
+    return Response.json({ ok: false, message: result.message }, { status: 502 });
   }
 
   function streamHandler(req: Request): Response {
@@ -283,6 +388,9 @@ export function startWebServer(deps: WebServerDeps): WebServerHandle {
         if (req.method === "POST" && path === "/api/confirm") return await confirmHandler(req);
         if (req.method === "GET" && path === "/api/stream") return streamHandler(req);
         if (req.method === "GET" && path === "/api/history") return historyHandler(req);
+        if (req.method === "GET" && path === "/api/voice/state") return voiceStateHandler(req);
+        if (req.method === "POST" && path === "/api/stt") return await sttHandler(req);
+        if (req.method === "POST" && path === "/api/tts") return await ttsHandler(req);
         return new Response("not found", { status: 404 });
       } catch (err) {
         log.error("web.handler_failed", {

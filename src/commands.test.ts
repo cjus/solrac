@@ -486,6 +486,8 @@ function makeFakeTg(): TelegramClient & { sent: SentMessage[] } {
       username: "solrac_dev_bot",
     })) as never,
     setMyCommands: (async () => true) as never,
+    sendVoice: (async () => ({ message_id: 0, date: 0, chat: { id: 0, type: "private" } })) as never,
+    sendAudio: (async () => ({ message_id: 0, date: 0, chat: { id: 0, type: "private" } })) as never,
   } as TelegramClient & { sent: SentMessage[] };
 }
 

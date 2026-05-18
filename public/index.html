@@ -23,6 +23,7 @@
     <header class="chat-header">
       <span class="title">solrac · web</span>
       <span class="spacer"></span>
+      <button id="voice-badge" class="voice-badge hidden" type="button" title="click to disable voice mode">🔊 voice mode on</button>
       <span id="conn-state" class="conn-state" title="stream status">…</span>
       <button id="clear-btn" class="header-btn" title="/clear all">⨯</button>
       <button id="logout-btn" class="header-btn" title="logout">⏻</button>
@@ -35,8 +36,10 @@
         <button type="button" class="engine-opt" data-prefix="!" title="secondary Claude (Opus)">!</button>
       </div>
       <textarea id="composer-text" rows="1" placeholder="message solrac…" autofocus></textarea>
+      <button type="button" id="mic-btn" class="mic-btn hidden" title="record voice" aria-label="record voice">🎙️</button>
       <button type="submit" id="send-btn" title="send (Enter)">↵</button>
     </form>
+    <div id="toast-host" class="toast-host" aria-live="polite"></div>
   </section>
 </main>
 <script src="/static/marked.min.js"></script>

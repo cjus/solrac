@@ -30,6 +30,9 @@ const els = {
   logoutBtn: $("logout-btn"),
   connState: $("conn-state"),
   enginePills: document.querySelectorAll(".engine-opt"),
+  micBtn: $("mic-btn"),
+  voiceBadge: $("voice-badge"),
+  toastHost: $("toast-host"),
 };
 
 // Track DOM nodes by message_id so streaming edits can replace them in place.
@@ -42,6 +45,22 @@ const messageNodes = new Map();
 let activeEngine = "";
 let stream = null;
 let firstTab = true;
+// Voice mode (mirror of sessions.voice_replies for the web chat id). Refreshed
+// from /api/voice/state on boot and after the user sends /voice on|off.
+let voiceModeOn = false;
+// Voice availability for the deploy. Probed once at boot by HEAD-ing
+// /api/voice/state — if it returns 401/200 the route exists (voice enabled);
+// 503 means the server has VOICE_ENABLED=false and the mic/speak surface
+// stays hidden.
+let voiceFeatureAvailable = false;
+// MediaRecorder state. `recorder` is the active recorder; `recordTimeoutId`
+// is the auto-stop timer that fires at VOICE_STT_MAX_SECONDS (60s server-side).
+let recorder = null;
+let recordTimeoutId = null;
+let recordChunks = [];
+// 60s — matches server-side VOICE_STT_MAX_SECONDS default. Client-side cap
+// keeps us from uploading audio the server will reject anyway.
+const RECORD_MAX_MS = 60_000;
 
 // ── Boot ───────────────────────────────────────────────
 
@@ -78,6 +97,8 @@ function bindUi() {
     pill.addEventListener("click", () => setEngine(pill.dataset.prefix));
   }
   setEngine("");
+  els.micBtn?.addEventListener("click", onMicClick);
+  els.voiceBadge?.addEventListener("click", () => sendUser("/voice off"));
 }
 
 // ── Auth ───────────────────────────────────────────────
@@ -98,6 +119,10 @@ function enterChat(history) {
   scrollToBottom();
   openStream();
   els.composerText.focus();
+  // Probe voice availability once per session. /api/voice/state returns 200
+  // when VOICE_ENABLED=true, 503 when off. We surface the mic + speak
+  // buttons only when the deploy supports them.
+  refreshVoiceState();
 }
 
 async function onLoginSubmit(e) {
@@ -185,6 +210,14 @@ function handleEvent(event) {
     if (!node) return;
     const stick = isNearBottom();
     renderBody(node.querySelector(".body"), event.markdown_source, event.html);
+    // Update the stashed markdown so the speak button (added when the
+    // final-state sentinel appears) picks up the latest text. Each edit
+    // overwrites — by the time `✅` lands, dataset.markdown has the full
+    // final reply.
+    if (typeof event.markdown_source === "string") {
+      node.dataset.markdown = event.markdown_source;
+    }
+    maybeAddSpeakButton(node);
     if (stick) scrollToBottom();
   } else if (event.kind === "reaction") {
     // We don't render reactions in the web UI v1.
@@ -232,6 +265,12 @@ async function sendUser(text) {
   } finally {
     els.sendBtn.disabled = false;
     els.composerText.focus();
+  }
+  // Slash command that flips sessions.voice_replies — refresh the badge
+  // shortly after so the UI reflects new state. Small delay lets the
+  // command's audit row settle before we re-query.
+  if (/^\s*\/voice(\s|$)/i.test(text)) {
+    window.setTimeout(refreshVoiceState, 500);
   }
 }
 
@@ -297,6 +336,9 @@ function appendMessage({ role, markdown, html_fallback, message_id }) {
   const li = document.createElement("li");
   li.className = `msg ${role}`;
   if (typeof message_id === "number") li.dataset.messageId = String(message_id);
+  // Stash the raw markdown on the LI so the speak button can read it
+  // straight from the DOM rather than tracking a parallel Map.
+  if (typeof markdown === "string") li.dataset.markdown = markdown;
   const roleLabel = document.createElement("div");
   roleLabel.className = "role";
   roleLabel.textContent = role === "user" ? "you" : "solrac";
@@ -307,6 +349,7 @@ function appendMessage({ role, markdown, html_fallback, message_id }) {
   li.appendChild(body);
   els.messages.appendChild(li);
   if (typeof message_id === "number") messageNodes.set(message_id, li);
+  if (role === "assistant") maybeAddSpeakButton(li);
   return li;
 }
 
@@ -343,4 +386,287 @@ const STICK_THRESHOLD_PX = 64;
 function isNearBottom() {
   const el = els.messages;
   return el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX;
+}
+
+// ── Voice ──────────────────────────────────────────────
+
+async function refreshVoiceState() {
+  try {
+    const res = await fetch("/api/voice/state");
+    if (res.status === 503) {
+      // Deploy has VOICE_ENABLED=false. Hide mic + speak surfaces entirely.
+      voiceFeatureAvailable = false;
+      voiceModeOn = false;
+      els.micBtn?.classList.add("hidden");
+      els.voiceBadge?.classList.add("hidden");
+      return;
+    }
+    if (!res.ok) return;
+    const body = await res.json();
+    voiceFeatureAvailable = true;
+    voiceModeOn = body.enabled === true;
+    els.micBtn?.classList.remove("hidden");
+    if (voiceModeOn) {
+      els.voiceBadge?.classList.remove("hidden");
+      if (els.voiceBadge) els.voiceBadge.textContent = "🔊 voice mode on";
+    } else {
+      els.voiceBadge?.classList.add("hidden");
+    }
+    // Audit existing assistant bubbles for speak buttons — when voice
+    // becomes available mid-session (e.g. after a server restart), already
+    // rendered messages should grow their speak button too.
+    for (const node of messageNodes.values()) {
+      maybeAddSpeakButton(node);
+    }
+  } catch {
+    // Network error — leave state as-is.
+  }
+}
+
+async function onMicClick() {
+  if (!voiceFeatureAvailable) return;
+  if (recorder) {
+    stopRecording(); // user tap to stop mid-flight
+    return;
+  }
+  try {
+    const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = pickMediaRecorderMime();
+    recorder = new MediaRecorder(mediaStream, mime ? { mimeType: mime } : undefined);
+    recordChunks = [];
+    recorder.addEventListener("dataavailable", (e) => {
+      if (e.data && e.data.size > 0) recordChunks.push(e.data);
+    });
+    recorder.addEventListener("stop", () => onRecordingStop(mediaStream));
+    recorder.start();
+    setMicState("recording");
+    recordTimeoutId = window.setTimeout(() => stopRecording(), RECORD_MAX_MS);
+  } catch (err) {
+    showToast(`mic error: ${err.message ?? "permission denied"}`);
+    recorder = null;
+    setMicState("idle");
+  }
+}
+
+function stopRecording() {
+  if (!recorder) return;
+  if (recordTimeoutId !== null) {
+    window.clearTimeout(recordTimeoutId);
+    recordTimeoutId = null;
+  }
+  try {
+    recorder.stop();
+  } catch {
+    // already inactive
+  }
+}
+
+async function onRecordingStop(mediaStream) {
+  setMicState("uploading");
+  // Stop the audio tracks so the browser indicator clears immediately.
+  for (const t of mediaStream.getTracks()) t.stop();
+  const chunks = recordChunks;
+  const mime = recorder?.mimeType || "audio/webm";
+  recorder = null;
+  recordChunks = [];
+  if (chunks.length === 0) {
+    setMicState("idle");
+    return;
+  }
+  const blob = new Blob(chunks, { type: mime });
+  const form = new FormData();
+  form.append("audio", blob, mime.includes("ogg") ? "audio.ogg" : "audio.webm");
+  try {
+    const res = await fetch("/api/stt", { method: "POST", body: form });
+    if (res.status === 401) {
+      enterLogin();
+      setMicState("idle");
+      return;
+    }
+    if (res.status === 413) {
+      showToast("audio too large — try a shorter clip");
+      setMicState("idle");
+      return;
+    }
+    if (res.status === 429) {
+      showToast("voice cap reached — try again in a minute");
+      setMicState("idle");
+      return;
+    }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      showToast(`transcription failed: ${body.message ?? res.status}`);
+      setMicState("idle");
+      return;
+    }
+    const body = await res.json();
+    const text = typeof body.text === "string" ? body.text : "";
+    if (text) {
+      // Pre-fill the composer; cursor at end so a quick edit-then-send is
+      // one keystroke. Operator decides whether to send — defends against
+      // STT errors. No auto-send in v1.
+      els.composerText.value = els.composerText.value
+        ? els.composerText.value + " " + text
+        : text;
+      autoResize();
+      els.composerText.focus();
+      const len = els.composerText.value.length;
+      els.composerText.setSelectionRange(len, len);
+    }
+  } catch (err) {
+    showToast(`network error: ${err.message ?? "unknown"}`);
+  } finally {
+    setMicState("idle");
+  }
+}
+
+function setMicState(state) {
+  if (!els.micBtn) return;
+  els.micBtn.classList.toggle("recording", state === "recording");
+  els.micBtn.classList.toggle("uploading", state === "uploading");
+  els.micBtn.disabled = state === "uploading";
+  els.micBtn.title =
+    state === "recording" ? "stop recording" : state === "uploading" ? "uploading…" : "record voice";
+}
+
+// MediaRecorder mime varies by browser:
+//   - Chromium → 'audio/webm;codecs=opus' (preferred)
+//   - Firefox  → same
+//   - Safari   → 'audio/mp4' (Safari rejects 'audio/webm')
+// Pick the first supported; let MediaRecorder default if none match
+// (Scribe v2 accepts both webm/opus and mp4/aac).
+function pickMediaRecorderMime() {
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+  if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) return null;
+  for (const m of candidates) {
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return null;
+}
+
+// ── Speak (TTS) ────────────────────────────────────────
+
+// Detect "final state" of an assistant message — the agent and engine
+// runners suffix successful turns with a `✅ N turns · $X.XXXX` footer
+// in the markdown source (see agent.ts::buildFooter). When that sentinel
+// is present we know the stream is settled and the speak button is safe
+// to expose. Mid-stream the button stays absent so the operator can't
+// pay for TTS on a partial reply.
+function isFinalAssistantMarkdown(md) {
+  if (typeof md !== "string") return false;
+  return md.includes("*✅");
+}
+
+function maybeAddSpeakButton(node) {
+  if (!voiceFeatureAvailable) return;
+  if (node.classList.contains("user")) return;
+  if (node.querySelector(".speak-btn")) return; // already added
+  const md = node.dataset.markdown;
+  if (!isFinalAssistantMarkdown(md)) return;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "speak-btn";
+  btn.title = "speak this reply";
+  btn.setAttribute("aria-label", "speak this reply");
+  btn.textContent = "🔊";
+  btn.addEventListener("click", () => onSpeakClick(node, btn));
+  node.appendChild(btn);
+}
+
+async function onSpeakClick(node, btn) {
+  const existingAudio = node.querySelector(".speak-audio");
+  // Click while playing → stop. Audio element stays attached (and its
+  // blob URL stays live) so the next click replays from cache without
+  // re-billing ElevenLabs.
+  if (existingAudio && !existingAudio.paused) {
+    existingAudio.pause();
+    existingAudio.currentTime = 0;
+    setSpeakButtonState(btn, "idle");
+    return;
+  }
+  // Click after a previous play that ended/stopped → replay from cache.
+  if (existingAudio) {
+    existingAudio.currentTime = 0;
+    try {
+      await existingAudio.play();
+      setSpeakButtonState(btn, "playing");
+    } catch {
+      // Autoplay policy or other transient — silently ignore; the user
+      // can click again. No toast for replay failures.
+    }
+    return;
+  }
+  // First click → fetch TTS, attach a hidden <audio>, autoplay.
+  const markdown = node.dataset.markdown ?? "";
+  const messageId = node.dataset.messageId ? Number(node.dataset.messageId) : null;
+  if (!markdown) return;
+  btn.disabled = true;
+  btn.classList.add("loading");
+  try {
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message_id: messageId, markdown }),
+    });
+    if (res.status === 401) {
+      enterLogin();
+      return;
+    }
+    if (res.status === 413) {
+      showToast("reply too long to speak — try /voice on for terser replies");
+      return;
+    }
+    if (res.status === 429) {
+      const body = await res.json().catch(() => ({}));
+      showToast(body.message ?? "voice cap reached");
+      return;
+    }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      showToast(`speak failed: ${body.message ?? res.status}`);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    // Inject audio via DOM API (NOT innerHTML) — the sanitizer is for
+    // marked-rendered LLM content; this audio element is UI chrome added
+    // by app code, so the trust boundary doesn't move (plan §10.3).
+    // No `controls` attr — CSS hides the element entirely; the speak
+    // button is the only UI affordance.
+    const audio = document.createElement("audio");
+    audio.src = url;
+    audio.className = "speak-audio";
+    audio.dataset.blobUrl = url;
+    audio.addEventListener("play", () => setSpeakButtonState(btn, "playing"));
+    audio.addEventListener("pause", () => setSpeakButtonState(btn, "idle"));
+    audio.addEventListener("ended", () => setSpeakButtonState(btn, "idle"));
+    node.appendChild(audio);
+    await audio.play();
+  } catch (err) {
+    showToast(`network error: ${err.message ?? "unknown"}`);
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("loading");
+  }
+}
+
+function setSpeakButtonState(btn, state) {
+  btn.classList.toggle("playing", state === "playing");
+  btn.textContent = state === "playing" ? "⏹" : "🔊";
+  btn.title = state === "playing" ? "stop" : "speak this reply";
+}
+
+// ── Toast ──────────────────────────────────────────────
+
+function showToast(text) {
+  if (!els.toastHost) return;
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.textContent = text;
+  els.toastHost.appendChild(t);
+  // 4s fade-then-remove. The CSS animation handles fade; we just clean up.
+  window.setTimeout(() => {
+    t.classList.add("fading");
+    window.setTimeout(() => t.remove(), 500);
+  }, 4000);
 }

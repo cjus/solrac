@@ -52,6 +52,21 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 | `SOLRAC_WEB_PORT` | no | `8080` | positive int | Port for the web UI. Must differ from `PORT` (which serves `/health` & `/stats`). |
 | `SOLRAC_WEB_TOKEN` | when `SOLRAC_WEB_ENABLED=true` | — | string | Login secret. **Required even on `127.0.0.1`** — a co-tenant on a shared host could otherwise reach the unauthenticated UI. Generate with `openssl rand -hex 32`. Cookie set after login is HttpOnly + SameSite=Strict + Path=/ + Max-Age=24h. |
 | `SOLRAC_WEB_CHAT_ID` | no | `-1000` | negative int | Synthetic chat id all web traffic shares. One session per Claude tier, one cost-cap bucket, one `/clear` scope. Negative to avoid collision with real Telegram chat ids. |
+| `VOICE_ENABLED` | no | `false` | boolean | Master switch for voice (ElevenLabs STT + TTS). When `true`, `ELEVENLABS_API_KEY` AND `ELEVENLABS_VOICE_ID` MUST be set (boot fails loud otherwise). Telegram voice notes get transcribed via Scribe; `/voice on` enables per-chat audio replies via the configured voice. The web UI surfaces a mic button + per-message speak button. Independent voice cost cap (per-chat + global, sliding 60-min) over `voice_events.cost_usd_estimate` — Anthropic burn cap is unaffected. |
+| `ELEVENLABS_API_KEY` | when `VOICE_ENABLED=true` | — | string | ElevenLabs API key (`sk_…`). Get one at [elevenlabs.io](https://elevenlabs.io) → Profile + API Keys. Recommended restriction: **Text to Speech + Speech to Text only**, nothing else. **Scrubbed** from the SDK-spawned `claude` subprocess env (`agent.ts::sanitizedSubprocessEnv` strips the entire `ELEVENLABS_*` prefix). |
+| `ELEVENLABS_VOICE_ID` | when `VOICE_ENABLED=true` | — | string | 20-char voice id from ElevenLabs VoiceLab → voice detail page. Single deploy-wide voice (no per-chat override in v1). |
+| `ELEVENLABS_TTS_MODEL` | no | `eleven_flash_v2_5` | string | TTS model id. `eleven_flash_v2_5` is $0.05/1k chars, low latency. Alternatives: `eleven_turbo_v2_5` (similar), `eleven_multilingual_v2` ($0.10/1k, better quality). |
+| `ELEVENLABS_STT_MODEL` | no | `scribe_v2` | string | STT model id. `scribe_v2` is the GA replacement for v1 (March 2026). |
+| `VOICE_TTS_MAX_CHARS` | no | `3000` | positive int | Hard wall — TTS requests over this length (post-markdown-strip) are refused with HTTP 413 (web) or a chat hint (Telegram). The voice-mode prompt nudge (`VOICE_REPLY_WORDS_HINT`) defends against this softly; the wall is the last line of defense. |
+| `VOICE_REPLY_WORDS_HINT` | no | `60` | positive int | Soft target — when `/voice on` is set for a chat, this word budget is injected as a system prompt block. The model may use up to 3× when the user asks for more detail. Clamped to `[30, 200]` at boot (out-of-range warns + clamps). |
+| `VOICE_STT_MAX_BYTES` | no | `2097152` (2 MiB) | positive int | Hard ceiling on audio upload size. Web `/api/stt` rejects oversized bodies before paying Scribe; Telegram voice-note download is bounded by the same cap. |
+| `VOICE_STT_MAX_SECONDS` | no | `60` | positive int | Client-side `MediaRecorder` stop timer for the web UI mic button. |
+| `VOICE_HOURLY_COST_CAP_USD` | no | `0.25` | positive float | **Per-chat** voice cost ceiling. Sliding 60-min window over `voice_events.cost_usd_estimate`. Independent of Anthropic `HOURLY_COST_CAP_USD`. |
+| `VOICE_GLOBAL_HOURLY_COST_CAP_USD` | no | `1.00` | positive float | **Global** voice cost ceiling. Sliding 60-min window across all chats. Independent of Anthropic `GLOBAL_HOURLY_COST_CAP_USD`. |
+| `ELEVENLABS_TTS_OUTPUT_FORMAT_WEB` | no | `mp3_44100_64` | string | Output format the browser `<audio>` consumes. MP3 plays everywhere (Chromium, Firefox, Safari). |
+| `ELEVENLABS_TTS_OUTPUT_FORMAT_TG` | no | `opus_48000_64` | string | Output format Telegram `sendVoice` consumes. Defaults to Ogg/Opus — verified against ElevenLabs (May 2026 probe). If a future upstream change flips to raw Opus, set to `mp3_44100_64` and Telegram path uses `sendAudio` instead (the env-var picks). |
+| `ELEVENLABS_TTS_PRICE_USD_PER_1K_CHARS` | no | `0.05` | positive float | Pricing constant for TTS cost estimate (used by the voice cost cap). Pin to your ElevenLabs plan if it differs from the published default. |
+| `ELEVENLABS_STT_PRICE_USD_PER_HOUR` | no | `0.22` | positive float | Pricing constant for STT cost estimate. Pin to your plan if it differs. |
 
 ## Validation rules
 
@@ -73,6 +88,7 @@ Every Solrac knob is an environment variable, validated and frozen at boot by `s
 - **Local/remote mutex:** `LOCAL_ENABLED=true && REMOTE_ENABLED=true` is rejected at boot. The engine slot has a single driver per boot — picking between modes is structural, not per-message. Operators wanting both should pin `SOLRAC_DEFAULT_ENGINE=primary` and use Claude for the no-prefix path.
 - **Local-tools constraint:** `LOCAL_TOOLS_ENABLED=true` requires `SOLRAC_INTEGRATIONS_ENABLED=true` (else there are no tools to expose; boot throws).
 - **Web UI constraint:** when `SOLRAC_WEB_ENABLED=true`, `SOLRAC_WEB_TOKEN` must be set (any value; ≥32 chars recommended). `SOLRAC_WEB_PORT` must differ from `PORT`. `SOLRAC_WEB_CHAT_ID` must be a negative integer.
+- **Voice constraint:** when `VOICE_ENABLED=true`, both `ELEVENLABS_API_KEY` AND `ELEVENLABS_VOICE_ID` must be set and non-blank. `VOICE_REPLY_WORDS_HINT` is clamped to `[30, 200]` at boot with a `config.voice_reply_words_clamped` warn line if the operator value falls outside that range. All other voice values must parse as positive numbers / integers when provided. Voice cost caps (`VOICE_HOURLY_COST_CAP_USD`, `VOICE_GLOBAL_HOURLY_COST_CAP_USD`) are **independent** of the Anthropic caps — they sum `voice_events.cost_usd_estimate` over their own sliding 60-min windows.
 
 The returned `Config` object is `Object.freeze`d; `allowlistBootstrap` is also frozen. There's no runtime mutation path.
 
@@ -175,6 +191,19 @@ SOLRAC_WEB_HOST=127.0.0.1         # 0.0.0.0 to expose on LAN/Tailscale/public
 SOLRAC_WEB_PORT=8080              # must differ from PORT
 SOLRAC_WEB_TOKEN=                 # required when enabled; generate: openssl rand -hex 32
 # SOLRAC_WEB_CHAT_ID=-1000        # synthetic shared chat id for the web transport
+
+# Voice (ElevenLabs STT + TTS). Off by default. When VOICE_ENABLED=true,
+# ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID are required (boot fails loud).
+# Independent voice cost cap separate from the Anthropic cap.
+VOICE_ENABLED=false
+# ELEVENLABS_API_KEY=sk_…                # restrict the key to TTS + STT only
+# ELEVENLABS_VOICE_ID=…                  # 20-char id from VoiceLab
+# ELEVENLABS_TTS_MODEL=eleven_flash_v2_5
+# ELEVENLABS_STT_MODEL=scribe_v2
+# VOICE_TTS_MAX_CHARS=3000               # hard wall on TTS input length
+# VOICE_REPLY_WORDS_HINT=60              # soft word budget when /voice on
+# VOICE_HOURLY_COST_CAP_USD=0.25         # per-chat sliding 60-min cap
+# VOICE_GLOBAL_HOURLY_COST_CAP_USD=1.00  # global sliding 60-min cap
 ```
 
 ### Claude-only deploy
@@ -219,6 +248,8 @@ The SDK spawns a `claude` subprocess that **inherits parent env**. Solrac scrubs
 - `TG_*` (any prefix)
 - `LOCAL_*` (any prefix — backend URL/model)
 - `REMOTE_*` (any prefix — OpenRouter API key + base URL)
+- `ELEVENLABS_*` (any prefix — voice API key + voice id)
+- `VOICE_*` (any prefix — voice cost caps + limits)
 - `STATS_BEARER_TOKEN`
 - `ALLOWLIST_BOOTSTRAP`
 - `NOTION_API_KEY`

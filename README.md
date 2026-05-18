@@ -1,6 +1,6 @@
 # Solrac
 
-> A self-hosted, hackable personal Agent: free local LLM (Ollama or LMStudio) or remote LLM (OpenRouter) by default, with explicit escalation to Anthropic's Claude Sonnet/Opus via the Claude Agent SDK. Reach it from Telegram or a browser; own every audit row, permission rule, and budget cap.
+> A self-hosted personal Agent you can configure, hack, and **converse with**. Reach it by text from Telegram or a browser, or by voice (ElevenLabs STT + TTS) on either transport. Free local LLM (Ollama / LMStudio) or remote (OpenRouter) by default; escalate to Anthropic's Claude Sonnet (`@`) or Opus (`!`) only when you mean it. Own every audit row, permission rule, and budget cap.
 
 <image src="./docs/solrac.png" width="300px" />
 
@@ -16,11 +16,12 @@ It's deliberately smaller and narrower than other personal-assistant projects:
 Both are broader and better-resourced. **Solrac's distinct value:**
 
 - **BYO-model engine slot.** No-prefix messages route to whichever model source you wire — free on-host (Ollama / LMStudio) or pay-per-token remote (OpenRouter). `@` (Sonnet) and `!` (Opus) are paid Claude escalations only on operator intent.
-- **Cost enforcement, not just visibility.** Sliding per-chat and global hourly USD caps that *deny* turns when hit — they sum every `cost_usd` row (Claude or OpenRouter), so remote-mode burn is gated by the same ceilings without extra configuration. Plus a daily cost-report DM.
-- **Audit-before-acting.** Every update (allowed, denied, queue-full) writes a row to one append-only SQLite table, tagged with the engine that served it (`local:ollama:...`, `remote:openrouter:...`, `claude:primary:...`).
+- **Cost enforcement, not just visibility.** Sliding per-chat and global hourly USD caps that *deny* turns when hit — they sum every `cost_usd` row (Claude or OpenRouter), so remote-mode burn is gated by the same ceilings without extra configuration. Plus a daily cost-report DM. Voice spend (ElevenLabs STT + TTS, when enabled) rides a **second** independent cost-cap axis with its own per-chat + global ceilings.
+- **Voice on every transport.** Telegram voice notes get transcribed; the web UI has a mic button and per-message speak buttons. `/voice on` turns on terse audio replies. ~120 lines of `fetch` against ElevenLabs — no SDK, no realtime WebSocket. Off by default.
+- **Audit-before-acting.** Every update (allowed, denied, queue-full) writes a row to one append-only SQLite table, tagged with the engine that served it (`local:ollama:...`, `remote:openrouter:...`, `claude:primary:...`). Voice gets a parallel `voice_events` log — every STT/TTS attempt (allowed, capped, denied, errored) is recorded.
 - **Single-process minimalism.** No HTTP framework, no Telegram framework runtime, no queue server, no Docker, no sub-agents. A few thousand lines of TypeScript you can read in an afternoon and fork.
 
-If you need multi-tenancy, voice wake, mobile companions, or 25 chat platforms, use OpenClaw or Hermes. If you want a small, cost-capped, fully audited foundation you can bend to your shape, Solrac fits.
+If you need multi-tenancy, always-listening voice wake, mobile companions, or 25 chat platforms, use OpenClaw or Hermes. If you want a small, cost-capped, fully audited foundation — with optional speech-to-text and text-to-speech on Telegram and the browser — that you can bend to your shape, Solrac fits.
 
 ## Quick start
 

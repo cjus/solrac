@@ -676,6 +676,77 @@ GROUP BY skill_name, origin
 ORDER BY n DESC;
 ```
 
+### Voice events
+
+The `voice_events` table is append-only and parallel to `audit`. Every voice flow (STT in, TTS out) writes a row regardless of outcome — `ok`, `denied_cap` (voice cap fired), `denied_gate` (allowlist), or `error` (upstream / network).
+
+```sql
+-- Recent voice events for a chat (one row per stt/tts attempt)
+SELECT id,
+       datetime(ts_ms/1000, 'unixepoch') AS at,
+       kind,
+       source,
+       status,
+       duration_ms,
+       chars,
+       ROUND(cost_usd_estimate, 4) AS cost,
+       error_message
+FROM voice_events
+WHERE chat_id = ?
+ORDER BY ts_ms DESC
+LIMIT 50;
+```
+
+```sql
+-- Voice spend last 24h, per chat and per kind
+SELECT chat_id,
+       kind,
+       COUNT(*) AS attempts,
+       SUM(CASE status WHEN 'ok' THEN 1 ELSE 0 END) AS ok,
+       SUM(CASE status WHEN 'denied_cap' THEN 1 ELSE 0 END) AS capped,
+       SUM(CASE status WHEN 'error' THEN 1 ELSE 0 END) AS errored,
+       ROUND(SUM(cost_usd_estimate), 4) AS spend
+FROM voice_events
+WHERE ts_ms >= (strftime('%s','now','-1 day') * 1000)
+GROUP BY chat_id, kind
+ORDER BY spend DESC;
+```
+
+```sql
+-- Sliding 60-min global voice spend (matches the in-process cap query)
+SELECT ROUND(SUM(cost_usd_estimate), 4) AS spent_last_hour
+FROM voice_events
+WHERE ts_ms >= (strftime('%s','now','-1 hour') * 1000)
+  AND status = 'ok';
+```
+
+```sql
+-- Voice cap-deny rate by chat (last 7 days). High values mean the cap is too
+-- low OR the operator is using voice heavily — check before raising the cap.
+SELECT chat_id,
+       SUM(CASE status WHEN 'denied_cap' THEN 1 ELSE 0 END) * 100.0 / COUNT(*)
+         AS pct_denied,
+       COUNT(*) AS total_attempts
+FROM voice_events
+WHERE ts_ms >= (strftime('%s','now','-7 day') * 1000)
+GROUP BY chat_id
+HAVING total_attempts >= 5
+ORDER BY pct_denied DESC;
+```
+
+```sql
+-- Upstream errors (ElevenLabs side: rate limits, auth, transcoding issues)
+SELECT datetime(ts_ms/1000, 'unixepoch') AS at,
+       chat_id,
+       kind,
+       source,
+       error_message
+FROM voice_events
+WHERE status = 'error'
+ORDER BY ts_ms DESC
+LIMIT 20;
+```
+
 ---
 
 ## Workspace inspection
