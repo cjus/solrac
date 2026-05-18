@@ -224,6 +224,16 @@ export interface AgentRunDeps {
   // a `<voice-mode>` block telling the model to keep the reply under this
   // many words. Optional — omitted when `VOICE_ENABLED=false`.
   voiceReplyWords?: number;
+  // Post-turn TTS attach. Called once per successful turn AFTER the audit
+  // row is finalized. Wired only on the Telegram transport when VOICE_ENABLED
+  // — web has its own per-message speak button. Best-effort: failures inside
+  // the callback log + return; they do NOT propagate.
+  attachVoiceReply?: (opts: {
+    chatId: number;
+    messageId: number | null;
+    auditId: number;
+    finalText: string;
+  }) => Promise<void>;
 }
 
 export interface AgentRunInput {
@@ -588,6 +598,18 @@ export async function runAgent(deps: AgentRunDeps, input: AgentRunInput): Promis
     numTurns,
     isError,
   });
+
+  // Voice (TTS attach). Fire-and-forget — the text reply is already
+  // committed; a TTS failure must not propagate. The callback itself
+  // gates on `sessions.voice_replies` and cost caps.
+  if (deps.attachVoiceReply && !isError && finalText.trim()) {
+    await deps.attachVoiceReply({
+      chatId: input.chatId,
+      messageId: stubId,
+      auditId,
+      finalText,
+    });
+  }
 }
 
 const defaultAllowAll: CanUseTool = async (toolName) => {

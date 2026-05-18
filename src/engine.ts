@@ -150,6 +150,16 @@ export interface EngineRunDeps {
   // carrying the `<voice-mode>` block is pushed right after the SOLRAC.md
   // overlay. Optional — omitted when `VOICE_ENABLED=false`.
   voiceReplyWords?: number;
+  // Post-turn TTS attach. Called once per successful turn AFTER the audit
+  // row is finalized. Wired only on the Telegram transport when VOICE_ENABLED
+  // — web has its own per-message speak button. Best-effort: failures inside
+  // the callback log + return; they do NOT propagate.
+  attachVoiceReply?: (opts: {
+    chatId: number;
+    messageId: number | null;
+    auditId: number;
+    finalText: string;
+  }) => Promise<void>;
 }
 
 export interface EngineRunInput {
@@ -402,6 +412,15 @@ export async function runEngineTurn(
     costUsd: costForAudit,
     isError,
   });
+
+  if (deps.attachVoiceReply && !isError && assistantText.trim()) {
+    await deps.attachVoiceReply({
+      chatId: input.chatId,
+      messageId: stubId,
+      auditId,
+      finalText: assistantText,
+    });
+  }
 }
 
 /**
@@ -722,6 +741,15 @@ async function runEngineTurnWithTools(
     iterationCapHit: result.iterationCapHit,
     isError,
   });
+
+  if (deps.attachVoiceReply && !isError && result.assistantText.trim()) {
+    await deps.attachVoiceReply({
+      chatId: input.chatId,
+      messageId: stubId,
+      auditId,
+      finalText: result.assistantText,
+    });
+  }
 }
 
 // Render variants for the tools-on path. Mirror the single-shot
