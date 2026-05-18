@@ -389,12 +389,11 @@ body {
 .speak-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .speak-btn.loading { animation: mic-pulse 1.2s ease-in-out infinite; }
 
-.speak-audio {
-  display: block;
-  margin: 8px 0 0 0;
-  width: 100%;
-  max-width: 360px;
-}
+/* Audio element is invisible — the 🔊 / ⏹ button is the only UI for
+ * playback. display:none does NOT prevent the element from playing. */
+.speak-audio { display: none; }
+
+.speak-btn.playing { opacity: 1; color: var(--accent); border-color: var(--accent); }
 
 /* Toast — bottom-right transient messages. */
 

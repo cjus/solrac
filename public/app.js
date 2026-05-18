@@ -574,6 +574,29 @@ function maybeAddSpeakButton(node) {
 }
 
 async function onSpeakClick(node, btn) {
+  const existingAudio = node.querySelector(".speak-audio");
+  // Click while playing → stop. Audio element stays attached (and its
+  // blob URL stays live) so the next click replays from cache without
+  // re-billing ElevenLabs.
+  if (existingAudio && !existingAudio.paused) {
+    existingAudio.pause();
+    existingAudio.currentTime = 0;
+    setSpeakButtonState(btn, "idle");
+    return;
+  }
+  // Click after a previous play that ended/stopped → replay from cache.
+  if (existingAudio) {
+    existingAudio.currentTime = 0;
+    try {
+      await existingAudio.play();
+      setSpeakButtonState(btn, "playing");
+    } catch {
+      // Autoplay policy or other transient — silently ignore; the user
+      // can click again. No toast for replay failures.
+    }
+    return;
+  }
+  // First click → fetch TTS, attach a hidden <audio>, autoplay.
   const markdown = node.dataset.markdown ?? "";
   const messageId = node.dataset.messageId ? Number(node.dataset.messageId) : null;
   if (!markdown) return;
@@ -608,26 +631,29 @@ async function onSpeakClick(node, btn) {
     // Inject audio via DOM API (NOT innerHTML) — the sanitizer is for
     // marked-rendered LLM content; this audio element is UI chrome added
     // by app code, so the trust boundary doesn't move (plan §10.3).
-    let existing = node.querySelector(".speak-audio");
-    if (existing) {
-      // Revoke the previous blob URL before replacing so we don't leak.
-      const prev = existing.dataset.blobUrl;
-      if (prev) URL.revokeObjectURL(prev);
-      existing.remove();
-    }
+    // No `controls` attr — CSS hides the element entirely; the speak
+    // button is the only UI affordance.
     const audio = document.createElement("audio");
-    audio.controls = true;
     audio.src = url;
     audio.className = "speak-audio";
     audio.dataset.blobUrl = url;
-    audio.autoplay = true;
+    audio.addEventListener("play", () => setSpeakButtonState(btn, "playing"));
+    audio.addEventListener("pause", () => setSpeakButtonState(btn, "idle"));
+    audio.addEventListener("ended", () => setSpeakButtonState(btn, "idle"));
     node.appendChild(audio);
+    await audio.play();
   } catch (err) {
     showToast(`network error: ${err.message ?? "unknown"}`);
   } finally {
     btn.disabled = false;
     btn.classList.remove("loading");
   }
+}
+
+function setSpeakButtonState(btn, state) {
+  btn.classList.toggle("playing", state === "playing");
+  btn.textContent = state === "playing" ? "⏹" : "🔊";
+  btn.title = state === "playing" ? "stop" : "speak this reply";
 }
 
 // ── Toast ──────────────────────────────────────────────
