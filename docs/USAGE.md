@@ -1094,6 +1094,28 @@ Open `http://127.0.0.1:8080`. The login page accepts `SOLRAC_WEB_TOKEN`; on succ
 
 The token is **required even on `127.0.0.1`** — a co-tenant on a shared host could otherwise reach the unauthenticated UI.
 
+### Reaching the UI from other devices (HTTPS)
+
+Modern browser APIs — most notably `getUserMedia` (the mic) — are gated to **secure contexts**: HTTPS, or `http://localhost` / `http://127.0.0.1`. Plain HTTP to a LAN IP or a Tailscale 100.x address fails the gate and the mic button hides itself with a one-time toast. (The 🔊 speak buttons keep working — TTS playback doesn't need a secure context.)
+
+Cleanest single-tenant fix is **Tailscale serve** — auto-provisioned Let's Encrypt cert on your MagicDNS hostname, no certbot, tailnet-scoped:
+
+```sh
+# One-time admin console toggles: MagicDNS on, HTTPS Certificates on
+# (https://login.tailscale.com/admin/dns)
+
+# Keep Solrac on localhost; tailscaled fronts it
+SOLRAC_WEB_HOST=127.0.0.1 SOLRAC_WEB_PORT=8080 solrac
+
+# In another shell — terminate TLS at Tailscale's built-in proxy
+tailscale serve --bg http://localhost:8080
+tailscale serve status                  # confirm; should show https://<host>.<tailnet>.ts.net → localhost:8080
+```
+
+Open `https://<host>.<tailnet>.ts.net/` from any device on your tailnet. Mic enabled, no LAN exposure. Tear down with `tailscale serve reset`.
+
+Alternatives: Caddy in front (one-line auto-TLS), nginx + Let's Encrypt, or any reverse proxy with a real cert. Do **not** use `tailscale funnel` — that exposes Solrac to the public internet, defeating the single-tenant posture.
+
 ### Feature parity with Telegram
 
 Everything you can do in Telegram works in the web UI through the same code path:
@@ -1163,6 +1185,19 @@ When `VOICE_ENABLED=true` AND you're logged in to the web UI:
 - **Voice mode badge** in the header (top right). Shows `🔊 voice mode on` when `/voice on` is active for the web chat id. Click to disable (sends `/voice off`).
 
 The web speak button is **on-demand**, not automatic — you control when you pay for synthesis. Different shape from Telegram, where voice-mode-on auto-attaches every reply.
+
+**Microphone needs a secure context.** The browser's `getUserMedia` API only works over HTTPS or `http://localhost` (and `http://127.0.0.1`) — it's undefined on any other HTTP origin. If you open the web UI via a LAN IP or a Tailscale 100.x address over plain HTTP, the mic button hides itself on first load and you'll see a one-time toast: *mic disabled — needs HTTPS or http://localhost*. The 🔊 speak buttons keep working (audio playback doesn't need a secure context). Three fixes:
+
+1. **Same machine** → just use `http://localhost:<SOLRAC_WEB_PORT>/`.
+2. **Tailscale** → terminate TLS at Tailscale's built-in proxy. One-time setup in the admin console (DNS → MagicDNS + HTTPS Certificates), then:
+   ```sh
+   # Bind Solrac to localhost only so only the local serve daemon reaches it
+   SOLRAC_WEB_HOST=127.0.0.1 solrac
+   # Front it with auto-provisioned TLS on your MagicDNS hostname
+   tailscale serve --bg http://localhost:<SOLRAC_WEB_PORT>
+   ```
+   Now `https://<host>.<tailnet>.ts.net/` works from every device on your tailnet, mic enabled. Real Let's Encrypt cert, auto-renewed.
+3. **Public-internet HTTPS** → front with Caddy / Traefik / nginx + a real cert.
 
 ### Voice mode and engine compliance
 

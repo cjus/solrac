@@ -311,9 +311,22 @@ Solrac can run a second `Bun.serve` instance that hosts a minimal vanilla-JS cha
 
 **Security notes:**
 - The token is **required** even on `127.0.0.1` — a co-tenant on a shared host could otherwise reach the unauthenticated UI.
-- When `SOLRAC_WEB_HOST=0.0.0.0`, the UI is reachable on every interface. Pair with a strong token (32+ hex chars) and consider Tailscale or a reverse proxy if you need TLS.
+- When `SOLRAC_WEB_HOST=0.0.0.0`, the UI is reachable on every interface. Pair with a strong token (32+ hex chars).
 - Sessions are stored in process memory; restarting Solrac signs out all browsers (operator must log in again).
 - File uploads are not supported (Telegram's photo flow is). Out of scope for v1.
+
+**Reaching Solrac over HTTPS (needed for the mic button).** The browser's `getUserMedia` API is undefined on any HTTP origin that isn't `localhost` / `127.0.0.1`. If you plan to access the UI from your phone, another laptop, or anywhere else on your LAN, you want TLS termination. The simplest path for a single-tenant deploy is **Tailscale serve**:
+
+1. One-time setup in the Tailscale admin console (https://login.tailscale.com/admin/dns): MagicDNS on, HTTPS Certificates on.
+2. Bind Solrac to localhost only — keep `SOLRAC_WEB_HOST=127.0.0.1`.
+3. Front it with Tailscale's built-in proxy (auto-provisions a Let's Encrypt cert for your MagicDNS hostname, auto-renews):
+   ```sh
+   tailscale serve --bg http://localhost:8080
+   tailscale serve status   # confirms https://<host>.<tailnet>.ts.net → localhost:8080
+   ```
+4. Open `https://<host>.<tailnet>.ts.net/` from any device on your tailnet.
+
+Alternatives: Caddy with auto-TLS in front of `127.0.0.1:8080`, or nginx + Let's Encrypt. Without TLS, mic input fails silently — the speak buttons still work. See [USAGE.md#web-ui-voice-surface](./USAGE.md#web-ui-voice-surface) for the symptom + full recovery options and [RUNBOOK.md#web-ui-mic-error](./RUNBOOK.md#web-ui-mic-error) for the diagnosis flow.
 
 For the full env reference, see [CONFIG.md](./CONFIG.md#variables); for the architecture and security posture see [ARCHITECTURE.md#web-ui-transport-optional](./ARCHITECTURE.md#web-ui-transport-optional); for daily-use feature parity with Telegram see [USAGE.md#web-ui-browser-interface](./USAGE.md#web-ui-browser-interface).
 
