@@ -53,6 +53,16 @@ let voiceModeOn = false;
 // 503 means the server has VOICE_ENABLED=false and the mic/speak surface
 // stays hidden.
 let voiceFeatureAvailable = false;
+// Mic-capture availability. True only when voice is server-enabled AND the
+// browser exposes `navigator.mediaDevices.getUserMedia` + `MediaRecorder`.
+// The MediaDevices API requires a secure context (HTTPS or localhost) — so
+// `http://<lan-ip>:port` opens the UI without a working mic. We split this
+// from `voiceFeatureAvailable` because TTS (the 🔊 speak button + voice-mode
+// reply attachment) works fine in non-secure contexts; only STT needs it.
+let micCaptureAvailable = false;
+// One-shot guard so the "mic requires HTTPS" toast only fires once per page
+// load, not on every /api/voice/state probe.
+let micUnavailableToastShown = false;
 // MediaRecorder state. `recorder` is the active recorder; `recordTimeoutId`
 // is the auto-stop timer that fires at VOICE_STT_MAX_SECONDS (60s server-side).
 let recorder = null;
@@ -396,6 +406,7 @@ async function refreshVoiceState() {
     if (res.status === 503) {
       // Deploy has VOICE_ENABLED=false. Hide mic + speak surfaces entirely.
       voiceFeatureAvailable = false;
+      micCaptureAvailable = false;
       voiceModeOn = false;
       els.micBtn?.classList.add("hidden");
       els.voiceBadge?.classList.add("hidden");
@@ -405,7 +416,18 @@ async function refreshVoiceState() {
     const body = await res.json();
     voiceFeatureAvailable = true;
     voiceModeOn = body.enabled === true;
-    els.micBtn?.classList.remove("hidden");
+    micCaptureAvailable = hasMicCaptureSupport();
+    if (micCaptureAvailable) {
+      els.micBtn?.classList.remove("hidden");
+    } else {
+      els.micBtn?.classList.add("hidden");
+      if (!micUnavailableToastShown) {
+        micUnavailableToastShown = true;
+        showToast(
+          "mic disabled — needs HTTPS or http://localhost. Speak buttons still work.",
+        );
+      }
+    }
     if (voiceModeOn) {
       els.voiceBadge?.classList.remove("hidden");
       if (els.voiceBadge) els.voiceBadge.textContent = "🔊 voice mode on";
@@ -424,7 +446,7 @@ async function refreshVoiceState() {
 }
 
 async function onMicClick() {
-  if (!voiceFeatureAvailable) return;
+  if (!micCaptureAvailable) return;
   if (recorder) {
     stopRecording(); // user tap to stop mid-flight
     return;
@@ -527,6 +549,22 @@ function setMicState(state) {
   els.micBtn.disabled = state === "uploading";
   els.micBtn.title =
     state === "recording" ? "stop recording" : state === "uploading" ? "uploading…" : "record voice";
+}
+
+// Browser feature-detect for mic capture. Returns true only when both APIs
+// are present. `navigator.mediaDevices` is undefined in non-secure contexts
+// (anything other than HTTPS or http://localhost) — the most common cause
+// for end users hitting the bot via a LAN IP / non-MagicDNS Tailscale name
+// over HTTP. We split this from the server-side `voiceFeatureAvailable`
+// flag so TTS (speak buttons + voice-mode reply) keeps working over plain
+// HTTP; only STT (mic) requires a secure context.
+function hasMicCaptureSupport() {
+  return (
+    typeof navigator !== "undefined" &&
+    typeof navigator.mediaDevices !== "undefined" &&
+    typeof navigator.mediaDevices.getUserMedia === "function" &&
+    typeof MediaRecorder !== "undefined"
+  );
 }
 
 // MediaRecorder mime varies by browser:

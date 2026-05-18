@@ -27,6 +27,7 @@ For day-to-day operations, see [OPERATIONS.md](./OPERATIONS.md).
 - [Ollama errors (default engine path)](#ollama-errors)
 - [Web UI not reachable / login won't take](#web-ui-issues)
 - [Web UI streaming silent / messages don't appear](#web-ui-stream-silent)
+- [Web UI mic button hidden / `getUserMedia` undefined](#web-ui-mic-error)
 
 ---
 
@@ -1066,6 +1067,62 @@ Or front with Caddy / Traefik, both of which handle SSE without explicit config.
 - Keep Solrac on the post-`ec7669a` branch (any release after 2026-05-08).
 - Document the proxy SSE config alongside the systemd unit when deploying.
 - The audit log is the durable record — if a streaming reply was lost, it's still in `audit.response`. Reload restores it.
+
+---
+
+<a id="web-ui-mic-error"></a>
+
+## Web UI mic button hidden / "Cannot read properties of undefined (reading 'getUserMedia')"
+
+### Symptoms
+
+- The web UI loads fine, speak buttons work, but the 🎙️ mic button doesn't appear (or used to appear on `v0.10.0` and threw `mic error: Cannot read properties of undefined (reading 'getUserMedia')`).
+- A one-time toast on first load reads `mic disabled — needs HTTPS or http://localhost. Speak buttons still work.` (post-fix builds).
+
+### Diagnosis
+
+The browser's `navigator.mediaDevices` API is undefined in **non-secure contexts**. Three origins are treated as secure:
+
+- HTTPS (any port)
+- `http://localhost` / any port
+- `http://127.0.0.1` / any port
+
+Everything else — including plain HTTP to a LAN IP (`http://192.168.x.x:7134`) or a Tailscale 100.x address — fails feature-detect. The server is fine; `/api/voice/state` returns 200 because `VOICE_ENABLED=true`. It's the browser refusing to expose the mic API.
+
+Confirm by opening DevTools → Console → run `navigator.mediaDevices`. If it prints `undefined`, you're on a non-secure origin.
+
+### Recovery
+
+Pick whichever fits the deployment.
+
+**Same machine (loopback).** Just access via `http://localhost:<SOLRAC_WEB_PORT>/`. Even when Solrac is bound to `0.0.0.0`, `localhost` is treated as secure.
+
+**Tailscale serve (recommended for personal use across devices).** One-time setup in the Tailscale admin console — DNS → MagicDNS on, DNS → HTTPS Certificates on. Then on the host:
+
+```sh
+# Bind Solrac to localhost so only the local Tailscale serve daemon can reach it
+SOLRAC_WEB_HOST=127.0.0.1 SOLRAC_WEB_PORT=7134 solrac
+
+# Front it with Tailscale's built-in TLS terminator (Let's Encrypt cert auto-provisioned)
+tailscale serve --bg http://localhost:7134
+```
+
+Now `https://<host>.<tailnet>.ts.net/` works from every device on your tailnet, mic enabled. The cert auto-renews. Useful commands:
+
+```sh
+tailscale serve status     # what's currently being served
+tailscale serve reset      # tear down all serves
+```
+
+Do **not** use `tailscale funnel` for this — that exposes the service to the public internet, which defeats the point of single-tenant Solrac.
+
+**Reverse proxy with TLS.** Front Solrac with Caddy / Traefik / nginx and a real cert (Let's Encrypt or otherwise). Caddy auto-TLS is one-liner; nginx needs the SSE config from [Web UI streaming silent](#web-ui-stream-silent) plus the cert lines.
+
+### Prevention
+
+Pre-`v0.10.1` (post-fix), the client now feature-detects `navigator.mediaDevices` in `refreshVoiceState` and hides the mic button when the API is missing. The 🔊 speak buttons keep working — TTS playback uses `<audio>`, which doesn't need a secure context. So users on non-secure origins still get terse audio replies, just no mic input.
+
+If you're writing a deployment guide for end users, lead with one of the three secure-context fixes above. The most common surprise is opening Solrac via a LAN IP "to test from the laptop" and expecting the mic to work.
 
 ---
 

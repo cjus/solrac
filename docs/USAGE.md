@@ -1164,6 +1164,19 @@ When `VOICE_ENABLED=true` AND you're logged in to the web UI:
 
 The web speak button is **on-demand**, not automatic — you control when you pay for synthesis. Different shape from Telegram, where voice-mode-on auto-attaches every reply.
 
+**Microphone needs a secure context.** The browser's `getUserMedia` API only works over HTTPS or `http://localhost` (and `http://127.0.0.1`) — it's undefined on any other HTTP origin. If you open the web UI via a LAN IP or a Tailscale 100.x address over plain HTTP, the mic button hides itself on first load and you'll see a one-time toast: *mic disabled — needs HTTPS or http://localhost*. The 🔊 speak buttons keep working (audio playback doesn't need a secure context). Three fixes:
+
+1. **Same machine** → just use `http://localhost:<SOLRAC_WEB_PORT>/`.
+2. **Tailscale** → terminate TLS at Tailscale's built-in proxy. One-time setup in the admin console (DNS → MagicDNS + HTTPS Certificates), then:
+   ```sh
+   # Bind Solrac to localhost only so only the local serve daemon reaches it
+   SOLRAC_WEB_HOST=127.0.0.1 solrac
+   # Front it with auto-provisioned TLS on your MagicDNS hostname
+   tailscale serve --bg http://localhost:<SOLRAC_WEB_PORT>
+   ```
+   Now `https://<host>.<tailnet>.ts.net/` works from every device on your tailnet, mic enabled. Real Let's Encrypt cert, auto-renewed.
+3. **Public-internet HTTPS** → front with Caddy / Traefik / nginx + a real cert.
+
 ### Voice mode and engine compliance
 
 The `<voice-mode>` system block is a soft target, not a hard rule:
