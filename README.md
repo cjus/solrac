@@ -1,6 +1,6 @@
 # Solrac
 
-> A self-hosted, hackable personal Agent: free local LLM (Ollama or LMStudio) or remote LLM (OpenRouter) by default, with explicit escalation to Anthropic's Claude Sonnet/Opus via the Claude Agent SDK. Reach it from Telegram or a browser — optionally with **voice** (ElevenLabs STT + TTS) on either transport. Own every audit row, permission rule, and budget cap.
+> A self-hosted personal Agent you can configure, hack, and **converse with**. Reach it by text from Telegram or a browser, or by voice (ElevenLabs STT + TTS) on either transport. Free local LLM (Ollama / LMStudio) or remote (OpenRouter) by default; escalate to Anthropic's Claude Sonnet (`@`) or Opus (`!`) only when you mean it. Own every audit row, permission rule, and budget cap.
 
 <image src="./docs/solrac.png" width="300px" />
 
