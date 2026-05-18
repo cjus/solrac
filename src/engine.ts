@@ -77,6 +77,7 @@ import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { SolracDb } from "./db.ts";
 import type { SessionStore } from "./session.ts";
 import { readInstanceMd, wrapInstanceMd } from "./instance.ts";
+import { buildVoiceModePrompt } from "./voice.ts";
 import type { IntegrationTier } from "./integrations.ts";
 import {
   type EngineChatMessage,
@@ -144,6 +145,11 @@ export interface EngineRunDeps {
   // `LOCAL_MAX_TOOL_ITERATIONS` / `REMOTE_MAX_TOOL_ITERATIONS`. Defaults to
   // 8; only consulted when tools are enabled.
   maxToolIterations?: number;
+  // Voice — word target for the voice-mode prompt nudge. When set AND
+  // `sessions.voice_replies=1` for the chat, an extra `system` message
+  // carrying the `<voice-mode>` block is pushed right after the SOLRAC.md
+  // overlay. Optional — omitted when `VOICE_ENABLED=false`.
+  voiceReplyWords?: number;
 }
 
 export interface EngineRunInput {
@@ -220,6 +226,16 @@ export async function runEngineTurn(
   const instanceMd = readInstanceMd(deps.instanceMdPath);
   if (instanceMd !== null) {
     messages.push({ role: "system", content: wrapInstanceMd(instanceMd) });
+  }
+  // Voice-mode block — pushed as its own `system` message right after the
+  // SOLRAC.md overlay (per plan §14). Local models without RLHF on
+  // instruction hierarchy do better with a distinct system turn than
+  // concatenation into another one.
+  if (deps.voiceReplyWords !== undefined && deps.db.getVoiceRepliesFlag(input.chatId)) {
+    messages.push({
+      role: "system",
+      content: buildVoiceModePrompt({ words: deps.voiceReplyWords }),
+    });
   }
   // History reconstruction: stateful chat context per chat. Pulls every
   // successful turn for the chat regardless of engine — primary Claude,
@@ -555,6 +571,15 @@ async function runEngineTurnWithTools(
   const instanceMd = readInstanceMd(deps.instanceMdPath);
   if (instanceMd !== null) {
     initialMessages.push({ role: "system", content: wrapInstanceMd(instanceMd) });
+  }
+  // Voice-mode block — same as the single-shot path. Both modes must
+  // agree so toggling `/voice on` is consistent regardless of whether
+  // integrations are wired.
+  if (deps.voiceReplyWords !== undefined && deps.db.getVoiceRepliesFlag(input.chatId)) {
+    initialMessages.push({
+      role: "system",
+      content: buildVoiceModePrompt({ words: deps.voiceReplyWords }),
+    });
   }
   // Same cutoff treatment as the single-shot path; the tool-loop variant
   // must agree so `/clear local` is consistent across both modes.
