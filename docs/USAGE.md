@@ -1094,6 +1094,28 @@ Open `http://127.0.0.1:8080`. The login page accepts `SOLRAC_WEB_TOKEN`; on succ
 
 The token is **required even on `127.0.0.1`** — a co-tenant on a shared host could otherwise reach the unauthenticated UI.
 
+### Reaching the UI from other devices (HTTPS)
+
+Modern browser APIs — most notably `getUserMedia` (the mic) — are gated to **secure contexts**: HTTPS, or `http://localhost` / `http://127.0.0.1`. Plain HTTP to a LAN IP or a Tailscale 100.x address fails the gate and the mic button hides itself with a one-time toast. (The 🔊 speak buttons keep working — TTS playback doesn't need a secure context.)
+
+Cleanest single-tenant fix is **Tailscale serve** — auto-provisioned Let's Encrypt cert on your MagicDNS hostname, no certbot, tailnet-scoped:
+
+```sh
+# One-time admin console toggles: MagicDNS on, HTTPS Certificates on
+# (https://login.tailscale.com/admin/dns)
+
+# Keep Solrac on localhost; tailscaled fronts it
+SOLRAC_WEB_HOST=127.0.0.1 SOLRAC_WEB_PORT=8080 solrac
+
+# In another shell — terminate TLS at Tailscale's built-in proxy
+tailscale serve --bg http://localhost:8080
+tailscale serve status                  # confirm; should show https://<host>.<tailnet>.ts.net → localhost:8080
+```
+
+Open `https://<host>.<tailnet>.ts.net/` from any device on your tailnet. Mic enabled, no LAN exposure. Tear down with `tailscale serve reset`.
+
+Alternatives: Caddy in front (one-line auto-TLS), nginx + Let's Encrypt, or any reverse proxy with a real cert. Do **not** use `tailscale funnel` — that exposes Solrac to the public internet, defeating the single-tenant posture.
+
 ### Feature parity with Telegram
 
 Everything you can do in Telegram works in the web UI through the same code path:
