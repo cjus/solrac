@@ -143,7 +143,13 @@ export type SolracCommand =
   // - `/tasks run <name>` fires a task on demand (bypasses the schedule
   //   clock; honors enabled / one_off_consumed / max_cost_usd / queue-full).
   | { kind: "tasks_list" }
-  | { kind: "tasks_run"; name: string };
+  | { kind: "tasks_run"; name: string }
+  // Voice (ElevenLabs). `enabled === null` is the no-arg query form ("what
+  // is voice mode set to right now"); explicit true/false flips
+  // sessions.voice_replies. Same dispatch for Telegram + web — web operators
+  // can `/voice on` to get the word-limit nudge even though web has its
+  // own per-message speak button.
+  | { kind: "voice_set"; enabled: boolean | null };
 
 export type ParseCommandResult =
   | { kind: "run"; cmd: SolracCommand }
@@ -167,6 +173,7 @@ export const BOT_COMMAND_REGISTRY: ReadonlyArray<BotCommand> = [
   { command: "status", description: "Show session and spend snapshot" },
   { command: "context", description: "Show context window size in bytes + tokens" },
   { command: "tasks", description: "List scheduled tasks (or run <name>)" },
+  { command: "voice", description: "Toggle voice replies (on/off)" },
   { command: "help", description: "Show available commands" },
 ];
 
@@ -201,6 +208,7 @@ const KNOWN_COMMANDS = new Set([
   "context",
   "help",
   "tasks",
+  "voice",
 ]);
 
 const TIER_ARG_MAP: Record<string, TierArg> = {
@@ -315,6 +323,20 @@ export function parseCommand(text: string, deps: ParseCommandDeps): ParseCommand
     const m = /^run\s+([A-Za-z0-9_]{1,32})$/.exec(argRaw);
     if (m) return { kind: "run", cmd: { kind: "tasks_run", name: m[1]!.toLowerCase() } };
     return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}tasks ${argRaw}` } };
+  }
+
+  if (name === "voice") {
+    // No-arg → query current state (rendered by the dispatcher). Operators
+    // commonly type `/voice` to remember which mode they're in.
+    if (argRaw === "") return { kind: "run", cmd: { kind: "voice_set", enabled: null } };
+    const lower = argRaw.toLowerCase();
+    if (lower === "on" || lower === "1" || lower === "true") {
+      return { kind: "run", cmd: { kind: "voice_set", enabled: true } };
+    }
+    if (lower === "off" || lower === "0" || lower === "false") {
+      return { kind: "run", cmd: { kind: "voice_set", enabled: false } };
+    }
+    return { kind: "run", cmd: { kind: "unknown", raw: `${prefix}voice ${argRaw}` } };
   }
 
   // /compact — `all` is invalid (compacting both tiers in one command is two
@@ -455,6 +477,8 @@ export async function runCommand(
       return runTasksList(deps, msg, updateId);
     case "tasks_run":
       return runTasksRun(deps, msg, updateId, cmd.name);
+    case "voice_set":
+      return runVoiceSet(deps, msg, updateId, cmd.enabled);
   }
 }
 
@@ -1186,6 +1210,7 @@ const HELP_COMMANDS_MD = [
   "- **context** `@|!` — show context-window size in bytes + tokens for that tier.",
   "- **help** — this card.",
   "- **status** — show session and spend snapshot for this chat.",
+  "- **voice** `[on|off]` — toggle voice replies (Telegram audio note + word-limit prompt). No arg shows current state.",
   "",
   "**Customize**",
   "",
@@ -1953,6 +1978,35 @@ async function runTasksRun(
   }
   await sendOrLog(deps.tg, msg.chat.id, reply, "cmd.tasks_reply_failed");
   writeSystemAudit(deps, msg, updateId, `tasks_run:${result.kind}`, status);
+}
+
+// ---------------------------------------------------------------------------
+// /voice on|off
+// ---------------------------------------------------------------------------
+
+async function runVoiceSet(
+  deps: RunCommandDeps,
+  msg: Message,
+  updateId: number,
+  enabled: boolean | null,
+): Promise<void> {
+  const chatId = msg.chat.id;
+  // No-arg → query. Render current state without writing the DB so an
+  // operator typing `/voice` doesn't bump `sessions.updated_at`.
+  if (enabled === null) {
+    const current = deps.db.getVoiceRepliesFlag(chatId);
+    const state = current ? "<b>on</b>" : "<b>off</b>";
+    const reply = `🔊 voice mode: ${state} (use <code>/voice on</code> or <code>/voice off</code>)`;
+    await sendOrLog(deps.tg, chatId, reply, "cmd.voice_reply_failed");
+    writeSystemAudit(deps, msg, updateId, `voice_query:${current ? "on" : "off"}`, "ok");
+    return;
+  }
+  deps.db.setVoiceRepliesFlag(chatId, enabled);
+  const reply = enabled
+    ? "🔊 voice mode <b>on</b> — replies will be terser; Telegram replies attach an audio note."
+    : "🔇 voice mode <b>off</b> — replies return to normal length, no audio attached.";
+  await sendOrLog(deps.tg, chatId, reply, "cmd.voice_reply_failed");
+  writeSystemAudit(deps, msg, updateId, `voice_set:${enabled ? "on" : "off"}`, "ok");
 }
 
 function formatScheduleSpec(t: ScheduledTask): string {
